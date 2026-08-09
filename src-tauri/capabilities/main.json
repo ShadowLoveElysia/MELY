@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "Permissions required by the main MELY desktop window.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "fs:allow-read-dir",
+    "fs:allow-read-file",
+    "fs:allow-stat",
+    "fs:allow-open",
+    "fs:allow-write",
+    "fs:allow-write-file"
+  ]
+}

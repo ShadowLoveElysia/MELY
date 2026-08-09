@@ -1,0 +1,110 @@
+name: Windows Dev Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mely-windows-dev-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build and publish dev release
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the latest main commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache Rust build data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build and test Windows packages
+        shell: pwsh
+        run: ./scripts/build-windows-release.ps1 -Channel dev
+
+      - name: Preserve workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: MELY-dev-windows-x64-${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            release/MELY-dev-windows-x64-portable.zip
+            release/MELY-dev-windows-x64-setup.exe
+            release/MELY-dev-windows-x64-SHA256SUMS.txt
+
+      - name: Update rolling dev release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = "dev-latest"
+          $notesPath = Join-Path $env:RUNNER_TEMP "mely-dev-release-notes.md"
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $runUrl = "https://github.com/$repo/actions/runs/$env:GITHUB_RUN_ID"
+          @"
+          Automated Windows development build.
+
+          - Commit: $env:GITHUB_SHA
+          - Short commit: $shortSha
+          - Workflow run: $runUrl
+
+          This prerelease is replaced whenever `main` receives a new commit.
+          "@ | Set-Content -LiteralPath $notesPath -Encoding utf8
+
+          gh api "repos/$repo/git/ref/tags/$tag" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh api --method PATCH "repos/$repo/git/refs/tags/$tag" -f sha="$env:GITHUB_SHA" -F force=true *> $null
+          } else {
+            gh api --method POST "repos/$repo/git/refs" -f ref="refs/tags/$tag" -f sha="$env:GITHUB_SHA" *> $null
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Could not update the dev tag." }
+
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $tag --repo $repo --title "MELY Development Build" --notes-file $notesPath --prerelease
+          } else {
+            gh release create $tag --repo $repo --verify-tag --title "MELY Development Build" --notes-file $notesPath --prerelease
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Could not create or update the dev release." }
+
+          $assets = @(
+            "release/MELY-dev-windows-x64-portable.zip",
+            "release/MELY-dev-windows-x64-setup.exe",
+            "release/MELY-dev-windows-x64-SHA256SUMS.txt"
+          )
+          gh release upload $tag @assets --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload dev release assets." }

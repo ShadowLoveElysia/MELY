@@ -1,0 +1,94 @@
+name: Windows Release Assets
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mely-windows-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    name: Build assets from the published tag
+    if: >-
+      github.event.release.prerelease == false &&
+      github.event.release.draft == false &&
+      github.event.release.tag_name != 'dev-latest' &&
+      startsWith(github.event.release.tag_name, 'v')
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the published release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Read project version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache Rust build data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build and test tagged Windows packages
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: ./scripts/build-windows-release.ps1 -Channel release -ExpectedTag $env:RELEASE_TAG
+
+      - name: Preserve workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: MELY-${{ steps.version.outputs.version }}-windows-x64
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            release/MELY-${{ steps.version.outputs.version }}-windows-x64-portable.zip
+            release/MELY-${{ steps.version.outputs.version }}-windows-x64-setup.exe
+            release/MELY-${{ steps.version.outputs.version }}-windows-x64-SHA256SUMS.txt
+
+      - name: Attach assets to the published release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          MELY_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $assets = @(
+            "release/MELY-$env:MELY_VERSION-windows-x64-portable.zip",
+            "release/MELY-$env:MELY_VERSION-windows-x64-setup.exe",
+            "release/MELY-$env:MELY_VERSION-windows-x64-SHA256SUMS.txt"
+          )
+          gh release upload $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload release assets." }
