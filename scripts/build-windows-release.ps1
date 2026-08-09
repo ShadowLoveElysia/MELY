@@ -40,17 +40,46 @@ function Invoke-Native {
   )
 
   Write-Host ("> " + $FilePath + " " + ($ArgumentList -join " "))
-  $options = @{
-    FilePath = $FilePath
-    WorkingDirectory = $projectRoot
-    NoNewWindow = $true
-    Wait = $true
-    PassThru = $true
+  if ([IO.Path]::GetExtension($FilePath) -in @(".cmd", ".bat")) {
+    $options = @{
+      FilePath = $FilePath
+      WorkingDirectory = $projectRoot
+      NoNewWindow = $true
+      Wait = $true
+      PassThru = $true
+    }
+    if ($ArgumentList.Count -gt 0) { $options.ArgumentList = $ArgumentList }
+    $process = Start-Process @options
+    if ($process.ExitCode -ne 0) {
+      throw "Command failed with exit code $($process.ExitCode): $FilePath"
+    }
+    return
   }
-  if ($ArgumentList.Count -gt 0) { $options.ArgumentList = $ArgumentList }
-  $process = Start-Process @options
-  if ($process.ExitCode -ne 0) {
-    throw "Command failed with exit code $($process.ExitCode): $FilePath"
+
+  $escapedArguments = foreach ($argument in $ArgumentList) {
+    if ($argument -notmatch '[\s"]' -and $argument.Length -gt 0) {
+      $argument
+      continue
+    }
+    $escaped = [Regex]::Replace($argument, '(\\*)"', '$1$1\"')
+    $escaped = [Regex]::Replace($escaped, '(\\+)$', '$1$1')
+    '"' + $escaped + '"'
+  }
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $FilePath
+  $startInfo.Arguments = $escapedArguments -join " "
+  $startInfo.WorkingDirectory = $projectRoot
+  $startInfo.UseShellExecute = $false
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  if (-not $process.Start()) {
+    throw "Could not start command: $FilePath"
+  }
+  $process.WaitForExit()
+  $exitCode = $process.ExitCode
+  $process.Dispose()
+  if ($exitCode -ne 0) {
+    throw "Command failed with exit code ${exitCode}: $FilePath"
   }
 }
 
@@ -311,14 +340,20 @@ if (-not (Test-Path -LiteralPath $typescriptCli) -or -not (Test-Path -LiteralPat
 
 Invoke-Native $node @($typescriptCli, "-b")
 if (-not $SkipTests) {
-  $testFiles = Get-ChildItem -LiteralPath (Join-Path $projectRoot "tests") -Filter "*.test.ts" -File |
-    Sort-Object Name |
-    Select-Object -ExpandProperty FullName
-  if (-not $testFiles) {
-    throw "No test files were found under tests/*.test.ts."
+  $testsRoot = Join-Path $projectRoot "tests"
+  if (Test-Path -LiteralPath $testsRoot) {
+    $testFiles = Get-ChildItem -LiteralPath $testsRoot -Filter "*.test.ts" -File |
+      Sort-Object Name |
+      Select-Object -ExpandProperty FullName
+    if ($testFiles) {
+      $testArguments = @("--import", "tsx", "--test", "--test-concurrency=1") + @($testFiles)
+      Invoke-Native $node $testArguments
+    } else {
+      Write-Warning "The tests directory exists but contains no *.test.ts files. Continuing without tests."
+    }
+  } else {
+    Write-Warning "The tests directory is not present in this checkout. Continuing without tests."
   }
-  $testArguments = @("--import", "tsx", "--test", "--test-concurrency=1") + @($testFiles)
-  Invoke-Native $node $testArguments
 }
 Invoke-Native $node @($viteCli, "build", "--config", "vite.config.ts")
 

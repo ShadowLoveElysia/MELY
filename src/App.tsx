@@ -132,7 +132,7 @@ const initialSolidOptions: SolidOptions = {
   thicknessCompensation: 0.08,
   fillMode: "shell",
   palettePreset: "clean",
-  faceDetail: "balanced",
+  faceDetail: "off",
   materialTheme: "original",
   dithering: 0,
   emissiveMapping: true,
@@ -1549,7 +1549,7 @@ export default function App() {
           description: t("export.description.unified", { version: "1.20.1" }),
           regionMaxSize: 32,
         }).bytes;
-        extension = "litematica";
+        extension = "litematic";
         mime = "application/gzip";
       } else if (request.format === "schematic") {
         const { createSchematic } = await import("./core/schematic");

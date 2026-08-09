@@ -402,7 +402,7 @@ const createBundlePlan = (
       relativeOffset: view.occupiedBounds.min.map((value, axis) =>
         value - anchor[axis]) as Point,
       files: {
-        litematic: `${root}.litematica`,
+        litematic: `${root}.litematic`,
         ...(includeSchematic ? { schematic: `${root}.schem` } : {}),
         ...(includeMcstructure ? { mcstructure: `${root}.mcstructure` } : {}),
       },
@@ -412,7 +412,7 @@ const createBundlePlan = (
     name,
     slug,
     anchor,
-    overallLitematic: `litematica/${slug}.litematica`,
+    overallLitematic: `litematica/${slug}.litematic`,
     views,
     parts,
     includeSchematic,

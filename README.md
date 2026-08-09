@@ -9,10 +9,21 @@
 
 **简体中文** | [English](docs/README.en.md) | [日本語](docs/README.ja.md)
 
+## 普通用户使用方法
+
+1. 从项目的 [GitHub Releases](https://github.com/ShadowLoveElysia/MELY/releases) 页面下载 Windows x64 安装包 `MELY-<版本号>-windows-x64-setup.exe`，或下载便携版 `MELY-<版本号>-windows-x64-portable.zip`。普通用户无需下载 Source code 压缩包。
+2. 安装版直接运行安装程序；便携版需先完整解压，再双击 `MELY.exe`。若系统提示缺少 WebView2，请安装 Microsoft Edge WebView2 Runtime。
+3. 导入 `.pmx`、`.pmd` 模型或包含模型与贴图的 ZIP 文件，根据需要再导入 `.vmd` 动作。
+4. 在预览中调整动作时间、模型骨骼和生成参数，选定目标姿态后点击“锁定当前动作”。
+5. 选择实体方块或 Ethereal Hologram 全息线框模式，设置目标高度、采样间距和材质方案，然后生成投影。
+6. 检查 3D 预览、材料清单和分层建造指南，再按目标版本导出 `.litematica`、`.schem`、`.mcstructure` 或 `.mcfunction` 行为包。
+
+> 已打包的安装版和便携版不需要 Node.js、Rust 或 Visual Studio Build Tools。本文后续的环境配置、快速启动、构建与开发命令面向需要从源码运行或参与开发的用户。
+
 ## 模型资源与友情链接
 
 - [模之屋（APlayBox）](https://www.aplaybox.com/)：模型创作与分享平台。本链接仅用于方便用户查找由发布者提供的资源，不表示 MELY 对任何资源的权利状态、质量或可用范围作出保证。
-- 下载或使用任何资源前，请逐项阅读并遵守资源页面、压缩包或附带文件中的模型声明、README 和配布条款，包括署名、修改、转换、导出、公开展示、再分发及商业使用等限制，同时遵守[模之屋用户使用协议](https://www.aplaybox.com/agreement)。
+- 下载或使用任何资源前，请逐项阅读并遵守资源页面、压缩包或附带文件中的模型声明、README 和配布条款，包括署名、修改、转换、导出、公开展示、再分发及商业使用等限制，同时遵守[模之屋用户使用协议](https://www.aplaybox.com/agreement)及适用法律。
 
 MELY 是一款面向 Minecraft 建筑创作者的 MMD 模型转换与工程规划工具。
 

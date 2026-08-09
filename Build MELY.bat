@@ -22,5 +22,5 @@ if "%MELY_EXIT%"=="0" (
 )
 
 popd
-pause
+if not defined MELY_NO_PAUSE pause
 endlocal & exit /b %MELY_EXIT%
