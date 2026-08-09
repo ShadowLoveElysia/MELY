@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  areMotionTracksReadyForGeneration,
   canToggleMotionPlayback,
   formatMotionFrame,
   getAdjacentMotionFrame,
@@ -36,6 +37,25 @@ test("VMD generation requires a locked frame while static poses do not", () => {
   assert.equal(isMotionReadyForGeneration(true, null), false);
   assert.equal(isMotionReadyForGeneration(true, 0), true);
   assert.equal(isMotionReadyForGeneration(true, 12.375), true);
+});
+
+test("dual-track generation requires every loaded track to be locked", () => {
+  assert.equal(areMotionTracksReadyForGeneration([
+    { loaded: false, lockedFrame: null },
+    { loaded: false, lockedFrame: null },
+  ]), true);
+  assert.equal(areMotionTracksReadyForGeneration([
+    { loaded: true, lockedFrame: 12 },
+    { loaded: false, lockedFrame: null },
+  ]), true);
+  assert.equal(areMotionTracksReadyForGeneration([
+    { loaded: true, lockedFrame: 12 },
+    { loaded: true, lockedFrame: null },
+  ]), false);
+  assert.equal(areMotionTracksReadyForGeneration([
+    { loaded: true, lockedFrame: 12 },
+    { loaded: true, lockedFrame: 7.5 },
+  ]), true);
 });
 
 test("space playback is available only for an unlocked VMD motion", () => {

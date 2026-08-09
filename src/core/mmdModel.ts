@@ -1,6 +1,5 @@
 import {
   BufferGeometry,
-  Quaternion,
   Skeleton,
   Texture,
   type Color,
@@ -244,22 +243,14 @@ const materialCount = (mesh: SkinnedMesh) =>
 const materialList = (mesh: SkinnedMesh) =>
   (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) as Material[];
 
-interface RuntimeMorph {
-  name?: string;
-  englishName?: string;
-  type?: string;
-  groupOffsets?: readonly { morphIndex: number; weight: number }[];
-  flipOffsets?: readonly { morphIndex: number; weight: number }[];
-  boneOffsets?: readonly {
-    boneIndex: number;
-    translation: readonly [number, number, number];
-    rotation: readonly [number, number, number, number];
-  }[];
-}
-
 interface ExpressionTrackState {
   animation: MmdAnimation;
-  bindings: readonly { morphIndex: number; track: VmdMorphTrack }[];
+  bindings: readonly {
+    name: string;
+    source: VmdMorphTrack;
+    sampled: VmdMorphTrack;
+  }[];
+  morphTracks: Record<string, VmdMorphTrack>;
 }
 
 const maxPackedTrackFrame = (
@@ -267,26 +258,6 @@ const maxPackedTrackFrame = (
 ) => tracks.reduce((maximum, track) => (
   Math.max(maximum, track.frames[track.frames.length - 1] ?? 0)
 ), 0);
-
-const filteredDanceAnimation = (animation: MmdAnimation): MmdAnimation => ({
-  ...animation,
-  bytes: new Uint8Array(),
-  metadata: {
-    ...animation.metadata,
-    counts: {
-      ...animation.metadata.counts,
-      morphs: 0,
-      cameras: 0,
-      lights: 0,
-      selfShadows: 0,
-    },
-    maxFrame: maxPackedTrackFrame(Object.values(animation.boneTracks)),
-  },
-  morphTracks: {},
-  cameraFrames: [],
-  lightFrames: [],
-  selfShadowFrames: [],
-});
 
 const sampleMorphTrack = (track: VmdMorphTrack, frame: number) => {
   const frames = track.frames;
@@ -313,127 +284,71 @@ const sampleMorphTrack = (track: VmdMorphTrack, frame: number) => {
   return previousWeight + ((track.weights[nextIndex] ?? previousWeight) - previousWeight) * ratio;
 };
 
-const weightedQuaternion = (
-  source: readonly [number, number, number, number],
-  weight: number,
-  sourceScratch: Quaternion,
-  resultScratch: Quaternion,
-) => {
-  sourceScratch.set(-source[0], -source[1], source[2], source[3]).normalize();
-  if (weight < 0) {
-    sourceScratch.x *= -1;
-    sourceScratch.y *= -1;
-    sourceScratch.z *= -1;
-    weight = -weight;
-  }
-  return resultScratch.identity().slerp(sourceScratch, weight);
-};
-
-const runtimeMorphs = (mesh: SkinnedMesh): RuntimeMorph[] => (
-  Array.isArray(mesh.userData.mmdMorphs) ? mesh.userData.mmdMorphs : []
-);
-
 const expressionBindings = (
   mesh: SkinnedMesh,
   animation: MmdAnimation,
 ) => {
-  const indices = new Map<string, number>();
-  Object.entries(mesh.morphTargetDictionary ?? {}).forEach(([name, index]) => indices.set(name, index));
-  runtimeMorphs(mesh).forEach((morph, index) => {
-    if (morph.name) indices.set(morph.name, index);
-    if (morph.englishName) indices.set(morph.englishName, index);
-  });
-  return Object.entries(animation.morphTracks).flatMap(([name, track]) => {
-    const morphIndex = indices.get(name);
-    return morphIndex === undefined ? [] : [{ morphIndex, track }];
-  });
-};
-
-const expandExpressionMorph = (
-  morphs: readonly RuntimeMorph[],
-  weights: number[],
-  morphIndex: number,
-  weight: number,
-  visited: Uint8Array,
-) => {
-  const morph = morphs[morphIndex];
-  const offsets = morph?.type === "flip" ? morph.flipOffsets : morph?.groupOffsets;
-  if ((morph?.type !== "group" && morph?.type !== "flip") || !offsets || weight === 0) return;
-  offsets.forEach((offset) => {
-    if (offset.morphIndex < 0 || offset.morphIndex >= weights.length) return;
-    const contribution = weight * offset.weight;
-    weights[offset.morphIndex] = (weights[offset.morphIndex] ?? 0) + contribution;
-    if (contribution === 0 || visited[offset.morphIndex] === 1) return;
-    visited[offset.morphIndex] = 1;
-    expandExpressionMorph(morphs, weights, offset.morphIndex, contribution, visited);
-    visited[offset.morphIndex] = 0;
+  const names = new Set(Object.keys(mesh.morphTargetDictionary ?? {}));
+  const runtimeMorphs = mesh.userData.mmdMorphs;
+  if (Array.isArray(runtimeMorphs)) {
+    runtimeMorphs.forEach((morph) => {
+      if (!morph || typeof morph !== "object") return;
+      const name = (morph as { name?: unknown }).name;
+      const englishName = (morph as { englishName?: unknown }).englishName;
+      if (typeof name === "string" && name) names.add(name);
+      if (typeof englishName === "string" && englishName) names.add(englishName);
+    });
+  }
+  return Object.entries(animation.morphTracks).flatMap(([name, source]) => {
+    if (!names.has(name)) return [];
+    const sampled: VmdMorphTrack = {
+      packed: "morph",
+      frames: new Uint32Array([0]),
+      weights: new Float32Array([0]),
+    };
+    return [{ name, source, sampled }];
   });
 };
 
-const syncMorphSplitTargets = (mesh: SkinnedMesh) => {
-  const sourceInfluences = mesh.morphTargetInfluences;
-  const bodyMeshes = mesh.userData.mmdMorphSplitBodyMeshes;
-  if (!sourceInfluences || !Array.isArray(bodyMeshes)) return;
-  bodyMeshes.forEach((body) => {
-    if (!isSkinnedMesh(body) || !body.morphTargetInfluences) return;
-    const indices = body.userData.mmdMorphSplitBody?.morphTargetIndices as ArrayLike<number> | undefined;
-    if (!indices) return;
-    for (let index = 0; index < indices.length; index += 1) {
-      body.morphTargetInfluences[index] = sourceInfluences[indices[index] ?? -1] ?? 0;
-    }
-  });
-};
-
-const applyExpressionTrack = (
-  mesh: SkinnedMesh,
+const sampleExpressionTrack = (
   state: ExpressionTrackState | null,
   frame: number,
 ) => {
-  const influences = mesh.morphTargetInfluences;
-  if (!influences) return;
-  influences.fill(0);
-  if (!state) {
-    syncMorphSplitTargets(mesh);
-    return;
-  }
-  state.bindings.forEach(({ morphIndex, track }) => {
-    influences[morphIndex] = sampleMorphTrack(track, frame);
+  state?.bindings.forEach(({ source, sampled }) => {
+    sampled.weights[0] = sampleMorphTrack(source, frame);
   });
-  const morphs = runtimeMorphs(mesh);
-  const weights = Array.from(influences);
-  const directWeights = [...weights];
-  const visited = new Uint8Array(weights.length);
-  morphs.forEach((_morph, index) => {
-    const weight = directWeights[index] ?? 0;
-    if (weight === 0) return;
-    visited[index] = 1;
-    expandExpressionMorph(morphs, weights, index, weight, visited);
-    visited[index] = 0;
-  });
-  influences.forEach((_weight, index) => {
-    influences[index] = weights[index] ?? 0;
-  });
-  const sourceQuaternion = new Quaternion();
-  const weightedQuaternionResult = new Quaternion();
-  morphs.forEach((morph, morphIndex) => {
-    const weight = weights[morphIndex] ?? 0;
-    if (morph.type !== "bone" || weight === 0) return;
-    morph.boneOffsets?.forEach((offset) => {
-      const bone = mesh.skeleton.bones[offset.boneIndex];
-      if (!bone) return;
-      bone.position.x += offset.translation[0] * weight;
-      bone.position.y += offset.translation[1] * weight;
-      bone.position.z -= offset.translation[2] * weight;
-      bone.quaternion.premultiply(weightedQuaternion(
-        offset.rotation,
-        weight,
-        sourceQuaternion,
-        weightedQuaternionResult,
-      ));
-      bone.updateMatrix();
-    });
-  });
-  syncMorphSplitTargets(mesh);
+};
+
+const combinedMotionAnimation = (
+  dance: MmdAnimation | null,
+  expression: ExpressionTrackState | null,
+): MmdAnimation | null => {
+  const source = dance ?? expression?.animation;
+  if (!source) return null;
+  const boneTracks = dance?.boneTracks ?? {};
+  const morphTracks = expression?.morphTracks ?? {};
+  return {
+    ...source,
+    bytes: new Uint8Array(),
+    metadata: {
+      ...source.metadata,
+      counts: {
+        ...source.metadata.counts,
+        bones: Object.keys(boneTracks).length,
+        morphs: Object.keys(morphTracks).length,
+        cameras: 0,
+        lights: 0,
+        selfShadows: 0,
+      },
+      maxFrame: maxPackedTrackFrame(Object.values(boneTracks)),
+    },
+    boneTracks,
+    morphTracks,
+    cameraFrames: [],
+    lightFrames: [],
+    selfShadowFrames: [],
+    propertyFrames: dance?.propertyFrames ?? [],
+  };
 };
 
 const SKIN_KEYWORDS = [
@@ -687,6 +602,7 @@ export const loadMmdModel = async (
     dance: null,
     expression: null,
   };
+  let danceAnimation: MmdAnimation | null = null;
   let expressionTrack: ExpressionTrackState | null = null;
 
   const currentModel = () => {
@@ -759,17 +675,20 @@ export const loadMmdModel = async (
         throw appError("error.motion.noCompatibleTracks");
       }
       if (kind === "dance") {
-        target.setAnimation(filteredDanceAnimation(motion.animation));
+        danceAnimation = motion.animation;
       } else {
+        const bindings = expressionBindings(target.mesh, motion.animation);
         expressionTrack = {
           animation: motion.animation,
-          bindings: expressionBindings(target.mesh, motion.animation),
+          bindings,
+          morphTracks: Object.fromEntries(bindings.map(({ name, sampled }) => [name, sampled])),
         };
       }
-      const frameState = kind === "dance"
-        ? evaluateMmdPreviewFrame(target, 0)
-        : target.runtime.frameState();
-      applyExpressionTrack(target.mesh, expressionTrack, 0);
+      const combined = combinedMotionAnimation(danceAnimation, expressionTrack);
+      if (!combined) throw new Error("MMD motion binding was unexpectedly empty");
+      sampleExpressionTrack(expressionTrack, 0);
+      target.setAnimation(combined);
+      const frameState = evaluateMmdPreviewFrame(target, 0);
       syncMmdSkeletonForCpuRead(target);
       currentPose().syncAfterRuntimeUpdate();
       const maxFrame = kind === "dance"
@@ -798,16 +717,8 @@ export const loadMmdModel = async (
       const expression = expressionDuration > 0
         ? Math.max(0, Math.min(expressionDuration, times.expression))
         : 0;
-      if (motionInfo.dance) evaluateMmdPreviewFrame(target, dance);
-      else {
-        target.runtime.resetPose();
-        evaluateMmdPreviewFrame(target, 0);
-      }
-      applyExpressionTrack(
-        target.mesh,
-        expressionTrack,
-        expression * (motionInfo.expression?.frameRate ?? 30),
-      );
+      sampleExpressionTrack(expressionTrack, expression * (motionInfo.expression?.frameRate ?? 30));
+      evaluateMmdPreviewFrame(target, dance);
       currentPose().syncAfterRuntimePreview();
       return { dance, expression };
     },
@@ -819,16 +730,8 @@ export const loadMmdModel = async (
       const expression = expressionDuration > 0
         ? Math.max(0, Math.min(expressionDuration, times.expression))
         : 0;
-      if (motionInfo.dance) evaluateMmdPreviewFrame(target, dance);
-      else {
-        target.runtime.resetPose();
-        evaluateMmdPreviewFrame(target, 0);
-      }
-      applyExpressionTrack(
-        target.mesh,
-        expressionTrack,
-        expression * (motionInfo.expression?.frameRate ?? 30),
-      );
+      sampleExpressionTrack(expressionTrack, expression * (motionInfo.expression?.frameRate ?? 30));
+      evaluateMmdPreviewFrame(target, dance);
       currentPose().syncAfterRuntimeUpdate();
       syncMmdSkeletonForCpuRead(target);
       return { dance, expression };
@@ -837,16 +740,21 @@ export const loadMmdModel = async (
       const target = currentModel();
       if (!kind || kind === "dance") {
         motionInfo.dance = null;
-        target.runtime.clearAnimation();
+        danceAnimation = null;
       }
       if (!kind || kind === "expression") {
         motionInfo.expression = null;
         expressionTrack = null;
       }
-      if (!motionInfo.dance) target.runtime.resetPose();
-      if (motionInfo.dance) evaluateMmdPreviewFrame(target, 0);
-      else evaluateMmdPreviewFrame(target, 0);
-      applyExpressionTrack(target.mesh, expressionTrack, 0);
+      const combined = combinedMotionAnimation(danceAnimation, expressionTrack);
+      if (combined) {
+        target.setAnimation(combined);
+        evaluateMmdPreviewFrame(target, 0);
+      } else {
+        target.runtime.clearAnimation();
+        target.runtime.resetPose();
+        evaluateMmdPreviewFrame(target, 0);
+      }
       syncMmdSkeletonForCpuRead(target);
       currentPose().syncAfterRuntimeUpdate();
     },
@@ -867,6 +775,7 @@ export const loadMmdModel = async (
       activeModel = null;
       motionInfo.dance = null;
       motionInfo.expression = null;
+      danceAnimation = null;
       expressionTrack = null;
       pose = null;
       disposeMmdModelResources(disposedModel, disposeMmdModel);

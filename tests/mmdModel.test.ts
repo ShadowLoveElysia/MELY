@@ -239,7 +239,7 @@ test("disposed model pose methods no longer retain a usable pose controller", as
   assert.throws(() => nudgeBone(0, "x", 1), /disposed/);
 });
 
-test("loaded VMD reports tracks that actually match the model", async () => {
+test("dance and expression tracks sample independent frames from one VMD", async () => {
   const { readFile } = await import("node:fs/promises");
   const [modelBytes, motionBytes] = await Promise.all([
     readFile(new URL("./fixtures/mely-input-e2e.pmd", import.meta.url)),
@@ -250,11 +250,22 @@ test("loaded VMD reports tracks that actually match the model", async () => {
   const model = await loadMmdModel([modelFile], modelFile);
 
   try {
-    const motion = await model.loadMotion(motionFile);
-    assert.equal(motion.boneTrackCount, 4);
-    assert.equal(motion.matchedBoneTrackCount, 4);
-    assert.equal(motion.morphTrackCount, 1);
-    assert.equal(motion.matchedMorphTrackCount, 1);
+    const dance = await model.loadMotion(motionFile, "dance");
+    const expression = await model.loadMotion(motionFile, "expression");
+    assert.equal(dance.kind, "dance");
+    assert.equal(dance.boneTrackCount, 4);
+    assert.equal(dance.matchedBoneTrackCount, 4);
+    assert.equal(expression.kind, "expression");
+    assert.equal(expression.morphTrackCount, 1);
+    assert.equal(expression.matchedMorphTrackCount, 1);
+
+    const evaluated = model.updatePose({ dance: 1, expression: 0.5 });
+    const root = model.mesh.skeleton.bones.find((bone) => bone.name === "root");
+    const smileIndex = model.mesh.morphTargetDictionary?.smile;
+    assert.deepEqual(evaluated, { dance: 1, expression: 0.5 });
+    assert.ok(root);
+    assert.ok(Math.abs(root.position.x - 0.55) < 1e-5);
+    assert.equal(smileIndex === undefined ? undefined : model.mesh.morphTargetInfluences?.[smileIndex], 0.5);
   } finally {
     model.dispose();
   }

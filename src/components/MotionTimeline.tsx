@@ -87,8 +87,12 @@ export function MotionTimeline({
         <button
           type="button"
           className={`motion-play-button ${playing ? "motion-play-button--active" : ""}`}
-          aria-label={playing ? t("sidebar.motion.pause") : t("sidebar.motion.play")}
-          title={playing ? t("sidebar.motion.pause") : t("sidebar.motion.play")}
+          aria-label={playing
+            ? t("sidebar.motion.pause", { track: trackLabel })
+            : t("sidebar.motion.play", { track: trackLabel })}
+          title={playing
+            ? t("sidebar.motion.pause", { track: trackLabel })
+            : t("sidebar.motion.play", { track: trackLabel })}
           disabled={locked || disabled}
           onClick={() => onPlayingChange(!playing)}
         >
@@ -142,14 +146,20 @@ export function MotionTimeline({
       <button
         type="button"
         className={`viewport-motion__lock ${locked ? "viewport-motion__lock--active" : ""}`}
-        aria-label={locked ? t("sidebar.motion.unlock") : t("sidebar.motion.lock")}
-        title={locked ? t("sidebar.motion.unlock") : t("sidebar.motion.lock")}
+        aria-label={locked
+          ? t("sidebar.motion.unlock", { track: trackLabel })
+          : t("sidebar.motion.lock", { track: trackLabel })}
+        title={locked
+          ? t("sidebar.motion.unlock", { track: trackLabel })
+          : t("sidebar.motion.lock", { track: trackLabel })}
         aria-pressed={locked}
         disabled={disabled}
         onClick={onLockToggle}
       >
         {locked ? <Unlock size={15} /> : <Lock size={15} />}
-        <span>{locked ? t("sidebar.motion.unlock") : t("sidebar.motion.lock")}</span>
+        <span>{locked
+          ? t("sidebar.motion.unlock", { track: trackLabel })
+          : t("sidebar.motion.lock", { track: trackLabel })}</span>
       </button>
     </section>
   );

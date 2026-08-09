@@ -1022,7 +1022,6 @@ export default function App() {
             setAssets((current) => [...current, ...nextAssets]);
             expandedAssetsRef.current = [...expandedAssetsRef.current, ...expanded];
             setPreviewMode("source");
-            const loadedMotion = loadedTracks[0];
             setToast(t("toast.motionLoaded", {
               name: loadedTracks.map((track) => track.name).join(" + "),
               frames: number(Math.max(...loadedTracks.map((track) => track.maxFrame))),
@@ -1211,7 +1210,10 @@ export default function App() {
     invalidateProjection("motion-lock");
     setPoseRevision((value) => value + 1);
     setPreviewMode("source");
-    setToast(t("toast.motionLocked", { frame: formatMotionFrame(exactFrame) }));
+    setToast(t("toast.motionLocked", {
+      track: t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack"),
+      frame: `${kind === "dance" ? "D" : "E"}${formatMotionFrame(exactFrame)}`,
+    }));
   };
 
   const changePreviewMode = (mode: PreviewMode) => {
@@ -1789,14 +1791,15 @@ export default function App() {
           <span>{showMotionStatus ? (
             <span className="motion-status-list">
               {MOTION_TRACK_KINDS.map((kind) => motionTracks[kind] ? (
-                <MotionStatusText
-                  key={kind}
-                  kind={kind}
-                  motion={motionTracks[kind]}
-                  timeSource={motionRuntime[kind].timeStore}
-                  playbackSource={motionRuntime[kind].playbackStore}
-                  lockedFrame={lockedMotionFrames[kind]}
-                />
+                <span key={kind}>
+                  <MotionStatusText
+                    kind={kind}
+                    motion={motionTracks[kind]}
+                    timeSource={motionRuntime[kind].timeStore}
+                    playbackSource={motionRuntime[kind].playbackStore}
+                    lockedFrame={lockedMotionFrames[kind]}
+                  />
+                </span>
               ) : null)}
             </span>
           ) : statusText}</span>

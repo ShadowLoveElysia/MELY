@@ -4,7 +4,7 @@ import { zipSync, strToU8 } from "fflate";
 import { AppError } from "../src/core/appError";
 import {
   expandMmdAssets,
-  selectPrimaryMmdMotionCandidate,
+  selectMmdMotionTrackCandidates,
 } from "../src/core/mmdAssets";
 
 test("ZIP model packages expand from a stream and preserve relative asset paths", async () => {
@@ -45,10 +45,10 @@ test("invalid ZIP packages report a stable archive error code", async () => {
   });
 });
 
-test("multi-VMD packages prefer a compatible body motion over a facial-only motion", () => {
+test("multi-VMD packages select compatible dance and expression tracks independently", () => {
   const facial = new File([Uint8Array.of(1)], "樱花草表情.vmd");
   const body = new File([Uint8Array.of(2)], "樱花草动作.vmd");
-  const selected = selectPrimaryMmdMotionCandidate([
+  const selected = selectMmdMotionTrackCandidates([
     {
       file: facial,
       path: "樱花草/樱花草表情.vmd",
@@ -69,6 +69,8 @@ test("multi-VMD packages prefer a compatible body motion over a facial-only moti
     },
   ]);
 
-  assert.equal(selected?.file, body);
-  assert.equal(selected?.matchedBoneTrackCount, 57);
+  assert.equal(selected.dance?.file, body);
+  assert.equal(selected.dance?.matchedBoneTrackCount, 57);
+  assert.equal(selected.expression?.file, facial);
+  assert.equal(selected.expression?.matchedMorphTrackCount, 27);
 });

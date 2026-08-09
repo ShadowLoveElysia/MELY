@@ -13,8 +13,8 @@
 
 1. Download the Windows x64 installer `MELY-<version>-windows-x64-setup.exe` or the portable archive `MELY-<version>-windows-x64-portable.zip` from [GitHub Releases](https://github.com/ShadowLoveElysia/MELY/releases). General users do not need the Source code archives.
 2. Run the installer directly, or fully extract the portable archive and then double-click `MELY.exe`. If Windows reports that WebView2 is missing, install the Microsoft Edge WebView2 Runtime.
-3. Import a `.pmx` or `.pmd` model, or a ZIP archive containing the model and its textures. Import a `.vmd` motion when needed.
-4. Adjust the motion time, model bones, and generation settings in the preview. Once the desired pose is selected, choose **Lock current frame**.
+3. Import a `.pmx` or `.pmd` model, or a ZIP archive containing the model and its textures. Add dance-motion or expression `.vmd` files as needed.
+4. Dance and expression tracks appear only after their data is imported; unloaded tracks do not occupy space. Adjust each track independently, then lock every loaded track once the combined pose is ready.
 5. Select solid-block mode or Ethereal Hologram wireframe mode, configure the target height, sampling interval, and material scheme, and then generate the projection.
 6. Review the 3D preview, material list, and layered building guide, then export a `.litematic`, `.schem`, `.mcstructure`, or `.mcfunction` behavior pack for the target edition.
 
@@ -34,8 +34,9 @@ MELY currently targets the Minecraft Java Edition 1.20.1 block registry while al
 ## Key Features
 
 - Import `.pmx` and `.pmd` models, ZIP model packages, and their textures.
-- Import `.vmd` motions with real-time playback, pause, timeline scrubbing, frame-by-frame adjustment, and pose locking.
-- Play or pause VMD motions with the Space key.
+- Separate VMD bone motion and expression morphs into independent tracks, showing only tracks whose data has been imported.
+- Play, pause, scrub, step, and lock the dance and expression tracks independently; preview and generation combine their selected frames.
+- Use the Space key for the dance track when present, or the expression track when no dance track is loaded.
 - Render animation in real time on the GPU, then generate CPU-skinned snapshots only when locking a frame or voxelizing.
 - Adjust model bones manually and import or export lightweight MELY Pose JSON files.
 - Generate solid-block voxels or Ethereal Hologram wireframes.
@@ -205,9 +206,9 @@ To rebuild an existing Release, manually run **Windows Release Assets** from the
 ## Basic Workflow
 
 1. Drag a PMX or PMD model and its textures, or a ZIP package containing them, into MELY.
-2. Import a VMD motion file when needed.
-3. Play the motion, find the desired moment on the timeline, and stop it with the Space key or the pause button.
-4. Select **Lock Motion** to use the current frame as the pose for voxelization and projection generation.
+2. Import a dance-motion VMD, an expression VMD, or a VMD containing both bone and morph data as needed.
+3. MELY displays only loaded tracks. Play or scrub the dance and expression tracks independently to combine the desired motion and expression frames.
+4. Lock every loaded track to use the combined pose for voxelization and projection generation.
 5. Select solid mode or hologram wireframe mode, then set the target height, sampling interval, and material scheme.
 6. Generate the projection and inspect the 3D preview, material list, and layered building guide.
 7. Export Litematica, Schematic, Bedrock Structure, or a command behavior pack for the target platform.

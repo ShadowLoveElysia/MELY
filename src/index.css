@@ -113,6 +113,18 @@ button {
   font-size: 11px;
 }
 
+.motion-status-list {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.motion-status-list > :not(:last-child)::after {
+  margin-left: 10px;
+  color: #4e5b64;
+  content: "/";
+}
+
 .status-dot {
   width: 7px;
   height: 7px;
@@ -1334,6 +1346,14 @@ select:focus { border-color: #268ea0; }
   grid-template-rows: minmax(0, 1fr) auto;
 }
 
+.viewport-motion-stack {
+  z-index: 7;
+  display: grid;
+  border-top: 1px solid #2b3e47;
+  background: #11181d;
+  box-shadow: 0 -8px 24px rgb(0 0 0 / 28%);
+}
+
 .viewport-stage {
   position: relative;
   min-width: 0;
@@ -1349,19 +1369,20 @@ select:focus { border-color: #268ea0; }
 }
 
 .viewport-motion {
-  z-index: 7;
   display: grid;
-  min-height: 66px;
+  min-height: 62px;
   grid-template-columns: minmax(140px, 0.9fr) auto minmax(260px, 2fr) auto auto;
   gap: 12px;
   align-items: center;
   padding: 10px 16px;
-  border-width: 1px 0 0;
+  border-width: 0;
   border-radius: 0;
   border-color: #2b3e47;
   background: #11181d;
-  box-shadow: 0 -8px 24px rgb(0 0 0 / 28%);
+  box-shadow: none;
 }
+
+.viewport-motion + .viewport-motion { border-top: 1px solid #26343c; }
 
 .viewport-motion__identity,
 .viewport-motion__identity > span,
@@ -1374,6 +1395,7 @@ select:focus { border-color: #268ea0; }
 }
 
 .viewport-motion__identity { gap: 8px; color: #e2b666; }
+.viewport-motion--expression .viewport-motion__identity { color: #72cfc2; }
 .viewport-motion__identity > span { flex-direction: column; align-items: flex-start; gap: 2px; }
 .viewport-motion__identity strong {
   overflow: hidden;
@@ -1384,6 +1406,11 @@ select:focus { border-color: #268ea0; }
   white-space: nowrap;
 }
 .viewport-motion__identity small { color: #71808a; font-size: 8px; }
+.viewport-motion__track-label {
+  color: #a98a51;
+  font-weight: 700;
+}
+.viewport-motion--expression .viewport-motion__track-label { color: #5ca99f; }
 .viewport-motion__transport { gap: 4px; }
 .viewport-motion__scrubber { gap: 10px; }
 .viewport-motion__scrubber input { min-width: 0; flex: 1; }
@@ -1915,14 +1942,14 @@ kbd {
   }
 
   .viewport-motion {
-    min-height: 106px;
-    grid-template-columns: minmax(0, 1fr) auto;
+    min-height: 88px;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 8px;
     padding: 9px 10px;
   }
   .viewport-motion__identity strong { max-width: 46vw; }
-  .viewport-motion__scrubber { grid-column: 1 / -1; }
-  .viewport-motion__lock { min-width: 42px; }
+  .viewport-motion__scrubber { grid-row: 2; grid-column: 1 / -1; }
+  .viewport-motion__lock { grid-row: 1; grid-column: 3; min-width: 42px; }
   .viewport-motion__lock span { display: none; }
 }
 

@@ -328,6 +328,7 @@ export const selectMmdMotionTrackCandidates = (
 
 const motionTargetNames = (model: Pick<LoadedMmdModel, "bones" | "mesh"> | undefined) => {
   const bones = new Set<string>();
+  const morphs = new Set(Object.keys(model?.mesh.morphTargetDictionary ?? {}));
   model?.bones.forEach((bone) => {
     if (bone.name) bones.add(bone.name);
     if (bone.englishName) bones.add(bone.englishName);
@@ -335,9 +336,19 @@ const motionTargetNames = (model: Pick<LoadedMmdModel, "bones" | "mesh"> | undef
   model?.mesh.skeleton.bones.forEach((bone) => {
     if (bone.name) bones.add(bone.name);
   });
+  const runtimeMorphs = model?.mesh.userData.mmdMorphs;
+  if (Array.isArray(runtimeMorphs)) {
+    runtimeMorphs.forEach((morph) => {
+      if (!morph || typeof morph !== "object") return;
+      const name = (morph as { name?: unknown }).name;
+      const englishName = (morph as { englishName?: unknown }).englishName;
+      if (typeof name === "string" && name) morphs.add(name);
+      if (typeof englishName === "string" && englishName) morphs.add(englishName);
+    });
+  }
   return {
     bones,
-    morphs: new Set(Object.keys(model?.mesh.morphTargetDictionary ?? {})),
+    morphs,
   };
 };
 
