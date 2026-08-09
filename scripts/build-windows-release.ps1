@@ -3,6 +3,7 @@ param(
   [ValidateSet("local", "dev", "release")]
   [string]$Channel = "local",
   [switch]$SkipInstall,
+  [switch]$RefreshDependencies,
   [switch]$SkipTests,
   [switch]$OpenOutput
 )
@@ -278,6 +279,10 @@ $npm = Resolve-Tool "npm.cmd" @(
   "$env:ProgramFiles\nodejs\npm.cmd",
   "$env:LOCALAPPDATA\Programs\nodejs\npm.cmd"
 )
+$npmCli = Join-Path (Split-Path -Parent $npm) "node_modules\npm\bin\npm-cli.js"
+if (-not (Test-Path -LiteralPath $npmCli)) {
+  throw "npm CLI was not found next to npm.cmd: $npmCli"
+}
 $cargo = Resolve-Tool "cargo.exe" @("$env:USERPROFILE\.cargo\bin\cargo.exe")
 $rustc = Resolve-Tool "rustc.exe" @("$env:USERPROFILE\.cargo\bin\rustc.exe")
 
@@ -313,13 +318,58 @@ Write-Host "[MELY] Rust: $((Get-NativeOutput $rustc @('--version')).Trim())"
 Write-Host "[MELY] MSVC linker: $link"
 Write-Host "[MELY] Windows SDK: $($windowsSdk.Version)"
 
-if (-not $SkipInstall) {
-  Invoke-Native $npm @("ci", "--no-audit", "--no-fund")
-}
-
 $tauriCli = Join-Path $projectRoot "node_modules\@tauri-apps\cli\tauri.js"
 $typescriptCli = Join-Path $projectRoot "node_modules\typescript\bin\tsc"
 $viteCli = Join-Path $projectRoot "node_modules\vite\bin\vite.js"
+$dependenciesReady =
+  (Test-Path -LiteralPath $tauriCli) -and
+  (Test-Path -LiteralPath $typescriptCli) -and
+  (Test-Path -LiteralPath $viteCli)
+
+if ($SkipInstall -and $RefreshDependencies) {
+  throw "-SkipInstall and -RefreshDependencies cannot be used together."
+}
+
+$installDependencies =
+  -not $SkipInstall -and
+  ($RefreshDependencies -or $Channel -ne "local" -or -not $dependenciesReady)
+if ($installDependencies) {
+  $npmWrapper = Join-Path $env:TEMP ("mely-npm-ci-" + [Guid]::NewGuid().ToString("N") + ".cmd")
+  try {
+    $npmArguments = "ci --no-audit --no-fund"
+    if ($Channel -eq "local") {
+      $npmArguments += " --ignore-scripts"
+    }
+    $npmWrapperLines = @(
+      "@echo off",
+      ('set "PATH=' + $nodeDirectory + ';%PATH%"'),
+      ('"' + $node + '" "' + $npmCli + '" ' + $npmArguments),
+      'exit /b %ERRORLEVEL%'
+    )
+    [IO.File]::WriteAllLines($npmWrapper, $npmWrapperLines, [Text.Encoding]::ASCII)
+    Invoke-Native $env:ComSpec @("/d", "/c", $npmWrapper)
+  } finally {
+    Remove-Item -LiteralPath $npmWrapper -Force -ErrorAction SilentlyContinue
+  }
+
+  if ($Channel -eq "local") {
+    # npm 11 can drop the Node.js directory from lifecycle PATH in some Windows launch environments.
+    $esbuildInstallers = @(
+      (Join-Path $projectRoot "node_modules\esbuild\install.js"),
+      (Join-Path $projectRoot "node_modules\tsx\node_modules\esbuild\install.js")
+    )
+    foreach ($installer in $esbuildInstallers) {
+      if (-not (Test-Path -LiteralPath $installer)) {
+        throw "Expected esbuild installer is missing after npm ci: $installer"
+      }
+      Invoke-Native $node @($installer)
+    }
+  }
+} elseif ($Channel -eq "local" -and -not $SkipInstall) {
+  Write-Host "[MELY] Reusing installed dependencies for the local build."
+  Write-Host "[MELY] Use -RefreshDependencies after closing development servers to run npm ci."
+}
+
 if (-not (Test-Path -LiteralPath $tauriCli)) {
   throw "Tauri dependencies are missing. Run npm ci or omit -SkipInstall."
 }

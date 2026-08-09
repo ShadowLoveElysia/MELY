@@ -24,6 +24,16 @@ test("Windows npm scripts invoke JavaScript entry points without relying on bin 
   assert.match(packageJson.scripts["preview:web"], /^node node_modules\/vite\/bin\/vite\.js preview /);
 });
 
+test("Windows release builds reuse local dependencies without weakening CI installs", async () => {
+  const builder = await readProjectFile("scripts/build-windows-release.ps1");
+  assert.match(builder, /\[switch\]\$RefreshDependencies/);
+  assert.match(builder, /\$RefreshDependencies -or \$Channel -ne "local" -or -not \$dependenciesReady/);
+  assert.match(builder, /if \(\$Channel -eq "local"\) \{[\s\S]*--ignore-scripts/);
+  assert.match(builder, /node_modules\\esbuild\\install\.js/);
+  assert.match(builder, /node_modules\\tsx\\node_modules\\esbuild\\install\.js/);
+  assert.match(builder, /Reusing installed dependencies for the local build/);
+});
+
 test("Tauri desktop shell uses v2 configuration and bundled Web assets", async () => {
   const config = JSON.parse(await readProjectFile("src-tauri/tauri.conf.json"));
   const cargo = await readProjectFile("src-tauri/Cargo.toml");
