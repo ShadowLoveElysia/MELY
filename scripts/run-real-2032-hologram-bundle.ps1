@@ -47,7 +47,7 @@ $summary = if ($ExportFormat -eq "bundle") {
   Join-Path $outputRoot ($RunLabel + "-validation-summary.json")
 }
 $outputPrefix = Join-Path $outputRoot $RunLabel
-$artifactExtension = if ($ExportFormat -eq "bundle") { ".zip" } else { ".litematica" }
+$artifactExtension = if ($ExportFormat -eq "bundle") { ".zip" } else { ".litematic" }
 Remove-Item -LiteralPath $viteStdout, $viteStderr, $auditStdout, $auditStderr, $report, $summary -ErrorAction SilentlyContinue
 
 foreach ($required in @($node, $edge, $playwright, $ModelZip)) {

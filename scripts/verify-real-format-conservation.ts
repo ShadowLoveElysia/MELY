@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { gunzipSync, strFromU8, unzipSync } from "fflate";
 import * as nbt from "prismarine-nbt";
@@ -25,10 +25,16 @@ type Point = [number, number, number];
 type StateMap = Map<string, string>;
 
 const projectRoot = resolve(import.meta.dirname, "..");
-const sourcePath = resolve(
-  process.env.MELY_FORMAT_SOURCE
-    ?? join(projectRoot, "test-generation-solid-balanced.litematica"),
-);
+const defaultSourcePath = join(projectRoot, "test-generation-solid-balanced.litematic");
+const legacySourcePath = join(projectRoot, "test-generation-solid-balanced.litematica");
+const sourcePath = resolve(process.env.MELY_FORMAT_SOURCE ?? await (async () => {
+  try {
+    await access(defaultSourcePath);
+    return defaultSourcePath;
+  } catch {
+    return legacySourcePath;
+  }
+})());
 const outputDirectory = resolve(
   process.env.MELY_FORMAT_OUTPUT
     ?? join(projectRoot, "release-validation", "real-format-conservation"),
@@ -391,7 +397,7 @@ const run = async () => {
     timestamp: 1,
     regionMaxSize: 32,
   });
-  await writeFile(join(outputDirectory, "real-format-audit.litematica"), litematic.bytes);
+  await writeFile(join(outputDirectory, "real-format-audit.litematic"), litematic.bytes);
   const decodedLitematic = decodeLitematic(litematic.bytes);
   report.formats.litematic = {
     byteLength: litematic.bytes.byteLength,

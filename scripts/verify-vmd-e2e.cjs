@@ -372,7 +372,7 @@ const main = async () => {
     const frame0Canvas = await saveCanvas(page, "frame-0-source");
     report.pose.f0Canvas = { ...frame0Canvas, pixels: undefined };
     await generateProjection(page);
-    report.projections.f0 = await exportLitematic(page, "frame-0.litematica");
+    report.projections.f0 = await exportLitematic(page, "frame-0.litematic");
 
     await page.getByRole("button", { name: "Source model", exact: true }).click();
     await page.getByRole("button", { name: "Unlock frame", exact: true }).click();
@@ -394,7 +394,7 @@ const main = async () => {
       morphCount: frame30Pose.document.morphs?.length || 0,
     };
     await generateProjection(page);
-    report.projections.f30 = await exportLitematic(page, "frame-30.litematica");
+    report.projections.f30 = await exportLitematic(page, "frame-30.litematic");
 
     const poseInput = page.locator('input[type="file"][accept*=".pose.json"]');
     await poseInput.setInputFiles(frame30Pose.path);
@@ -413,7 +413,7 @@ const main = async () => {
     report.pose.f0ToImportedCanvasDifference = canvasDifference(frame0Canvas.pixels, importedCanvas.pixels);
     report.pose.f30ToImportedCanvasDifference = canvasDifference(frame30Canvas.pixels, importedCanvas.pixels);
     await generateProjection(page);
-    report.projections.importedPose = await exportLitematic(page, "imported-pose.litematica");
+    report.projections.importedPose = await exportLitematic(page, "imported-pose.litematic");
 
     await page.getByRole("button", { name: "Source model", exact: true }).click();
     await page.getByRole("switch", { name: "Manual posing", exact: true }).click();

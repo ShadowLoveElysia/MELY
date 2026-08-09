@@ -3,7 +3,7 @@ const nbt = require("prismarine-nbt");
 
 const files = process.argv.slice(2);
 if (files.length < 2) {
-  throw new Error("Usage: node scripts/inspect-face-detail.cjs <baseline.litematica> <variant...>");
+  throw new Error("Usage: node scripts/inspect-face-detail.cjs <baseline.litematic> <variant...>");
 }
 
 const unpackLong = (value) =>

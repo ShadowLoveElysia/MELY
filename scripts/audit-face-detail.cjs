@@ -18,7 +18,7 @@ for (let index = 0; index < args.length; index += 1) {
 
 if (positional.length !== 3 || !sidecarPath) {
   throw new Error(
-    "Usage: node scripts/audit-face-detail.cjs <off.litematica> <balanced.litematica> <strong.litematica> --sidecar <solid-*.face.json> [--report <report.json>]",
+    "Usage: node scripts/audit-face-detail.cjs <off.litematic> <balanced.litematic> <strong.litematic> --sidecar <solid-*.face.json> [--report <report.json>]",
   );
 }
 

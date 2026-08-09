@@ -16,7 +16,7 @@
 3. Import a `.pmx` or `.pmd` model, or a ZIP archive containing the model and its textures. Import a `.vmd` motion when needed.
 4. Adjust the motion time, model bones, and generation settings in the preview. Once the desired pose is selected, choose **Lock current frame**.
 5. Select solid-block mode or Ethereal Hologram wireframe mode, configure the target height, sampling interval, and material scheme, and then generate the projection.
-6. Review the 3D preview, material list, and layered building guide, then export a `.litematica`, `.schem`, `.mcstructure`, or `.mcfunction` behavior pack for the target edition.
+6. Review the 3D preview, material list, and layered building guide, then export a `.litematic`, `.schem`, `.mcstructure`, or `.mcfunction` behavior pack for the target edition.
 
 > The packaged installer and portable build do not require Node.js, Rust, or Visual Studio Build Tools. The environment setup, quick-launch, build, and development instructions later in this document are intended for users who want to run MELY from source or contribute to development.
 
@@ -44,7 +44,7 @@ MELY currently targets the Minecraft Java Edition 1.20.1 block registry while al
 - Use CIEDE2000 color matching, skin protection, facial-detail enhancement, material blacklists, and themed palettes.
 - Map emissive materials, preview at night, and adjust dithering intensity.
 - Produce material lists, shulker-box and chest plans, web-based layered building guides, and automatic project partitioning.
-- Export `.litematica`, `.schem`, `.mcstructure`, and `.mcfunction` behavior packs.
+- Export `.litematic`, `.schem`, `.mcstructure`, and `.mcfunction` behavior packs.
 - Support extended-height projects up to 2,032 blocks with multi-stage risk confirmation.
 - Provide Simplified Chinese, English, and Japanese interfaces.
 

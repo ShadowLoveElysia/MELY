@@ -16,7 +16,7 @@
 3. 导入 `.pmx`、`.pmd` 模型或包含模型与贴图的 ZIP 文件，根据需要再导入 `.vmd` 动作。
 4. 在预览中调整动作时间、模型骨骼和生成参数，选定目标姿态后点击“锁定当前动作”。
 5. 选择实体方块或 Ethereal Hologram 全息线框模式，设置目标高度、采样间距和材质方案，然后生成投影。
-6. 检查 3D 预览、材料清单和分层建造指南，再按目标版本导出 `.litematica`、`.schem`、`.mcstructure` 或 `.mcfunction` 行为包。
+6. 检查 3D 预览、材料清单和分层建造指南，再按目标版本导出 `.litematic`、`.schem`、`.mcstructure` 或 `.mcfunction` 行为包。
 
 > 已打包的安装版和便携版不需要 Node.js、Rust 或 Visual Studio Build Tools。本文后续的环境配置、快速启动、构建与开发命令面向需要从源码运行或参与开发的用户。
 
@@ -44,7 +44,7 @@ MELY 当前以 Minecraft Java Edition 1.20.1 的方块注册表为主要目标�
 - CIEDE2000 色差匹配、皮肤保护、面部特征增强、材质黑名单和主题调色板。
 - 自发光材质映射、夜间预览和可调抖动强度。
 - 材料清单、潜影盒与箱子规划、网页分层建造指南和工程自动分块。
-- 导出 `.litematica`、`.schem`、`.mcstructure` 和 `.mcfunction` 行为包。
+- 导出 `.litematic`、`.schem`、`.mcstructure` 和 `.mcfunction` 行为包。
 - 支持最高 2032 格的扩展高度工程，并提供多阶段风险确认。
 - 中文、English、日本語界面。
 

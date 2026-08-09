@@ -247,7 +247,7 @@ const runCycle = async ({ page, input, index, setPhase, outputDirectory }) => {
 
   setPhase(`${prefix}:export`);
   startedAt = Date.now();
-  cycle.export = await exportLitematic(page, join(outputDirectory, `${prefix}.litematica`));
+  cycle.export = await exportLitematic(page, join(outputDirectory, `${prefix}.litematic`));
   cycle.exportMs = Date.now() - startedAt;
 
   setPhase(`${prefix}:start-cancel`);

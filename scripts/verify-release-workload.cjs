@@ -15,14 +15,14 @@ const browserPath = process.env.MELY_BROWSER_PATH;
 const mode = process.env.MELY_WORKLOAD_MODE || "hologram";
 const exportFormat = process.env.MELY_EXPORT_FORMAT || "litematic";
 const targetHeight = Number(process.env.MELY_TARGET_HEIGHT || 320);
-const faceDetail = process.env.MELY_FACE_DETAIL || "balanced";
+const faceDetail = process.env.MELY_FACE_DETAIL || "off";
 const navigationWaitUntil = process.env.MELY_NAVIGATION_WAIT_UNTIL || "networkidle";
 const outputPrefix = process.env.MELY_OUTPUT_PREFIX || `release-${mode}-${targetHeight}-${exportFormat}`;
 const reportPath = process.env.MELY_REPORT_PATH || `${outputPrefix}.json`;
 
 const validModes = new Set(["hologram", "solid"]);
 const exportExtensions = {
-  litematic: "litematica",
+  litematic: "litematic",
   bundle: "zip",
   schematic: "schem",
   mcstructure: "mcstructure",

@@ -12,7 +12,11 @@ $nodeCandidates = @(
   "C:\Users\q3238\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
 )
 $node = $nodeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-if (-not $Source) { $Source = Join-Path $projectRoot "test-generation-solid-balanced.litematica" }
+if (-not $Source) {
+  $currentSource = Join-Path $projectRoot "test-generation-solid-balanced.litematic"
+  $legacySource = Join-Path $projectRoot "test-generation-solid-balanced.litematica"
+  $Source = if (Test-Path -LiteralPath $currentSource) { $currentSource } else { $legacySource }
+}
 
 foreach ($required in @($node, $Source)) {
   if (-not $required -or -not (Test-Path -LiteralPath $required)) {

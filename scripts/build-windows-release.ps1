@@ -341,18 +341,18 @@ if (-not (Test-Path -LiteralPath $typescriptCli) -or -not (Test-Path -LiteralPat
 Invoke-Native $node @($typescriptCli, "-b")
 if (-not $SkipTests) {
   $testsRoot = Join-Path $projectRoot "tests"
-  if (Test-Path -LiteralPath $testsRoot) {
-    $testFiles = Get-ChildItem -LiteralPath $testsRoot -Filter "*.test.ts" -File |
-      Sort-Object Name |
-      Select-Object -ExpandProperty FullName
-    if ($testFiles) {
-      $testArguments = @("--import", "tsx", "--test", "--test-concurrency=1") + @($testFiles)
-      Invoke-Native $node $testArguments
-    } else {
-      Write-Warning "The tests directory exists but contains no *.test.ts files. Continuing without tests."
-    }
+  if (-not (Test-Path -LiteralPath $testsRoot)) {
+    New-Item -ItemType Directory -Path $testsRoot -Force | Out-Null
+    Write-Host "[MELY] Created missing tests directory: $testsRoot"
+  }
+  $testFiles = Get-ChildItem -LiteralPath $testsRoot -Filter "*.test.ts" -File |
+    Sort-Object Name |
+    Select-Object -ExpandProperty FullName
+  if ($testFiles) {
+    $testArguments = @("--import", "tsx", "--test", "--test-concurrency=1") + @($testFiles)
+    Invoke-Native $node $testArguments
   } else {
-    Write-Warning "The tests directory is not present in this checkout. Continuing without tests."
+    Write-Warning "The tests directory contains no *.test.ts files. Continuing without tests."
   }
 }
 Invoke-Native $node @($viteCli, "build", "--config", "vite.config.ts")

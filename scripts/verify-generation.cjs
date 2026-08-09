@@ -10,7 +10,7 @@ const appUrl = process.env.MELY_URL || "http://127.0.0.1:4199/";
 const modelZip = process.env.MELY_MODEL_ZIP;
 const browserPath = process.env.MELY_BROWSER_PATH;
 const mode = process.env.MELY_GENERATION_MODE || "hologram";
-const faceDetail = process.env.MELY_FACE_DETAIL || "balanced";
+const faceDetail = process.env.MELY_FACE_DETAIL || "off";
 const outputSuffix = mode === "solid" ? `${mode}-${faceDetail}` : mode;
 const cameraYawDrag = Number(process.env.MELY_CAMERA_YAW_DRAG || 0);
 const focusFace = process.env.MELY_FOCUS_FACE === "1";
@@ -301,7 +301,7 @@ const run = async () => {
     await page.locator(".export-button").click();
     await page.getByRole("button", { name: /Litematica/ }).click();
     const download = await downloadPromise;
-    const exportPath = `test-generation-${outputSuffix}.litematica`;
+    const exportPath = `test-generation-${outputSuffix}.litematic`;
     await download.saveAs(exportPath);
     const bytes = await readFile(exportPath);
     const parsed = await nbt.parse(bytes, "big");

@@ -17,7 +17,7 @@ const stopAfterSafe = process.env.MELY_E2E_STOP_AFTER_SAFE === "1";
 if (!modelZip) throw new Error("MELY_MODEL_ZIP is required");
 
 const formats = [
-  { id: "litematic", label: "Litematica projection", extension: "litematica" },
+  { id: "litematic", label: "Litematica projection", extension: "litematic" },
   { id: "bundle", label: "32³ project bundle ZIP", extension: "zip" },
   { id: "schematic", label: "Sponge Schematic", extension: "schem" },
   { id: "mcstructure", label: "Bedrock structure", extension: "mcstructure" },

@@ -35,7 +35,7 @@ MELY 是一个本地运行的 Web 与 Windows 桌面双运行时工具，用于�
 
 输出与施工工具：
 
-- Java 版 `.litematica`。
+- Java 版 `.litematic`。
 - Sponge Schematic v3 `.schem`。
 - Bedrock `.mcstructure`。
 - Bedrock `.mcfunction` 行为包 ZIP。
