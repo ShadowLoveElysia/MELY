@@ -25,7 +25,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box3, MathUtils, Vector3 } from "three";
 import { IconButton } from "./components/IconButton";
 import {
-  MotionFrameReadout,
+  MotionTrackFrameReadout,
   MotionStatusText,
   MotionTimeline,
 } from "./components/MotionTimeline";
@@ -51,10 +51,10 @@ import {
 import type { MmdModelCandidate } from "./core/mmdAssets";
 import type { LoadedMmdModel } from "./core/mmdModel";
 import {
+  areMotionTracksReadyForGeneration,
   canToggleMotionPlayback,
   formatMotionFrame,
   getAdjacentMotionFrame,
-  isMotionReadyForGeneration,
   shouldIgnoreMotionShortcut,
 } from "./core/motionUi";
 import {
@@ -76,7 +76,10 @@ import type {
   HologramOptions,
   MmdMeshSnapshot,
   MmdBoneInfo,
-  MmdMotionInfo,
+  MmdMotionTrackInfo,
+  MmdMotionTrackKind,
+  MmdMotionTracks,
+  MmdMotionTimes,
   MmdPoseState,
   ProjectionResult,
   PreviewMode,
@@ -179,6 +182,50 @@ const emptyPoseState: MmdPoseState = {
   canUndo: false,
   canRedo: false,
 };
+
+const MOTION_TRACK_KINDS = ["dance", "expression"] as const satisfies readonly MmdMotionTrackKind[];
+
+const emptyMotionTracks = (): MmdMotionTracks => ({
+  dance: null,
+  expression: null,
+});
+
+const emptyLockedMotionFrames = (): Record<MmdMotionTrackKind, number | null> => ({
+  dance: null,
+  expression: null,
+});
+
+interface MotionTrackRuntime {
+  seconds: number;
+  timeStore: ReturnType<typeof createMotionTimeStore>;
+  playbackStore: ReturnType<typeof createMotionPlaybackStore>;
+  pendingSeconds: number | null;
+  renderedUiSeconds: number | null;
+  uiPublishTimer: number | null;
+  playing: boolean;
+  info: MmdMotionTrackInfo | null;
+  clock: {
+    startedAt: number;
+    startSeconds: number;
+    lastUiFrame: number;
+  };
+}
+
+const createMotionTrackRuntime = (): MotionTrackRuntime => ({
+  seconds: 0,
+  timeStore: createMotionTimeStore(),
+  playbackStore: createMotionPlaybackStore(),
+  pendingSeconds: null,
+  renderedUiSeconds: null,
+  uiPublishTimer: null,
+  playing: false,
+  info: null,
+  clock: {
+    startedAt: 0,
+    startSeconds: 0,
+    lastUiFrame: 0,
+  },
+});
 
 const chooseDefaultBone = (bones: readonly MmdBoneInfo[]) => bones.find((bone) => {
   const names = `${bone.name} ${bone.englishName}`.normalize("NFKC").toLowerCase();
@@ -394,24 +441,16 @@ export default function App() {
     result: ProjectionResult;
     document: ProjectionDocument;
   } | null>(null);
-  const motionSecondsRef = useRef(0);
-  const motionTimeStoreRef = useRef<ReturnType<typeof createMotionTimeStore> | null>(null);
-  if (!motionTimeStoreRef.current) motionTimeStoreRef.current = createMotionTimeStore();
-  const motionTimeStore = motionTimeStoreRef.current;
-  const motionPlaybackStoreRef = useRef<ReturnType<typeof createMotionPlaybackStore> | null>(null);
-  if (!motionPlaybackStoreRef.current) motionPlaybackStoreRef.current = createMotionPlaybackStore();
-  const motionPlaybackStore = motionPlaybackStoreRef.current;
-  const pendingMotionSecondsRef = useRef<number | null>(null);
-  const renderedMotionUiSecondsRef = useRef<number | null>(null);
-  const motionUiPublishTimerRef = useRef<number | null>(null);
+  const motionRuntimeRef = useRef<Record<MmdMotionTrackKind, MotionTrackRuntime> | null>(null);
+  if (!motionRuntimeRef.current) {
+    motionRuntimeRef.current = {
+      dance: createMotionTrackRuntime(),
+      expression: createMotionTrackRuntime(),
+    };
+  }
+  const motionRuntime = motionRuntimeRef.current;
   const motionScrubCommitTimerRef = useRef<number | null>(null);
-  const motionPlayingRef = useRef(false);
-  const motionInfoRef = useRef<MmdMotionInfo | null>(null);
-  const motionClockRef = useRef({
-    startedAt: 0,
-    startSeconds: 0,
-    lastUiFrame: 0,
-  });
+  const lockedMotionFramesRef = useRef(emptyLockedMotionFrames());
   const [options, setOptions] = useState(initialOptions);
   const [solidOptions, setSolidOptions] = useState(initialSolidOptions);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("hologram");
@@ -420,8 +459,8 @@ export default function App() {
   const [modelCandidates, setModelCandidates] = useState<MmdModelCandidate[]>([]);
   const [selectedModelPath, setSelectedModelPath] = useState("");
   const [mmdModel, setMmdModel] = useState<LoadedMmdModel | null>(null);
-  const [motionInfo, setMotionInfo] = useState<MmdMotionInfo | null>(null);
-  const [lockedMotionFrame, setLockedMotionFrame] = useState<number | null>(null);
+  const [motionTracks, setMotionTracks] = useState<MmdMotionTracks>(emptyMotionTracks);
+  const [lockedMotionFrames, setLockedMotionFrames] = useState(emptyLockedMotionFrames);
   const [poseRevision, setPoseRevision] = useState(0);
   const [poseEditing, setPoseEditing] = useState(false);
   const [selectedBoneIndex, setSelectedBoneIndex] = useState<number | null>(null);
@@ -457,22 +496,26 @@ export default function App() {
   const [focusFaceToken, setFocusFaceToken] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
 
-  motionInfoRef.current = motionInfo;
+  MOTION_TRACK_KINDS.forEach((kind) => {
+    motionRuntime[kind].info = motionTracks[kind];
+  });
+  lockedMotionFramesRef.current = lockedMotionFrames;
 
-  const publishMotionSeconds = useCallback((seconds: number) => {
+  const publishMotionSeconds = useCallback((kind: MmdMotionTrackKind, seconds: number) => {
+    const runtime = motionRuntime[kind];
     if (motionScrubCommitTimerRef.current !== null) {
       window.clearTimeout(motionScrubCommitTimerRef.current);
       motionScrubCommitTimerRef.current = null;
     }
-    if (motionUiPublishTimerRef.current !== null) {
-      window.clearTimeout(motionUiPublishTimerRef.current);
-      motionUiPublishTimerRef.current = null;
+    if (runtime.uiPublishTimer !== null) {
+      window.clearTimeout(runtime.uiPublishTimer);
+      runtime.uiPublishTimer = null;
     }
-    pendingMotionSecondsRef.current = null;
-    renderedMotionUiSecondsRef.current = null;
-    motionSecondsRef.current = seconds;
-    motionTimeStore.set(seconds);
-  }, [motionTimeStore]);
+    runtime.pendingSeconds = null;
+    runtime.renderedUiSeconds = null;
+    runtime.seconds = seconds;
+    runtime.timeStore.set(seconds);
+  }, [motionRuntime]);
 
   const clearProjectionArtifacts = useCallback(() => {
     setResult(null);
@@ -534,12 +577,13 @@ export default function App() {
     if (motionScrubCommitTimerRef.current !== null) {
       window.clearTimeout(motionScrubCommitTimerRef.current);
     }
-    if (motionUiPublishTimerRef.current !== null) {
-      window.clearTimeout(motionUiPublishTimerRef.current);
-    }
+    MOTION_TRACK_KINDS.forEach((kind) => {
+      const timer = motionRuntime[kind].uiPublishTimer;
+      if (timer !== null) window.clearTimeout(timer);
+    });
     modelRef.current?.dispose();
     modelRef.current = null;
-  }, []);
+  }, [motionRuntime]);
 
   const invalidateProjection = useCallback((reason = "settings") => {
     currentJobRef.current = `${reason}:${crypto.randomUUID()}`;
@@ -566,62 +610,104 @@ export default function App() {
     motionScrubCommitTimerRef.current = window.setTimeout(commitMotionScrub, 120);
   }, [commitMotionScrub]);
 
+  const currentMotionTimes = useCallback((): MmdMotionTimes => ({
+    dance: motionRuntime.dance.seconds,
+    expression: motionRuntime.expression.seconds,
+  }), [motionRuntime]);
+
+  const stopAllMotionPlayback = useCallback(() => {
+    MOTION_TRACK_KINDS.forEach((kind) => {
+      const runtime = motionRuntime[kind];
+      runtime.playing = false;
+      runtime.pendingSeconds = null;
+      runtime.playbackStore.set(false);
+      runtime.timeStore.set(runtime.seconds);
+    });
+  }, [motionRuntime]);
+
+  const resetMotionTracks = useCallback(() => {
+    stopAllMotionPlayback();
+    MOTION_TRACK_KINDS.forEach((kind) => publishMotionSeconds(kind, 0));
+    setMotionTracks(emptyMotionTracks());
+    setLockedMotionFrames(emptyLockedMotionFrames());
+  }, [publishMotionSeconds, stopAllMotionPlayback]);
+
+  const installMotionTrack = useCallback((
+    kind: MmdMotionTrackKind,
+    info: MmdMotionTrackInfo,
+  ) => {
+    const runtime = motionRuntime[kind];
+    runtime.info = info;
+    runtime.playing = false;
+    runtime.playbackStore.set(false);
+    publishMotionSeconds(kind, 0);
+    setMotionTracks((current) => ({ ...current, [kind]: info }));
+    setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
+  }, [motionRuntime, publishMotionSeconds]);
+
   const advanceMotionPreview = useCallback((now: number) => {
     const model = modelRef.current;
-    const motion = motionInfoRef.current;
-    if (!model || !motion) return null;
+    if (!model || !MOTION_TRACK_KINDS.some((kind) => motionRuntime[kind].info)) return null;
 
-    const pendingSeconds = pendingMotionSecondsRef.current;
-    if (pendingSeconds !== null) {
-      pendingMotionSecondsRef.current = null;
-      model.updatePreviewPose(pendingSeconds);
-      motionSecondsRef.current = pendingSeconds;
-      renderedMotionUiSecondsRef.current = pendingSeconds;
-      return pendingSeconds;
-    }
-
-    if (!motionPlayingRef.current || motion.durationSeconds <= 0) return null;
-
-    const clock = motionClockRef.current;
-    const seconds = (
-      clock.startSeconds + Math.max(0, now - clock.startedAt) / 1000
-    ) % motion.durationSeconds;
-    model.updatePreviewPose(seconds);
-    motionSecondsRef.current = seconds;
-
-    const displayedFrame = Math.round(seconds * motion.frameRate);
-    if (displayedFrame !== clock.lastUiFrame) {
-      clock.lastUiFrame = displayedFrame;
-      renderedMotionUiSecondsRef.current = seconds;
-    }
-    return seconds;
-  }, []);
+    let evaluated = false;
+    MOTION_TRACK_KINDS.forEach((kind) => {
+      const runtime = motionRuntime[kind];
+      const motion = runtime.info;
+      if (!motion) return;
+      if (runtime.pendingSeconds !== null) {
+        runtime.seconds = runtime.pendingSeconds;
+        runtime.pendingSeconds = null;
+        runtime.renderedUiSeconds = runtime.seconds;
+        evaluated = true;
+        return;
+      }
+      if (!runtime.playing || motion.durationSeconds <= 0) return;
+      runtime.seconds = (
+        runtime.clock.startSeconds + Math.max(0, now - runtime.clock.startedAt) / 1000
+      ) % motion.durationSeconds;
+      const displayedFrame = Math.round(runtime.seconds * motion.frameRate);
+      if (displayedFrame !== runtime.clock.lastUiFrame) {
+        runtime.clock.lastUiFrame = displayedFrame;
+        runtime.renderedUiSeconds = runtime.seconds;
+      }
+      evaluated = true;
+    });
+    if (!evaluated) return null;
+    model.updatePreviewPose(currentMotionTimes());
+    return currentMotionTimes();
+  }, [currentMotionTimes, motionRuntime]);
 
   const publishRenderedMotionPreview = useCallback((
     renderedAt: number,
-    evaluatedMotionSeconds: number | null,
+    evaluatedMotionTimes: MmdMotionTimes | null,
     gpuSynchronized: boolean,
   ) => {
-    if (evaluatedMotionSeconds !== null && (window as Window & {
+    if (evaluatedMotionTimes !== null && (window as Window & {
       __MELY_E2E_GPU_PROBE__?: boolean;
     }).__MELY_E2E_GPU_PROBE__) {
       window.dispatchEvent(new CustomEvent("mely:vmd-frame-rendered", {
         detail: {
-          seconds: evaluatedMotionSeconds,
-          frame: evaluatedMotionSeconds * (motionInfoRef.current?.frameRate ?? 30),
+          times: evaluatedMotionTimes,
+          frames: {
+            dance: evaluatedMotionTimes.dance * (motionRuntime.dance.info?.frameRate ?? 30),
+            expression: evaluatedMotionTimes.expression * (motionRuntime.expression.info?.frameRate ?? 30),
+          },
           renderedAt,
           gpuSynchronized,
         },
       }));
     }
-    if (renderedMotionUiSecondsRef.current === null || motionUiPublishTimerRef.current !== null) return;
-    motionUiPublishTimerRef.current = window.setTimeout(() => {
-      motionUiPublishTimerRef.current = null;
-      const seconds = renderedMotionUiSecondsRef.current;
-      renderedMotionUiSecondsRef.current = null;
-      if (seconds !== null) motionTimeStore.set(seconds);
-    }, 0);
-  }, [motionTimeStore]);
+    MOTION_TRACK_KINDS.forEach((kind) => {
+      const runtime = motionRuntime[kind];
+      if (runtime.renderedUiSeconds === null || runtime.uiPublishTimer !== null) return;
+      runtime.uiPublishTimer = window.setTimeout(() => {
+        runtime.uiPublishTimer = null;
+        const seconds = runtime.renderedUiSeconds;
+        runtime.renderedUiSeconds = null;
+        if (seconds !== null) runtime.timeStore.set(seconds);
+      }, 0);
+    });
+  }, [motionRuntime]);
 
   const targetHeight = options.targetHeight;
   const heightRisk = useMemo(
@@ -806,12 +892,8 @@ export default function App() {
     const previousModel = modelRef.current;
     if (previousModel) {
       modelRef.current = null;
-      motionPlayingRef.current = false;
       setMmdModel(null);
-      setMotionInfo(null);
-      publishMotionSeconds(0);
-      motionPlaybackStore.set(false);
-      setLockedMotionFrame(null);
+      resetMotionTracks();
       setPoseEditing(false);
       setSelectedBoneIndex(null);
       setPoseState(emptyPoseState);
@@ -841,11 +923,7 @@ export default function App() {
     modelRef.current = loaded;
     setMmdModel(loaded);
     setSelectedModelPath(modelPath);
-    setMotionInfo(null);
-    publishMotionSeconds(0);
-    motionPlayingRef.current = false;
-    motionPlaybackStore.set(false);
-    setLockedMotionFrame(null);
+    resetMotionTracks();
     setPoseEditing(false);
     setSelectedBoneIndex(chooseDefaultBone(loaded.bones));
     setPoseState(loaded.poseState());
@@ -863,30 +941,38 @@ export default function App() {
     setResetToken((value) => value + 1);
     setPoseRevision((value) => value + 1);
 
-    let loadedMotion: MmdMotionInfo | null = null;
-    const { choosePrimaryMmdMotion } = await import("./core/mmdAssets");
-    const motionFile = await choosePrimaryMmdMotion(packageFiles, loaded);
-    if (motionFile) {
+    const loadedTracks: Partial<Record<MmdMotionTrackKind, MmdMotionTrackInfo>> = {};
+    const { chooseMmdMotionTracks } = await import("./core/mmdAssets");
+    const motionFiles = await chooseMmdMotionTracks(packageFiles, loaded);
+    if (motionFiles.dance || motionFiles.expression) {
       setModelLoadStageKey("app.stage.parseMotion");
-      loadedMotion = await loaded.loadMotion(motionFile);
-      if (modelLoadRequestRef.current !== requestId) {
-        if (modelRef.current === loaded) modelRef.current = null;
-        loaded.dispose();
-        return;
+      for (const kind of MOTION_TRACK_KINDS) {
+        const motionFile = motionFiles[kind];
+        if (!motionFile) continue;
+        loadedTracks[kind] = await loaded.loadMotion(motionFile, kind);
+        if (modelLoadRequestRef.current !== requestId) {
+          if (modelRef.current === loaded) modelRef.current = null;
+          loaded.dispose();
+          return;
+        }
       }
-      setMotionInfo(loadedMotion);
-      setLockedMotionFrame(null);
+      MOTION_TRACK_KINDS.forEach((kind) => {
+        const info = loadedTracks[kind];
+        if (info) installMotionTrack(kind, info);
+      });
+      loaded.updatePose({ dance: 0, expression: 0 });
       setPoseRevision((value) => value + 1);
     }
 
     const warnings = loaded.stats.textureWarnings;
+    const loadedMotion = loadedTracks.dance ?? loadedTracks.expression;
     setToast(t("toast.modelLoaded", {
       name: loaded.stats.name,
       vertices: number(loaded.stats.vertexCount),
       motion: loadedMotion ? t("toast.modelLoadedMotion", { frames: number(loadedMotion.maxFrame) }) : "",
       warnings: warnings ? t("toast.modelLoadedWarnings", { count: number(warnings) }) : "",
     }));
-  }, [clearProjectionArtifacts, number, publishMotionSeconds, t]);
+  }, [clearProjectionArtifacts, installMotionTrack, number, resetMotionTracks, t]);
 
   const addAssets = async (files: File[]) => {
     const requestId = crypto.randomUUID();
@@ -898,8 +984,8 @@ export default function App() {
 
     try {
       const {
+        chooseMmdMotionTracks,
         choosePrimaryMmdModel,
-        choosePrimaryMmdMotion,
         expandMmdAssets,
         inspectMmdModels,
         normalizeAssetPath,
@@ -917,25 +1003,29 @@ export default function App() {
       if (!modelFile) {
         if (modelLoadRequestRef.current === requestId) {
           const currentModel = modelRef.current;
-          const motionFile = await choosePrimaryMmdMotion(expanded, currentModel ?? undefined);
-          if (motionFile && currentModel) {
+          const motionFiles = await chooseMmdMotionTracks(expanded, currentModel ?? undefined);
+          if ((motionFiles.dance || motionFiles.expression) && currentModel) {
             setModelLoadStageKey("app.stage.parseMotion");
-            const loadedMotion = await currentModel.loadMotion(motionFile);
-            if (modelLoadRequestRef.current !== requestId) return;
-            setMotionInfo(loadedMotion);
-            publishMotionSeconds(0);
-            motionPlayingRef.current = false;
-            motionPlaybackStore.set(false);
-            setLockedMotionFrame(null);
+            const loadedTracks: MmdMotionTrackInfo[] = [];
+            for (const kind of MOTION_TRACK_KINDS) {
+              const motionFile = motionFiles[kind];
+              if (!motionFile) continue;
+              const loadedMotion = await currentModel.loadMotion(motionFile, kind);
+              if (modelLoadRequestRef.current !== requestId) return;
+              installMotionTrack(kind, loadedMotion);
+              loadedTracks.push(loadedMotion);
+            }
+            currentModel.updatePose(currentMotionTimes());
             setPoseEditing(false);
             invalidatePoseProjection();
             setPoseRevision((value) => value + 1);
-            setAssets((current) => [...current.filter((asset) => asset.type !== "motion"), ...nextAssets]);
+            setAssets((current) => [...current, ...nextAssets]);
             expandedAssetsRef.current = [...expandedAssetsRef.current, ...expanded];
             setPreviewMode("source");
+            const loadedMotion = loadedTracks[0];
             setToast(t("toast.motionLoaded", {
-              name: loadedMotion.name,
-              frames: number(loadedMotion.maxFrame),
+              name: loadedTracks.map((track) => track.name).join(" + "),
+              frames: number(Math.max(...loadedTracks.map((track) => track.maxFrame))),
             }));
             return;
           }
@@ -1018,60 +1108,70 @@ export default function App() {
     }
   };
 
-  const setMotionPlayingState = (playing: boolean) => {
+  const setMotionPlayingState = (kind: MmdMotionTrackKind, playing: boolean) => {
     const model = modelRef.current;
-    if (!motionInfo || !model) return;
-    if (playing && !canToggleMotionPlayback(true, lockedMotionFrame)) return;
+    const motion = motionTracks[kind];
+    const runtime = motionRuntime[kind];
+    if (!motion || !model) return;
+    if (playing && !canToggleMotionPlayback(true, lockedMotionFrames[kind])) return;
     if (motionScrubCommitTimerRef.current !== null) {
       window.clearTimeout(motionScrubCommitTimerRef.current);
       motionScrubCommitTimerRef.current = null;
     }
     if (playing) {
-      pendingMotionSecondsRef.current = null;
-      setLockedMotionFrame(null);
+      runtime.pendingSeconds = null;
+      setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
       if (result || previewMode !== "source") invalidatePoseProjection();
       setPoseEditing(false);
-      motionClockRef.current = {
+      runtime.clock = {
         startedAt: performance.now(),
-        startSeconds: motionSecondsRef.current,
-        lastUiFrame: Math.round(motionSecondsRef.current * motionInfo.frameRate),
+        startSeconds: runtime.seconds,
+        lastUiFrame: Math.round(runtime.seconds * motion.frameRate),
       };
     } else {
-      motionPlayingRef.current = false;
-      pendingMotionSecondsRef.current = null;
-      motionTimeStore.set(motionSecondsRef.current);
+      runtime.playing = false;
+      runtime.pendingSeconds = null;
+      runtime.timeStore.set(runtime.seconds);
     }
-    motionPlayingRef.current = playing;
-    motionPlaybackStore.set(playing);
+    runtime.playing = playing;
+    runtime.playbackStore.set(playing);
     setPreviewMode("source");
   };
 
-  const setMotionFrame = (frame: number) => {
+  const setMotionFrame = (kind: MmdMotionTrackKind, frame: number) => {
     const model = modelRef.current;
-    if (!model || !motionInfo) return;
-    const wasPlaying = motionPlayingRef.current;
-    motionPlayingRef.current = false;
-    if (wasPlaying) motionPlaybackStore.set(false);
-    if (lockedMotionFrame !== null) setLockedMotionFrame(null);
-    const clampedFrame = Math.max(0, Math.min(motionInfo.maxFrame, frame));
-    const seconds = clampedFrame / motionInfo.frameRate;
-    pendingMotionSecondsRef.current = seconds;
-    motionSecondsRef.current = seconds;
+    const motion = motionTracks[kind];
+    const runtime = motionRuntime[kind];
+    if (!model || !motion) return;
+    const wasPlaying = runtime.playing;
+    runtime.playing = false;
+    if (wasPlaying) runtime.playbackStore.set(false);
+    if (lockedMotionFrames[kind] !== null) {
+      setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
+    }
+    const clampedFrame = Math.max(0, Math.min(motion.maxFrame, frame));
+    const seconds = clampedFrame / motion.frameRate;
+    runtime.pendingSeconds = seconds;
+    runtime.seconds = seconds;
     if (result) scheduleMotionScrubCommit();
     if (previewMode !== "source") setPreviewMode("source");
   };
 
-  const stepMotionFrame = (direction: -1 | 1) => {
-    if (!motionInfo || lockedMotionFrame !== null) return;
-    setMotionFrame(getAdjacentMotionFrame(
-      motionSecondsRef.current * motionInfo.frameRate,
-      motionInfo.maxFrame,
+  const stepMotionFrame = (kind: MmdMotionTrackKind, direction: -1 | 1) => {
+    const motion = motionTracks[kind];
+    if (!motion || lockedMotionFrames[kind] !== null) return;
+    setMotionFrame(kind, getAdjacentMotionFrame(
+      motionRuntime[kind].seconds * motion.frameRate,
+      motion.maxFrame,
       direction,
     ));
   };
 
   const generateCurrentPose = () => {
-    if (!isMotionReadyForGeneration(Boolean(motionInfo), lockedMotionFrame)) {
+    if (!areMotionTracksReadyForGeneration(MOTION_TRACK_KINDS.map((kind) => ({
+      loaded: Boolean(motionTracks[kind]),
+      lockedFrame: lockedMotionFrames[kind],
+    })))) {
       setToast(t("toast.motionLockRequired"));
       return;
     }
@@ -1080,31 +1180,34 @@ export default function App() {
     void generate(generationMode, options, solidOptions);
   };
 
-  const toggleMotionLock = () => {
+  const toggleMotionLock = (kind: MmdMotionTrackKind) => {
     const model = modelRef.current;
-    if (!model || !motionInfo) return;
-    if (lockedMotionFrame !== null) {
-      setLockedMotionFrame(null);
+    const motion = motionTracks[kind];
+    const runtime = motionRuntime[kind];
+    if (!model || !motion) return;
+    if (lockedMotionFrames[kind] !== null) {
+      setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
       invalidatePoseProjection();
       setToast(t("toast.motionUnlocked"));
       return;
     }
 
-    motionPlayingRef.current = false;
-    motionPlaybackStore.set(false);
+    runtime.playing = false;
+    runtime.playbackStore.set(false);
     if (motionScrubCommitTimerRef.current !== null) {
       window.clearTimeout(motionScrubCommitTimerRef.current);
       motionScrubCommitTimerRef.current = null;
     }
     const exactFrame = Math.max(0, Math.min(
-      motionInfo.maxFrame,
-      motionSecondsRef.current * motionInfo.frameRate,
+      motion.maxFrame,
+      runtime.seconds * motion.frameRate,
     ));
-    const seconds = exactFrame / motionInfo.frameRate;
-    pendingMotionSecondsRef.current = null;
-    model.updatePose(seconds);
-    publishMotionSeconds(seconds);
-    setLockedMotionFrame(exactFrame);
+    const seconds = exactFrame / motion.frameRate;
+    runtime.pendingSeconds = null;
+    runtime.seconds = seconds;
+    model.updatePose(currentMotionTimes());
+    publishMotionSeconds(kind, seconds);
+    setLockedMotionFrames((current) => ({ ...current, [kind]: exactFrame }));
     invalidateProjection("motion-lock");
     setPoseRevision((value) => value + 1);
     setPreviewMode("source");
@@ -1137,10 +1240,10 @@ export default function App() {
     const model = modelRef.current;
     if (!model) return;
     if (editing) {
-      motionPlayingRef.current = false;
-      motionPlaybackStore.set(false);
-      pendingMotionSecondsRef.current = null;
-      if (motionInfo) model.updatePose(motionSecondsRef.current);
+      stopAllMotionPlayback();
+      if (MOTION_TRACK_KINDS.some((kind) => motionTracks[kind])) {
+        model.updatePose(currentMotionTimes());
+      }
       setSelectedBoneIndex((current) => current ?? chooseDefaultBone(model.bones));
       setPreviewMode("source");
     }
@@ -1192,6 +1295,16 @@ export default function App() {
     setToast(t("toast.poseReset"));
   };
 
+  const currentMotionFrameSuffix = () => MOTION_TRACK_KINDS
+    .flatMap((kind) => {
+      const motion = motionTracks[kind];
+      if (!motion) return [];
+      const frame = lockedMotionFramesRef.current[kind]
+        ?? motionRuntime[kind].seconds * motion.frameRate;
+      return [`_${kind === "dance" ? "D" : "E"}${formatMotionFrame(frame)}`];
+    })
+    .join("");
+
   const exportCurrentPose = async () => {
     const model = modelRef.current;
     if (!model) {
@@ -1199,18 +1312,14 @@ export default function App() {
       return;
     }
     try {
-      if (motionPlayingRef.current && motionInfo) {
-        motionPlayingRef.current = false;
-        motionPlaybackStore.set(false);
-        model.updatePose(motionSecondsRef.current);
-        motionTimeStore.set(motionSecondsRef.current);
+      if (MOTION_TRACK_KINDS.some((kind) => motionRuntime[kind].playing)) {
+        stopAllMotionPlayback();
+        model.updatePose(currentMotionTimes());
         setPoseRevision((value) => value + 1);
       }
       const { stringifyMelyPose } = await import("./core/melyPose");
       const pose = model.exportMelyPose();
-      const frameSuffix = motionInfo
-        ? `_F${formatMotionFrame(lockedMotionFrame ?? motionSecondsRef.current * motionInfo.frameRate)}`
-        : "";
+      const frameSuffix = currentMotionFrameSuffix();
       const saved = await saveBinaryFile(
         new TextEncoder().encode(stringifyMelyPose(pose)),
         `MELY_${safeFileStem(model.stats.name)}${frameSuffix}.pose.json`,
@@ -1238,12 +1347,8 @@ export default function App() {
       const { parseMelyPoseJson } = await import("./core/melyPose");
       const document = parseMelyPoseJson(await file.text());
 
-      motionPlayingRef.current = false;
-      motionPlaybackStore.set(false);
       model.clearMotion();
-      setMotionInfo(null);
-      publishMotionSeconds(0);
-      setLockedMotionFrame(null);
+      resetMotionTracks();
       expandedAssetsRef.current = expandedAssetsRef.current.filter((asset) => (
         !asset.name.toLowerCase().endsWith(".vmd")
       ));
@@ -1296,6 +1401,7 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      const targetKind = motionTracks.dance ? "dance" : motionTracks.expression ? "expression" : null;
       if (
         event.code !== "Space"
         || event.repeat
@@ -1303,26 +1409,25 @@ export default function App() {
         || event.metaKey
         || event.altKey
         || shouldIgnoreMotionShortcut(event.target)
-        || !canToggleMotionPlayback(Boolean(motionInfo), lockedMotionFrame)
+        || !targetKind
+        || !canToggleMotionPlayback(true, lockedMotionFrames[targetKind])
       ) return;
       event.preventDefault();
-      setMotionPlayingState(!motionPlayingRef.current);
+      setMotionPlayingState(targetKind, !motionRuntime[targetKind].playing);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [lockedMotionFrame, motionInfo]);
+  }, [lockedMotionFrames, motionRuntime, motionTracks]);
 
   const projectionName = useMemo(() => {
     const sourceName = mmdModel?.stats.name
       || assets.find((asset) => asset.type === "model")?.name.replace(/\.[^.]+$/, "")
       || "ELY_Hologram";
-    const frameSuffix = motionInfo
-      ? `_F${formatMotionFrame(lockedMotionFrame ?? motionSecondsRef.current * motionInfo.frameRate)}`
-      : "";
+    const frameSuffix = currentMotionFrameSuffix();
     const poseSuffix = poseState.editCount ? "_POSE" : "";
     const modeSuffix = result?.kind === "solid" ? "_SOLID" : "_HOLOGRAM";
     return `MELY_${safeFileStem(sourceName)}${frameSuffix}${poseSuffix}${modeSuffix}`;
-  }, [assets, lockedMotionFrame, mmdModel, motionInfo, poseRevision, poseState.editCount, result?.kind]);
+  }, [assets, lockedMotionFrames, mmdModel, motionTracks, poseRevision, poseState.editCount, result?.kind]);
 
   const prepareProjectionDocument = useCallback(async () => {
     if (!result) throw appError("error.litematic.emptyProjection");
@@ -1651,6 +1756,7 @@ export default function App() {
   };
 
   const stats = result?.stats ?? null;
+  const hasMotion = MOTION_TRACK_KINDS.some((kind) => Boolean(motionTracks[kind]));
   const statusText = useMemo(() => {
     if (modelLoading) return t(modelLoadStageKey);
     if (processing) return t(stageKey);
@@ -1666,7 +1772,7 @@ export default function App() {
     return t("app.status.waitingModel");
   }, [mmdModel, modelLoadStageKey, modelLoading, poseEditing, processing, selectedBoneIndex, stageKey, t]);
   const showMotionStatus = Boolean(
-    !modelLoading && !processing && !poseEditing && motionInfo && mmdModel,
+    !modelLoading && !processing && !poseEditing && hasMotion && mmdModel,
   );
 
   return (
@@ -1680,13 +1786,19 @@ export default function App() {
         </div>
         <div className="project-state">
           <span className={`status-dot ${processing || modelLoading || exporting ? "status-dot--busy" : ""}`} />
-          <span>{showMotionStatus && motionInfo ? (
-            <MotionStatusText
-              motion={motionInfo}
-              timeSource={motionTimeStore}
-              playbackSource={motionPlaybackStore}
-              lockedFrame={lockedMotionFrame}
-            />
+          <span>{showMotionStatus ? (
+            <span className="motion-status-list">
+              {MOTION_TRACK_KINDS.map((kind) => motionTracks[kind] ? (
+                <MotionStatusText
+                  key={kind}
+                  kind={kind}
+                  motion={motionTracks[kind]}
+                  timeSource={motionRuntime[kind].timeStore}
+                  playbackSource={motionRuntime[kind].playbackStore}
+                  lockedFrame={lockedMotionFrames[kind]}
+                />
+              ) : null)}
+            </span>
           ) : statusText}</span>
           <span className="version-chip">{t("app.version")}</span>
         </div>
@@ -1734,8 +1846,8 @@ export default function App() {
             modelStats={mmdModel?.stats ?? null}
             modelCandidates={modelCandidates}
             selectedModelPath={selectedModelPath}
-            motionInfo={motionInfo}
-            lockedMotionFrame={lockedMotionFrame}
+            motionTracks={motionTracks}
+            lockedMotionFrames={lockedMotionFrames}
             bones={mmdModel?.bones ?? []}
             materials={mmdModel?.materials ?? []}
             selectedBoneIndex={selectedBoneIndex}
@@ -1775,7 +1887,7 @@ export default function App() {
           />
         ) : null}
 
-        <section className={`viewport-panel ${motionInfo ? "viewport-panel--with-motion" : ""}`}>
+        <section className={`viewport-panel ${hasMotion ? "viewport-panel--with-motion" : ""}`}>
           <div className="viewport-stage">
             <div className="viewport-toolbar viewport-toolbar--left">
               <div className="toolbar-group">
@@ -1871,13 +1983,15 @@ export default function App() {
                   <span className="stat-separator" />
                   <span>{t("viewport.triangles", { count: number(mmdModel.stats.triangleCount) })}</span>
                   <span>{t("viewport.bones", { count: number(mmdModel.stats.boneCount) })}</span>
-                  {motionInfo ? (
-                    <MotionFrameReadout
-                      motion={motionInfo}
-                      timeSource={motionTimeStore}
-                      lockedFrame={lockedMotionFrame}
+                  {MOTION_TRACK_KINDS.map((kind) => motionTracks[kind] ? (
+                    <MotionTrackFrameReadout
+                      key={kind}
+                      kind={kind}
+                      motion={motionTracks[kind]}
+                      timeSource={motionRuntime[kind].timeStore}
+                      lockedFrame={lockedMotionFrames[kind]}
                     />
-                  ) : null}
+                  ) : null)}
                   {poseState.editCount ? <span>{t("viewport.edits", { count: number(poseState.editCount) })}</span> : null}
                 </div>
               ) : result?.kind === "solid" ? (
@@ -1904,18 +2018,24 @@ export default function App() {
             </div>
           </div>
 
-          {motionInfo ? (
-            <MotionTimeline
-              motion={motionInfo}
-              timeSource={motionTimeStore}
-              playbackSource={motionPlaybackStore}
-              lockedFrame={lockedMotionFrame}
-              disabled={processing || modelLoading}
-              onPlayingChange={setMotionPlayingState}
-              onFrameChange={setMotionFrame}
-              onFrameStep={stepMotionFrame}
-              onLockToggle={toggleMotionLock}
-            />
+          {hasMotion ? (
+            <div className="viewport-motion-stack">
+              {MOTION_TRACK_KINDS.map((kind) => motionTracks[kind] ? (
+                <MotionTimeline
+                  key={kind}
+                  kind={kind}
+                  motion={motionTracks[kind]}
+                  timeSource={motionRuntime[kind].timeStore}
+                  playbackSource={motionRuntime[kind].playbackStore}
+                  lockedFrame={lockedMotionFrames[kind]}
+                  disabled={processing || modelLoading}
+                  onPlayingChange={(playing) => setMotionPlayingState(kind, playing)}
+                  onFrameChange={(frame) => setMotionFrame(kind, frame)}
+                  onFrameStep={(direction) => stepMotionFrame(kind, direction)}
+                  onLockToggle={() => toggleMotionLock(kind)}
+                />
+              ) : null)}
+            </div>
           ) : null}
         </section>
       </div>

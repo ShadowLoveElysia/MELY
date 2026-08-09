@@ -1,7 +1,9 @@
 import {
   Lock,
   Pause,
+  PersonStanding,
   Play,
+  Smile,
   StepBack,
   StepForward,
   Unlock,
@@ -13,10 +15,11 @@ import type {
   MotionTimeSource,
 } from "../core/motionTimeStore";
 import { useI18n } from "../i18n/I18nProvider";
-import type { MmdMotionInfo } from "../types";
+import type { MmdMotionTrackInfo, MmdMotionTrackKind } from "../types";
 
 interface MotionTimelineProps {
-  motion: MmdMotionInfo;
+  kind: MmdMotionTrackKind;
+  motion: MmdMotionTrackInfo;
   timeSource: MotionTimeSource;
   playbackSource: MotionPlaybackSource;
   lockedFrame: number | null;
@@ -28,6 +31,7 @@ interface MotionTimelineProps {
 }
 
 export function MotionTimeline({
+  kind,
   motion,
   timeSource,
   playbackSource,
@@ -53,15 +57,19 @@ export function MotionTimeline({
   const locked = lockedFrame !== null;
   const currentFrame = lockedFrame ?? frame;
   const stepState = motionFrameStepState(currentFrame, motion.maxFrame);
-  const expressionOnly = motion.matchedBoneTrackCount === 0 && motion.matchedMorphTrackCount > 0;
+  const TrackIcon = kind === "dance" ? PersonStanding : Smile;
+  const trackLabel = t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack");
 
   return (
-    <section className="motion-control viewport-motion" aria-label={t("sidebar.motion.timeline")}> 
+    <section
+      className={`motion-control viewport-motion viewport-motion--${kind}`}
+      aria-label={t("sidebar.motion.trackTimeline", { track: trackLabel })}
+    >
       <div className="viewport-motion__identity">
-        <Play size={14} />
+        <TrackIcon size={14} />
         <span>
+          <small className="viewport-motion__track-label">{trackLabel}</small>
           <strong>{motion.name}</strong>
-          <small>{t("sidebar.motion.frames", { count: number(motion.maxFrame) })}</small>
         </span>
       </div>
 
@@ -105,7 +113,7 @@ export function MotionTimeline({
           max={motion.maxFrame}
           step={1}
           value={Math.min(motion.maxFrame, Math.round(currentFrame))}
-          aria-label={t("sidebar.motion.frame")}
+          aria-label={t("sidebar.motion.trackFrame", { track: trackLabel })}
           disabled={locked || disabled}
           onChange={(event) => onFrameChange(Number(event.target.value))}
         />
@@ -116,16 +124,18 @@ export function MotionTimeline({
       </div>
 
       <div className="viewport-motion__meta">
-        <span className={expressionOnly ? "viewport-motion__warning" : ""}>
-          {t("sidebar.motion.matchedBones", {
+        {kind === "dance" ? (
+          <span>{t("sidebar.motion.matchedBones", {
             matched: number(motion.matchedBoneTrackCount),
             total: number(motion.boneTrackCount),
-          })}
-        </span>
-        <span>{t("sidebar.motion.matchedMorphs", {
+          })}</span>
+        ) : (
+          <span>{t("sidebar.motion.matchedMorphs", {
           matched: number(motion.matchedMorphTrackCount),
           total: number(motion.morphTrackCount),
-        })}</span>
+          })}</span>
+        )}
+        <span>{t("sidebar.motion.frames", { count: number(motion.maxFrame) })}</span>
         <span>{t("sidebar.motion.frameRate", { rate: number(motion.frameRate) })}</span>
       </div>
 
@@ -146,7 +156,8 @@ export function MotionTimeline({
 }
 
 interface MotionFrameReadoutProps {
-  motion: MmdMotionInfo;
+  kind: MmdMotionTrackKind;
+  motion: MmdMotionTrackInfo;
   timeSource: MotionTimeSource;
   lockedFrame: number | null;
 }
@@ -164,8 +175,8 @@ const useDisplayedMotionFrame = ({
   return lockedFrame ?? seconds * motion.frameRate;
 };
 
-export function MotionFrameReadout(props: MotionFrameReadoutProps) {
-  return <span>F{formatMotionFrame(useDisplayedMotionFrame(props))}</span>;
+export function MotionTrackFrameReadout(props: MotionFrameReadoutProps) {
+  return <span>{props.kind === "dance" ? "D" : "E"}{formatMotionFrame(useDisplayedMotionFrame(props))}</span>;
 }
 
 interface MotionStatusTextProps extends MotionFrameReadoutProps {
@@ -180,11 +191,13 @@ export function MotionStatusText({ playbackSource, ...frameProps }: MotionStatus
     playbackSource.getSnapshot,
     playbackSource.getSnapshot,
   );
+  const track = t(frameProps.kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack");
   return <>{t(frameProps.lockedFrame !== null
     ? "app.status.motionLocked"
     : playing
       ? "app.status.motionPlaying"
       : "app.status.motionPaused", {
-    frame: formatMotionFrame(frame),
+    track,
+    frame: `${frameProps.kind === "dance" ? "D" : "E"}${formatMotionFrame(frame)}`,
   })}</>;
 }

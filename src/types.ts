@@ -88,6 +88,19 @@ export interface MmdMotionInfo {
   matchedMorphTrackCount: number;
 }
 
+export type MmdMotionTrackKind = "dance" | "expression";
+
+export interface MmdMotionTimes {
+  dance: number;
+  expression: number;
+}
+
+export type MmdMotionTrackInfo = MmdMotionInfo & {
+  kind: MmdMotionTrackKind;
+};
+
+export type MmdMotionTracks = Record<MmdMotionTrackKind, MmdMotionTrackInfo | null>;
+
 export interface HologramOptions {
   targetHeight: number;
   sampleSpacing: number;

@@ -6,7 +6,7 @@ import { getBlockDefinition } from "../core/blockRegistry";
 import type { LoadedMmdModel } from "../core/mmdModel";
 import { createMmdFaceFrameSnapshot } from "../core/mmdSnapshot";
 import { useI18n } from "../i18n/I18nProvider";
-import type { CameraMode, PreviewMode, ProjectionResult } from "../types";
+import type { CameraMode, MmdMotionTimes, PreviewMode, ProjectionResult } from "../types";
 
 interface Viewport3DProps {
   result: ProjectionResult | null;
@@ -26,8 +26,8 @@ interface Viewport3DProps {
   selectedBoneIndex: number | null;
   onBoneSelected: (index: number | null) => void;
   onPoseCommitted: () => void;
-  onBeforeRender?: (now: number) => number | null;
-  onAfterRender?: (now: number, evaluatedMotionSeconds: number | null, gpuSynchronized: boolean) => void;
+  onBeforeRender?: (now: number) => MmdMotionTimes | null;
+  onAfterRender?: (now: number, evaluatedMotionTimes: MmdMotionTimes | null, gpuSynchronized: boolean) => void;
   onReady?: () => void;
 }
 
@@ -672,7 +672,7 @@ export function Viewport3D({
     transformControls.addEventListener("mouseUp", commitTransform);
 
     const animate = (now: number) => {
-      const evaluatedMotionSeconds = onBeforeRenderRef.current?.(now) ?? null;
+      const evaluatedMotionTimes = onBeforeRenderRef.current?.(now) ?? null;
       controls.update();
       if (poseEditingRef.current && runtime.activeMode === "source") {
         refreshBoneMarkers(runtime, modelRef.current, selectedBoneIndexRef.current);
@@ -682,7 +682,7 @@ export function Viewport3D({
         __MELY_E2E_GPU_PROBE__?: boolean;
       }).__MELY_E2E_GPU_PROBE__);
       if (gpuSynchronized) renderer.getContext().finish();
-      onAfterRenderRef.current?.(performance.now(), evaluatedMotionSeconds, gpuSynchronized);
+      onAfterRenderRef.current?.(performance.now(), evaluatedMotionTimes, gpuSynchronized);
       runtime.animationFrame = requestAnimationFrame(animate);
     };
     runtime.animationFrame = requestAnimationFrame(animate);

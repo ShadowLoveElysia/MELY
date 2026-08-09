@@ -261,7 +261,7 @@ export const findMmdModelByPath = (files: readonly File[], path: string) => file
   && normalizeAssetPath(file.webkitRelativePath || file.name) === normalizeAssetPath(path),
 );
 
-interface MmdMotionCandidate {
+export interface MmdMotionCandidate {
   file: File;
   path: string;
   boneTrackCount: number;
@@ -298,6 +298,33 @@ export const selectPrimaryMmdMotionCandidate = (
     || right.morphTrackCount - left.morphTrackCount
     || compareText(left.path, right.path);
 })[0];
+
+const selectMotionTrackCandidate = (
+  candidates: readonly MmdMotionCandidate[],
+  kind: "dance" | "expression",
+) => [...candidates]
+  .filter((candidate) => kind === "dance"
+    ? candidate.matchedBoneTrackCount > 0
+    : candidate.matchedMorphTrackCount > 0)
+  .sort((left, right) => {
+    const matchedDifference = kind === "dance"
+      ? right.matchedBoneTrackCount - left.matchedBoneTrackCount
+      : right.matchedMorphTrackCount - left.matchedMorphTrackCount;
+    const totalDifference = kind === "dance"
+      ? right.boneTrackCount - left.boneTrackCount
+      : right.morphTrackCount - left.morphTrackCount;
+    return matchedDifference
+      || totalDifference
+      || right.maxFrame - left.maxFrame
+      || compareText(left.path, right.path);
+  })[0];
+
+export const selectMmdMotionTrackCandidates = (
+  candidates: readonly MmdMotionCandidate[],
+) => ({
+  dance: selectMotionTrackCandidate(candidates, "dance"),
+  expression: selectMotionTrackCandidate(candidates, "expression"),
+});
 
 const motionTargetNames = (model: Pick<LoadedMmdModel, "bones" | "mesh"> | undefined) => {
   const bones = new Set<string>();
@@ -342,4 +369,38 @@ export const choosePrimaryMmdMotion = async (
     }
   }
   return selectPrimaryMmdMotionCandidate(candidates)?.file ?? chooseShallowestAsset(motions);
+};
+
+export const chooseMmdMotionTracks = async (
+  files: readonly File[],
+  model?: Pick<LoadedMmdModel, "bones" | "mesh">,
+) => {
+  const motions = files.filter(isMmdMotionFile);
+  if (!motions.length) return {};
+  const { parseVmd } = await import("@yohawing/three-mmd-loader/parser");
+  const target = motionTargetNames(model);
+  const candidates: MmdMotionCandidate[] = [];
+  for (const file of motions) {
+    try {
+      const animation = parseVmd(await file.arrayBuffer());
+      const boneNames = Object.keys(animation.boneTracks);
+      const morphNames = Object.keys(animation.morphTracks);
+      candidates.push({
+        file,
+        path: normalizeAssetPath(file.webkitRelativePath || file.name),
+        boneTrackCount: boneNames.length,
+        morphTrackCount: morphNames.length,
+        matchedBoneTrackCount: boneNames.filter((name) => target.bones.has(name)).length,
+        matchedMorphTrackCount: morphNames.filter((name) => target.morphs.has(name)).length,
+        maxFrame: animation.metadata.maxFrame,
+      });
+    } catch {
+      // Invalid candidates are ignored when compatible parsed tracks exist.
+    }
+  }
+  const selected = selectMmdMotionTrackCandidates(candidates);
+  return {
+    dance: selected.dance?.file,
+    expression: selected.expression?.file,
+  };
 };

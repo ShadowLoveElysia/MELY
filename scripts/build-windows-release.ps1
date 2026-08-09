@@ -2,7 +2,6 @@
 param(
   [ValidateSet("local", "dev", "release")]
   [string]$Channel = "local",
-  [string]$ExpectedTag = "",
   [switch]$SkipInstall,
   [switch]$SkipTests,
   [switch]$OpenOutput
@@ -269,16 +268,6 @@ $tauriVersion = [string]$tauriConfig.version
 $cargoVersion = $cargoVersionMatch.Groups[1].Value
 if ($version -ne $tauriVersion -or $version -ne $cargoVersion) {
   throw "Version mismatch: package.json=$version, tauri.conf.json=$tauriVersion, Cargo.toml=$cargoVersion"
-}
-
-if ($ExpectedTag) {
-  $tagVersion = $ExpectedTag
-  if ($tagVersion.StartsWith("v", [StringComparison]::OrdinalIgnoreCase)) {
-    $tagVersion = $tagVersion.Substring(1)
-  }
-  if ($tagVersion -ne $version) {
-    throw "Release tag '$ExpectedTag' does not match project version '$version'."
-  }
 }
 
 $node = Resolve-Tool "node.exe" @(

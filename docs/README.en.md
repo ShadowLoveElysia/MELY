@@ -194,11 +194,13 @@ The project provides two Windows release workflows:
 Recommended formal release procedure:
 
 1. Update the version in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` to the same value.
-2. Commit the changes and create the corresponding tag, such as `v0.2.0`.
+2. Commit the changes and create a tag for that commit. The tag name can follow any release naming scheme.
 3. Create and publish a formal GitHub Release from that tag.
 4. Wait for the **Windows Release Assets** workflow to finish uploading the assets.
 
-The workflow requires the tag version to match all three project version fields exactly. If Immutable Releases is enabled for the GitHub repository, assets cannot be appended to or replaced in an already published Release. Keep that feature disabled to use the current post-publication build process.
+The Release title and tag name do not need to match the application's internal version. Artifact filenames use the internal version from the three project files, which must still match each other. If Immutable Releases is enabled for the GitHub repository, assets cannot be appended to or replaced in an already published Release. Keep that feature disabled to use the current post-publication build process.
+
+To rebuild an existing Release, manually run **Windows Release Assets** from the Actions page and enter that Release's tag name.
 
 ## Basic Workflow
 

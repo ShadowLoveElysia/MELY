@@ -35,7 +35,8 @@ import type {
   MmdMaterialInfo,
   MmdBoneInfo,
   MmdModelStats,
-  MmdMotionInfo,
+  MmdMotionTrackKind,
+  MmdMotionTracks,
   MmdPoseState,
   PreviewMode,
   ProjectionStats,
@@ -60,8 +61,8 @@ interface SidebarProps {
   modelStats: MmdModelStats | null;
   modelCandidates: readonly MmdModelCandidate[];
   selectedModelPath: string;
-  motionInfo: MmdMotionInfo | null;
-  lockedMotionFrame: number | null;
+  motionTracks: MmdMotionTracks;
+  lockedMotionFrames: Record<MmdMotionTrackKind, number | null>;
   bones: readonly MmdBoneInfo[];
   materials: readonly MmdMaterialInfo[];
   selectedBoneIndex: number | null;
@@ -123,8 +124,8 @@ export function Sidebar({
   modelStats,
   modelCandidates,
   selectedModelPath,
-  motionInfo,
-  lockedMotionFrame,
+  motionTracks,
+  lockedMotionFrames,
   bones,
   materials,
   selectedBoneIndex,
@@ -171,7 +172,10 @@ export function Sidebar({
   const boneDisplayName = (bone: MmdBoneInfo) => bone.displayName
     || t("model.boneFallback", { index: number(bone.index + 1) });
   const selectedSkinMaterials = new Set(solidOptions.skinMaterialIndices);
-  const motionLocked = lockedMotionFrame !== null;
+  const unlockedMotionTracks = (["dance", "expression"] as const)
+    .filter((kind) => motionTracks[kind] && lockedMotionFrames[kind] === null)
+    .map((kind) => t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack"));
+  const motionReady = unlockedMotionTracks.length === 0;
 
   const toggleSkinMaterial = (index: number) => {
     const next = new Set(solidOptions.skinMaterialIndices);
@@ -766,9 +770,11 @@ export function Sidebar({
           <button
             type="button"
             className="primary-button"
-            title={motionInfo && !motionLocked ? t("sidebar.motion.lockBeforeGenerate") : undefined}
+            title={!motionReady ? t("sidebar.motion.lockBeforeGenerateTracks", {
+              tracks: unlockedMotionTracks.join(" / "),
+            }) : undefined}
             onClick={onGenerate}
-            disabled={!modelStats || processing || modelLoading || Boolean(motionInfo && !motionLocked)}
+            disabled={!modelStats || processing || modelLoading || !motionReady}
           >
             {generationMode === "solid" ? <Boxes size={16} /> : <Sparkles size={16} />}
             {modelLoading ? t("sidebar.importing") : processing ? t("sidebar.generating") : generationMode === "solid" ? t("sidebar.generateSolid") : t("sidebar.generateHologram")}

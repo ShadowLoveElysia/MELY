@@ -17,6 +17,10 @@ export const isMotionReadyForGeneration = (
   lockedFrame: number | null,
 ) => !hasMotion || lockedFrame !== null;
 
+export const areMotionTracksReadyForGeneration = (
+  tracks: readonly { loaded: boolean; lockedFrame: number | null }[],
+) => tracks.every((track) => !track.loaded || track.lockedFrame !== null);
+
 export const canToggleMotionPlayback = (
   hasMotion: boolean,
   lockedFrame: number | null,

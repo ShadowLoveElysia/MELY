@@ -4,22 +4,27 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag to build and update
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: mely-windows-release-${{ github.event.release.tag_name }}
+  group: mely-windows-release-${{ inputs.release_tag || github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
   build-and-upload:
     name: Build assets from the published tag
     if: >-
-      github.event.release.prerelease == false &&
-      github.event.release.draft == false &&
-      github.event.release.tag_name != 'dev-latest' &&
-      startsWith(github.event.release.tag_name, 'v')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.release.prerelease == false &&
+      github.event.release.draft == false)
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -27,7 +32,7 @@ jobs:
       - name: Check out the published release tag
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.release_tag || github.event.release.tag_name }}
           fetch-depth: 0
 
       - name: Read project version
@@ -61,11 +66,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build and test tagged Windows packages
+      - name: Build and test Windows packages
         shell: pwsh
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: ./scripts/build-windows-release.ps1 -Channel release -ExpectedTag $env:RELEASE_TAG
+        run: ./scripts/build-windows-release.ps1 -Channel release
 
       - name: Preserve workflow artifacts
         uses: actions/upload-artifact@v7
@@ -82,7 +85,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
           MELY_VERSION: ${{ steps.version.outputs.version }}
         run: |
           $assets = @(

@@ -1,5 +1,6 @@
 import {
   BufferGeometry,
+  Quaternion,
   Skeleton,
   Texture,
   type Color,
@@ -8,13 +9,16 @@ import {
   type SkinnedMesh,
 } from "three";
 import type { ThreeMmdModel } from "@yohawing/three-mmd-loader";
+import type { MmdAnimation, VmdMorphTrack } from "@yohawing/three-mmd-loader/parser";
 import type {
   MelyPoseApplyResult,
   MelyPoseDocument,
   MmdBoneInfo,
   MmdMaterialInfo,
   MmdModelStats,
-  MmdMotionInfo,
+  MmdMotionTimes,
+  MmdMotionTrackInfo,
+  MmdMotionTrackKind,
   MmdPoseState,
 } from "../types";
 import { AppError, appError } from "./appError";
@@ -37,10 +41,10 @@ export interface LoadedMmdModel {
   bones: readonly MmdBoneInfo[];
   materials: readonly MmdMaterialInfo[];
   translationStep: number;
-  loadMotion: (file: File) => Promise<MmdMotionInfo>;
-  updatePreviewPose: (seconds: number) => number;
-  updatePose: (seconds: number) => number;
-  clearMotion: () => void;
+  loadMotion: (file: File, kind: MmdMotionTrackKind) => Promise<MmdMotionTrackInfo>;
+  updatePreviewPose: (times: MmdMotionTimes) => MmdMotionTimes;
+  updatePose: (times: MmdMotionTimes) => MmdMotionTimes;
+  clearMotion: (kind?: MmdMotionTrackKind) => void;
   beginBoneEdit: (index: number) => void;
   updateBoneEdit: (index: number) => void;
   endBoneEdit: (index: number) => boolean;
@@ -239,6 +243,198 @@ const materialCount = (mesh: SkinnedMesh) =>
 
 const materialList = (mesh: SkinnedMesh) =>
   (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) as Material[];
+
+interface RuntimeMorph {
+  name?: string;
+  englishName?: string;
+  type?: string;
+  groupOffsets?: readonly { morphIndex: number; weight: number }[];
+  flipOffsets?: readonly { morphIndex: number; weight: number }[];
+  boneOffsets?: readonly {
+    boneIndex: number;
+    translation: readonly [number, number, number];
+    rotation: readonly [number, number, number, number];
+  }[];
+}
+
+interface ExpressionTrackState {
+  animation: MmdAnimation;
+  bindings: readonly { morphIndex: number; track: VmdMorphTrack }[];
+}
+
+const maxPackedTrackFrame = (
+  tracks: readonly { frames: Uint32Array }[],
+) => tracks.reduce((maximum, track) => (
+  Math.max(maximum, track.frames[track.frames.length - 1] ?? 0)
+), 0);
+
+const filteredDanceAnimation = (animation: MmdAnimation): MmdAnimation => ({
+  ...animation,
+  bytes: new Uint8Array(),
+  metadata: {
+    ...animation.metadata,
+    counts: {
+      ...animation.metadata.counts,
+      morphs: 0,
+      cameras: 0,
+      lights: 0,
+      selfShadows: 0,
+    },
+    maxFrame: maxPackedTrackFrame(Object.values(animation.boneTracks)),
+  },
+  morphTracks: {},
+  cameraFrames: [],
+  lightFrames: [],
+  selfShadowFrames: [],
+});
+
+const sampleMorphTrack = (track: VmdMorphTrack, frame: number) => {
+  const frames = track.frames;
+  if (frames.length === 0) return 0;
+  if (frame <= (frames[0] ?? 0)) return track.weights[0] ?? 0;
+  let low = 1;
+  let high = frames.length - 1;
+  let nextIndex = frames.length;
+  while (low <= high) {
+    const middle = (low + high) >> 1;
+    if (frame < (frames[middle] ?? Number.POSITIVE_INFINITY)) {
+      nextIndex = middle;
+      high = middle - 1;
+    } else {
+      low = middle + 1;
+    }
+  }
+  if (nextIndex >= frames.length) return track.weights[frames.length - 1] ?? 0;
+  const previousIndex = nextIndex - 1;
+  const previousFrame = frames[previousIndex] ?? 0;
+  const nextFrame = frames[nextIndex] ?? previousFrame;
+  const ratio = nextFrame === previousFrame ? 0 : (frame - previousFrame) / (nextFrame - previousFrame);
+  const previousWeight = track.weights[previousIndex] ?? 0;
+  return previousWeight + ((track.weights[nextIndex] ?? previousWeight) - previousWeight) * ratio;
+};
+
+const weightedQuaternion = (
+  source: readonly [number, number, number, number],
+  weight: number,
+  sourceScratch: Quaternion,
+  resultScratch: Quaternion,
+) => {
+  sourceScratch.set(-source[0], -source[1], source[2], source[3]).normalize();
+  if (weight < 0) {
+    sourceScratch.x *= -1;
+    sourceScratch.y *= -1;
+    sourceScratch.z *= -1;
+    weight = -weight;
+  }
+  return resultScratch.identity().slerp(sourceScratch, weight);
+};
+
+const runtimeMorphs = (mesh: SkinnedMesh): RuntimeMorph[] => (
+  Array.isArray(mesh.userData.mmdMorphs) ? mesh.userData.mmdMorphs : []
+);
+
+const expressionBindings = (
+  mesh: SkinnedMesh,
+  animation: MmdAnimation,
+) => {
+  const indices = new Map<string, number>();
+  Object.entries(mesh.morphTargetDictionary ?? {}).forEach(([name, index]) => indices.set(name, index));
+  runtimeMorphs(mesh).forEach((morph, index) => {
+    if (morph.name) indices.set(morph.name, index);
+    if (morph.englishName) indices.set(morph.englishName, index);
+  });
+  return Object.entries(animation.morphTracks).flatMap(([name, track]) => {
+    const morphIndex = indices.get(name);
+    return morphIndex === undefined ? [] : [{ morphIndex, track }];
+  });
+};
+
+const expandExpressionMorph = (
+  morphs: readonly RuntimeMorph[],
+  weights: number[],
+  morphIndex: number,
+  weight: number,
+  visited: Uint8Array,
+) => {
+  const morph = morphs[morphIndex];
+  const offsets = morph?.type === "flip" ? morph.flipOffsets : morph?.groupOffsets;
+  if ((morph?.type !== "group" && morph?.type !== "flip") || !offsets || weight === 0) return;
+  offsets.forEach((offset) => {
+    if (offset.morphIndex < 0 || offset.morphIndex >= weights.length) return;
+    const contribution = weight * offset.weight;
+    weights[offset.morphIndex] = (weights[offset.morphIndex] ?? 0) + contribution;
+    if (contribution === 0 || visited[offset.morphIndex] === 1) return;
+    visited[offset.morphIndex] = 1;
+    expandExpressionMorph(morphs, weights, offset.morphIndex, contribution, visited);
+    visited[offset.morphIndex] = 0;
+  });
+};
+
+const syncMorphSplitTargets = (mesh: SkinnedMesh) => {
+  const sourceInfluences = mesh.morphTargetInfluences;
+  const bodyMeshes = mesh.userData.mmdMorphSplitBodyMeshes;
+  if (!sourceInfluences || !Array.isArray(bodyMeshes)) return;
+  bodyMeshes.forEach((body) => {
+    if (!isSkinnedMesh(body) || !body.morphTargetInfluences) return;
+    const indices = body.userData.mmdMorphSplitBody?.morphTargetIndices as ArrayLike<number> | undefined;
+    if (!indices) return;
+    for (let index = 0; index < indices.length; index += 1) {
+      body.morphTargetInfluences[index] = sourceInfluences[indices[index] ?? -1] ?? 0;
+    }
+  });
+};
+
+const applyExpressionTrack = (
+  mesh: SkinnedMesh,
+  state: ExpressionTrackState | null,
+  frame: number,
+) => {
+  const influences = mesh.morphTargetInfluences;
+  if (!influences) return;
+  influences.fill(0);
+  if (!state) {
+    syncMorphSplitTargets(mesh);
+    return;
+  }
+  state.bindings.forEach(({ morphIndex, track }) => {
+    influences[morphIndex] = sampleMorphTrack(track, frame);
+  });
+  const morphs = runtimeMorphs(mesh);
+  const weights = Array.from(influences);
+  const directWeights = [...weights];
+  const visited = new Uint8Array(weights.length);
+  morphs.forEach((_morph, index) => {
+    const weight = directWeights[index] ?? 0;
+    if (weight === 0) return;
+    visited[index] = 1;
+    expandExpressionMorph(morphs, weights, index, weight, visited);
+    visited[index] = 0;
+  });
+  influences.forEach((_weight, index) => {
+    influences[index] = weights[index] ?? 0;
+  });
+  const sourceQuaternion = new Quaternion();
+  const weightedQuaternionResult = new Quaternion();
+  morphs.forEach((morph, morphIndex) => {
+    const weight = weights[morphIndex] ?? 0;
+    if (morph.type !== "bone" || weight === 0) return;
+    morph.boneOffsets?.forEach((offset) => {
+      const bone = mesh.skeleton.bones[offset.boneIndex];
+      if (!bone) return;
+      bone.position.x += offset.translation[0] * weight;
+      bone.position.y += offset.translation[1] * weight;
+      bone.position.z -= offset.translation[2] * weight;
+      bone.quaternion.premultiply(weightedQuaternion(
+        offset.rotation,
+        weight,
+        sourceQuaternion,
+        weightedQuaternionResult,
+      ));
+      bone.updateMatrix();
+    });
+  });
+  syncMorphSplitTargets(mesh);
+};
 
 const SKIN_KEYWORDS = [
   "皮肤",
@@ -487,7 +683,11 @@ export const loadMmdModel = async (
   let pose: MmdPoseController | null = createMmdPoseController(model.mesh);
   const bones = pose.bones;
   const translationStep = pose.translationStep;
-  let motionInfo: MmdMotionInfo | null = null;
+  const motionInfo: Record<MmdMotionTrackKind, MmdMotionTrackInfo | null> = {
+    dance: null,
+    expression: null,
+  };
+  let expressionTrack: ExpressionTrackState | null = null;
 
   const currentModel = () => {
     if (!activeModel) throw new Error("MMD model has been disposed");
@@ -518,7 +718,7 @@ export const loadMmdModel = async (
       textureWarnings: textureWarnings.length,
     },
     previewRuntime: inspectMmdPreviewRuntime(model.root),
-    loadMotion: async (file) => {
+    loadMotion: async (file, kind) => {
       const target = currentModel();
       const motionLoader = new ThreeMmdLoader();
       let motion;
@@ -554,15 +754,29 @@ export const loadMmdModel = async (
       const motionMorphNames = Object.keys(motion.animation.morphTracks);
       const matchedBoneTrackCount = motionBoneNames.filter((name) => boneNames.has(name)).length;
       const matchedMorphTrackCount = motionMorphNames.filter((name) => morphNames.has(name)).length;
-      if (matchedBoneTrackCount + matchedMorphTrackCount === 0) {
+      const matchedTrackCount = kind === "dance" ? matchedBoneTrackCount : matchedMorphTrackCount;
+      if (matchedTrackCount === 0) {
         throw appError("error.motion.noCompatibleTracks");
       }
-      target.setAnimation(motion);
-      const frameState = evaluateMmdPreviewFrame(target, 0);
+      if (kind === "dance") {
+        target.setAnimation(filteredDanceAnimation(motion.animation));
+      } else {
+        expressionTrack = {
+          animation: motion.animation,
+          bindings: expressionBindings(target.mesh, motion.animation),
+        };
+      }
+      const frameState = kind === "dance"
+        ? evaluateMmdPreviewFrame(target, 0)
+        : target.runtime.frameState();
+      applyExpressionTrack(target.mesh, expressionTrack, 0);
       syncMmdSkeletonForCpuRead(target);
       currentPose().syncAfterRuntimeUpdate();
-      const maxFrame = motion.animation.metadata.maxFrame;
-      motionInfo = {
+      const maxFrame = kind === "dance"
+        ? maxPackedTrackFrame(Object.values(motion.animation.boneTracks))
+        : maxPackedTrackFrame(Object.values(motion.animation.morphTracks));
+      const loadedInfo: MmdMotionTrackInfo = {
+        kind,
         name: file.name.replace(/\.[^.]+$/, ""),
         modelName: motion.animation.metadata.modelName,
         maxFrame,
@@ -573,31 +787,66 @@ export const loadMmdModel = async (
         matchedBoneTrackCount,
         matchedMorphTrackCount,
       };
-      return motionInfo;
+      motionInfo[kind] = loadedInfo;
+      return loadedInfo;
     },
-    updatePreviewPose: (seconds) => {
+    updatePreviewPose: (times) => {
       const target = currentModel();
-      const duration = motionInfo?.durationSeconds ?? 0;
-      const clamped = duration > 0 ? Math.max(0, Math.min(duration, seconds)) : 0;
-      const frameState = evaluateMmdPreviewFrame(target, clamped);
+      const danceDuration = motionInfo.dance?.durationSeconds ?? 0;
+      const expressionDuration = motionInfo.expression?.durationSeconds ?? 0;
+      const dance = danceDuration > 0 ? Math.max(0, Math.min(danceDuration, times.dance)) : 0;
+      const expression = expressionDuration > 0
+        ? Math.max(0, Math.min(expressionDuration, times.expression))
+        : 0;
+      if (motionInfo.dance) evaluateMmdPreviewFrame(target, dance);
+      else {
+        target.runtime.resetPose();
+        evaluateMmdPreviewFrame(target, 0);
+      }
+      applyExpressionTrack(
+        target.mesh,
+        expressionTrack,
+        expression * (motionInfo.expression?.frameRate ?? 30),
+      );
       currentPose().syncAfterRuntimePreview();
-      return frameState.seconds;
+      return { dance, expression };
     },
-    updatePose: (seconds) => {
+    updatePose: (times) => {
       const target = currentModel();
-      const duration = motionInfo?.durationSeconds ?? 0;
-      const clamped = duration > 0 ? Math.max(0, Math.min(duration, seconds)) : 0;
-      const frameState = evaluateMmdPreviewFrame(target, clamped);
+      const danceDuration = motionInfo.dance?.durationSeconds ?? 0;
+      const expressionDuration = motionInfo.expression?.durationSeconds ?? 0;
+      const dance = danceDuration > 0 ? Math.max(0, Math.min(danceDuration, times.dance)) : 0;
+      const expression = expressionDuration > 0
+        ? Math.max(0, Math.min(expressionDuration, times.expression))
+        : 0;
+      if (motionInfo.dance) evaluateMmdPreviewFrame(target, dance);
+      else {
+        target.runtime.resetPose();
+        evaluateMmdPreviewFrame(target, 0);
+      }
+      applyExpressionTrack(
+        target.mesh,
+        expressionTrack,
+        expression * (motionInfo.expression?.frameRate ?? 30),
+      );
       currentPose().syncAfterRuntimeUpdate();
       syncMmdSkeletonForCpuRead(target);
-      return frameState.seconds;
+      return { dance, expression };
     },
-    clearMotion: () => {
+    clearMotion: (kind) => {
       const target = currentModel();
-      motionInfo = null;
-      target.runtime.clearAnimation();
-      target.runtime.resetPose();
-      evaluateMmdPreviewFrame(target, 0);
+      if (!kind || kind === "dance") {
+        motionInfo.dance = null;
+        target.runtime.clearAnimation();
+      }
+      if (!kind || kind === "expression") {
+        motionInfo.expression = null;
+        expressionTrack = null;
+      }
+      if (!motionInfo.dance) target.runtime.resetPose();
+      if (motionInfo.dance) evaluateMmdPreviewFrame(target, 0);
+      else evaluateMmdPreviewFrame(target, 0);
+      applyExpressionTrack(target.mesh, expressionTrack, 0);
       syncMmdSkeletonForCpuRead(target);
       currentPose().syncAfterRuntimeUpdate();
     },
@@ -616,7 +865,9 @@ export const loadMmdModel = async (
       if (!activeModel) return;
       const disposedModel = activeModel;
       activeModel = null;
-      motionInfo = null;
+      motionInfo.dance = null;
+      motionInfo.expression = null;
+      expressionTrack = null;
       pose = null;
       disposeMmdModelResources(disposedModel, disposeMmdModel);
     },

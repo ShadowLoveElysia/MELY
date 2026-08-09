@@ -202,13 +202,17 @@ MELY-0.2.0-windows-x64-SHA256SUMS.txt
 
 1. 同步修改 `package.json`、`src-tauri/tauri.conf.json` 和 `src-tauri/Cargo.toml`
    中的版本号。
-2. 提交代码并创建对应标签，例如 `v0.2.0`。
+2. 提交代码并为该提交创建标签。标签名称可按发布需要自由命名。
 3. 在 GitHub 上以该标签创建并发布正式 Release。
 4. 等待 `Windows Release Assets` 工作流将附件上传完成。
 
-工作流会强制检查标签版本与上述三处版本完全一致。如果 GitHub
+Release 标题和标签名称不需要与应用内部版本一致；产物文件名使用上述
+三处配置的内部版本号，且这三处版本仍须彼此一致。如果 GitHub
 仓库开启了 Immutable Releases，已发布的 Release 不允许再追加或替换附件；
 要使用当前的“发布后构建”流程，需保持该功能关闭。
+
+如需为现有 Release 重新打包，可在 Actions 页面手动运行
+`Windows Release Assets`，并填写该 Release 的标签名称。
 
 ## 基本工作流程
 
