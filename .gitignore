@@ -149,3 +149,5 @@ face-strong-generation-report.json
 TAURI_PREP.md
 /release
 MELY_R1_PLAN.md
+tests/ysm-2.6.5-forge+mc1.20.1-release.jar
+tests/ysm-conversion-research.md

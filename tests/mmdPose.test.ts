@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { DefaultMmdRuntime } from "@yohawing/three-mmd-loader";
 import * as THREE from "three";
 import { parseMelyPoseJson, stringifyMelyPose } from "../src/core/melyPose";
 import { createMmdPoseController } from "../src/core/mmdPose";
@@ -156,4 +157,55 @@ test("pose import clears morphs that are absent from the imported document", () 
   assert.equal(target.mesh.morphTargetInfluences?.[0], 0);
   assert.equal(applied.appliedMorphCount, 0);
   assert.deepEqual(applied.missingMorphNames, []);
+});
+
+test("imported pose remains stable across runtime evaluation and manual offsets apply once", () => {
+  const target = createRig();
+  const pose = createMmdPoseController(target.mesh);
+  const importedRotation = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(0, 0, 1),
+    Math.PI / 3,
+  );
+
+  pose.importMelyPose({
+    generator: "MELY",
+    version: "1.0",
+    bones: [
+      { name: "Root", pos: [0.4, 0.25, -0.1], rot: [0, 0, 0, 1] },
+      { name: "Arm_L", pos: [0, 0, 0], rot: importedRotation.toArray() },
+    ],
+    morphs: [{ name: "Blink", weight: 0.65 }],
+  });
+  const animation = pose.importedPoseAnimation();
+  assert.ok(animation);
+
+  target.root.position.set(0, 0, 0);
+  target.root.quaternion.identity();
+  target.arm.position.set(0, 1, 0);
+  target.arm.quaternion.identity();
+  target.mesh.morphTargetInfluences!.fill(0);
+  const runtime = new DefaultMmdRuntime();
+  runtime.setAnimation(animation, target.mesh);
+  runtime.evaluate(0, { physics: false, ik: false });
+  pose.syncAfterRuntimeUpdate();
+
+  assert.ok(target.root.position.distanceTo(new THREE.Vector3(0.4, 0.25, -0.1)) < 1e-6);
+  assert.ok(target.arm.quaternion.angleTo(importedRotation) < 5e-4);
+  assert.ok(Math.abs((target.mesh.morphTargetInfluences?.[0] ?? 0) - 0.65) < 1e-6);
+
+  const manualRotation = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(1, 0, 0),
+    Math.PI / 6,
+  );
+  assert.ok(pose.nudgeBone(1, "x", Math.PI / 6));
+  const expected = importedRotation.clone().multiply(manualRotation);
+  assert.ok(target.arm.quaternion.angleTo(expected) < 5e-4);
+
+  for (let index = 0; index < 3; index += 1) {
+    runtime.evaluate(0, { physics: false, ik: false });
+    pose.syncAfterRuntimeUpdate();
+    assert.ok(target.root.position.distanceTo(new THREE.Vector3(0.4, 0.25, -0.1)) < 1e-6);
+    assert.ok(target.arm.quaternion.angleTo(expected) < 5e-4);
+    assert.ok(Math.abs((target.mesh.morphTargetInfluences?.[0] ?? 0) - 0.65) < 1e-6);
+  }
 });

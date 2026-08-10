@@ -10,7 +10,10 @@ import {
   MMD_MODEL_LOAD_OPTIONS,
   releaseMmdLoaderReferences,
 } from "../src/core/mmdModel";
-import { evaluateMmdPreviewFrame } from "../src/core/mmdPreviewRuntime";
+import {
+  evaluateMmdPreviewFrame,
+  settleMmdPreviewFrame,
+} from "../src/core/mmdPreviewRuntime";
 import type { ThreeMmdModel } from "@yohawing/three-mmd-loader";
 
 test("model loading uses sparse morph bodies without preview proxy geometry", () => {
@@ -271,6 +274,52 @@ test("dance and expression tracks sample independent frames from one VMD", async
   }
 });
 
+test("imported pose survives model reevaluation without compounding manual edits", async () => {
+  const bytes = await import("node:fs/promises").then(({ readFile }) => (
+    readFile(new URL("./fixtures/mely-input-e2e.pmd", import.meta.url))
+  ));
+  const file = new File([bytes], "mely-input-e2e.pmd");
+  const model = await loadMmdModel([file], file);
+
+  try {
+    const upperIndex = model.bones.findIndex((bone) => bone.name === "upper");
+    const smileIndex = model.mesh.morphTargetDictionary?.smile;
+    const importedRotation = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 0, 1),
+      Math.PI / 5,
+    );
+    model.importMelyPose({
+      generator: "MELY",
+      version: "1.0",
+      bones: [
+        { name: "root", pos: [0.35, 0.2, -0.15], rot: [0, 0, 0, 1] },
+        { name: "upper", pos: [0, 0, 0], rot: importedRotation.toArray() },
+      ],
+      morphs: [{ name: "smile", weight: 0.6 }],
+    });
+    assert.ok(upperIndex >= 0);
+    assert.ok(model.nudgeBone(upperIndex, "x", Math.PI / 12));
+    const expectedRoot = new THREE.Vector3(0.35, 0.2, -0.15);
+    const expectedUpper = importedRotation.clone().multiply(
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 12),
+    );
+
+    for (let index = 0; index < 3; index += 1) {
+      model.updatePose({ dance: 0, expression: 0 });
+      const root = model.mesh.skeleton.bones.find((bone) => bone.name === "root");
+      const upper = model.mesh.skeleton.bones[upperIndex];
+      assert.ok(root?.position.distanceTo(expectedRoot) ?? Number.POSITIVE_INFINITY < 1e-5);
+      assert.ok(upper?.quaternion.angleTo(expectedUpper) ?? Number.POSITIVE_INFINITY < 1e-5);
+      const smileWeight = smileIndex === undefined
+        ? undefined
+        : model.mesh.morphTargetInfluences?.[smileIndex];
+      assert.ok(smileWeight !== undefined && Math.abs(smileWeight - 0.6) < 1e-6);
+    }
+  } finally {
+    model.dispose();
+  }
+});
+
 test("preview runtime reports shared morph-split skeletons without duplicating ownership", async () => {
   const bytes = await import("node:fs/promises").then(({ readFile }) => (
     readFile(new URL("./fixtures/mely-input-e2e.pmd", import.meta.url))
@@ -318,4 +367,26 @@ test("preview evaluation synchronizes renderer-facing bones without CPU skinning
   assert.equal(debugCaptures, 0);
   assert.equal(matrixWorldUpdates, 1);
   assert.equal(skeletonUpdates, 1);
+});
+
+test("exact physics settling seeds once and advances sixty fixed steps at the target frame", () => {
+  const evaluations: Array<{ seconds: number; physics: boolean }> = [];
+  const fixedSteps: Array<number | null> = [];
+  const model = {
+    runtime: {},
+    update(seconds: number, options?: { physics?: boolean }) {
+      evaluations.push({ seconds, physics: options?.physics === true });
+      return { seconds, frame: seconds * 30, frameRate: 30 };
+    },
+  } as unknown as ThreeMmdModel;
+
+  const state = settleMmdPreviewFrame(model, 0, {
+    setFixedStepOverride: (value) => fixedSteps.push(value),
+  });
+
+  assert.equal(state.seconds, 0);
+  assert.deepEqual(fixedSteps, [1 / 60, null]);
+  assert.deepEqual(evaluations[0], { seconds: 0, physics: false });
+  assert.equal(evaluations.filter((entry) => entry.physics).length, 61);
+  assert.equal(evaluations.every((entry) => entry.seconds === 0), true);
 });

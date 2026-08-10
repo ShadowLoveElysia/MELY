@@ -73,6 +73,8 @@ export interface MmdModelStats {
   materialCount: number;
   boneCount: number;
   morphCount: number;
+  rigidBodyCount: number;
+  jointCount: number;
   textureWarnings: number;
 }
 

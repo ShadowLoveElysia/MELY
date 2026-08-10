@@ -9,6 +9,7 @@ import {
   FileArchive,
   FileBox,
   FolderOpen,
+  GripVertical,
   Image,
   Layers3,
   LoaderCircle,
@@ -25,8 +26,7 @@ import {
   WandSparkles,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { DragEvent } from "react";
-import type { MmdModelCandidate } from "../core/mmdAssets";
+import type { CSSProperties, DragEvent, KeyboardEvent, PointerEvent } from "react";
 import { useI18n } from "../i18n/I18nProvider";
 import type { TranslationKey } from "../i18n";
 import type {
@@ -59,8 +59,6 @@ interface SidebarProps {
   previewMode: PreviewMode;
   stats: ProjectionStats | null;
   modelStats: MmdModelStats | null;
-  modelCandidates: readonly MmdModelCandidate[];
-  selectedModelPath: string;
   motionTracks: MmdMotionTracks;
   lockedMotionFrames: Record<MmdMotionTrackKind, number | null>;
   bones: readonly MmdBoneInfo[];
@@ -81,12 +79,19 @@ interface SidebarProps {
   progress: number;
   stage: string;
   progressDetail: string;
+  sidebarWidth: number;
+  physicsAvailable: boolean;
+  physicsEnabled: boolean;
+  physicsLoading: boolean;
   onOptionsChange: (patch: Partial<HologramOptions>) => void;
   onSolidOptionsChange: (patch: Partial<SolidOptions>) => void;
   onGenerationModeChange: (mode: GenerationMode) => void;
   onPreviewModeChange: (mode: PreviewMode) => void;
   onAssetsAdded: (files: File[]) => void | Promise<void>;
-  onModelSelected: (path: string) => void | Promise<void>;
+  onPhysicsEnabledChange: (enabled: boolean) => void | Promise<void>;
+  onSidebarResizeStart: (event: PointerEvent<HTMLDivElement>) => void;
+  onSidebarResizeStep: (delta: number) => void;
+  onSidebarResizeReset: () => void;
   onPoseEditingChange: (editing: boolean) => void;
   onBoneSelected: (index: number | null) => void;
   onPoseNudge: (axis: "x" | "y" | "z", direction: -1 | 1) => void;
@@ -122,8 +127,6 @@ export function Sidebar({
   previewMode,
   stats,
   modelStats,
-  modelCandidates,
-  selectedModelPath,
   motionTracks,
   lockedMotionFrames,
   bones,
@@ -144,12 +147,19 @@ export function Sidebar({
   progress,
   stage,
   progressDetail,
+  sidebarWidth,
+  physicsAvailable,
+  physicsEnabled,
+  physicsLoading,
   onOptionsChange,
   onSolidOptionsChange,
   onGenerationModeChange,
   onPreviewModeChange,
   onAssetsAdded,
-  onModelSelected,
+  onPhysicsEnabledChange,
+  onSidebarResizeStart,
+  onSidebarResizeStep,
+  onSidebarResizeReset,
   onPoseEditingChange,
   onBoneSelected,
   onPoseNudge,
@@ -176,6 +186,16 @@ export function Sidebar({
     .filter((kind) => motionTracks[kind] && lockedMotionFrames[kind] === null)
     .map((kind) => t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack"));
   const motionReady = unlockedMotionTracks.length === 0;
+
+  const onResizeKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      onSidebarResizeStep(event.key === "ArrowLeft" ? -24 : 24);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      onSidebarResizeReset();
+    }
+  };
 
   const toggleSkinMaterial = (index: number) => {
     const next = new Set(solidOptions.skinMaterialIndices);
@@ -206,7 +226,27 @@ export function Sidebar({
   };
 
   return (
-    <aside className="sidebar" aria-label={t("sidebar.aria")}>
+    <aside
+      className="sidebar"
+      aria-label={t("sidebar.aria")}
+      style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+    >
+      <div
+        className="sidebar-resize-handle"
+        role="separator"
+        tabIndex={0}
+        aria-label={t("sidebar.resize")}
+        aria-orientation="vertical"
+        aria-valuemin={300}
+        aria-valuemax={840}
+        aria-valuenow={sidebarWidth}
+        title={t("sidebar.resize")}
+        onPointerDown={onSidebarResizeStart}
+        onDoubleClick={onSidebarResizeReset}
+        onKeyDown={onResizeKeyDown}
+      >
+        <GripVertical size={12} />
+      </div>
       <div className="sidebar-scroll">
         <Section index="01" title={t("sidebar.section.assets")} subtitle={t("sidebar.section.assetsSubtitle")}>
           <div
@@ -257,21 +297,17 @@ export function Sidebar({
             </div>
           </div>
 
-          {modelCandidates.length > 1 ? (
-            <Field label={t("sidebar.packageModels")} hint={t("sidebar.packageModelsHint", { count: number(modelCandidates.length) })}>
-              <select
-                className="model-candidate-select"
-                aria-label={t("sidebar.packageModels")}
-                value={selectedModelPath}
-                disabled={modelLoading}
-                onChange={(event) => void onModelSelected(event.target.value)}
-              >
-                {modelCandidates.map((candidate) => (
-                  <option key={candidate.path} value={candidate.path}>
-                    {t("sidebar.candidate", { name: candidate.displayName, count: number(candidate.vertexCount) })}
-                  </option>
-                ))}
-              </select>
+          {modelStats ? (
+            <Field
+              label={t("sidebar.physics.label")}
+              hint={t(physicsAvailable ? "sidebar.physics.hint" : "sidebar.physics.unavailable")}
+            >
+              <Toggle
+                checked={physicsEnabled}
+                label={t("sidebar.physics.label")}
+                disabled={!physicsAvailable || physicsLoading || modelLoading || processing}
+                onChange={(enabled) => void onPhysicsEnabledChange(enabled)}
+              />
             </Field>
           ) : null}
 
@@ -290,6 +326,8 @@ export function Sidebar({
                 <span><small>{t("sidebar.stat.bones")}</small><strong>{number(modelStats.boneCount)}</strong></span>
                 <span><small>{t("sidebar.stat.materials")}</small><strong>{number(modelStats.materialCount)}</strong></span>
                 <span><small>{t("sidebar.stat.morphs")}</small><strong>{number(modelStats.morphCount)}</strong></span>
+                <span><small>{t("sidebar.stat.rigidBodies")}</small><strong>{number(modelStats.rigidBodyCount)}</strong></span>
+                <span><small>{t("sidebar.stat.joints")}</small><strong>{number(modelStats.jointCount)}</strong></span>
               </div>
               {modelStats.textureWarnings ? (
                 <div className="model-warning">

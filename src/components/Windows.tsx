@@ -6,7 +6,7 @@ interface WindowAction {
   label: string;
   onClick: () => void;
   disabled?: boolean;
-  emphasis?: "primary" | "danger" | "secondary";
+  emphasis?: "primary" | "danger" | "destructive" | "secondary";
 }
 
 interface WindowsProps {
@@ -18,6 +18,7 @@ interface WindowsProps {
   closeLabel: string;
   danger?: boolean;
   dismissible?: boolean;
+  restoreFocusTo?: HTMLElement | null;
 }
 
 export function Windows({
@@ -29,9 +30,15 @@ export function Windows({
   closeLabel,
   danger = false,
   dismissible = true,
+  restoreFocusTo,
 }: WindowsProps) {
   const titleId = useId();
-  const panelRef = useModalFocus<HTMLDivElement>({ open, dismissible, onClose });
+  const panelRef = useModalFocus<HTMLDivElement>({
+    open,
+    dismissible,
+    onClose,
+    restoreFocusTo,
+  });
 
   if (!open) return null;
   return (

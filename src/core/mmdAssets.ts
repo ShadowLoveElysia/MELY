@@ -271,6 +271,11 @@ export interface MmdMotionCandidate {
   maxFrame: number;
 }
 
+export type MmdMotionCandidateTracks = Record<
+  "dance" | "expression",
+  MmdMotionCandidate[]
+>;
+
 const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
 
 export const selectPrimaryMmdMotionCandidate = (
@@ -299,7 +304,7 @@ export const selectPrimaryMmdMotionCandidate = (
     || compareText(left.path, right.path);
 })[0];
 
-const selectMotionTrackCandidate = (
+const sortMotionTrackCandidates = (
   candidates: readonly MmdMotionCandidate[],
   kind: "dance" | "expression",
 ) => [...candidates]
@@ -317,13 +322,20 @@ const selectMotionTrackCandidate = (
       || totalDifference
       || right.maxFrame - left.maxFrame
       || compareText(left.path, right.path);
-  })[0];
+  });
+
+export const groupMmdMotionTrackCandidates = (
+  candidates: readonly MmdMotionCandidate[],
+): MmdMotionCandidateTracks => ({
+  dance: sortMotionTrackCandidates(candidates, "dance"),
+  expression: sortMotionTrackCandidates(candidates, "expression"),
+});
 
 export const selectMmdMotionTrackCandidates = (
   candidates: readonly MmdMotionCandidate[],
 ) => ({
-  dance: selectMotionTrackCandidate(candidates, "dance"),
-  expression: selectMotionTrackCandidate(candidates, "expression"),
+  dance: sortMotionTrackCandidates(candidates, "dance")[0],
+  expression: sortMotionTrackCandidates(candidates, "expression")[0],
 });
 
 const motionTargetNames = (model: Pick<LoadedMmdModel, "bones" | "mesh"> | undefined) => {
@@ -358,6 +370,16 @@ export const choosePrimaryMmdMotion = async (
 ) => {
   const motions = files.filter(isMmdMotionFile);
   if (!motions.length) return undefined;
+  const candidates = await inspectMmdMotionCandidates(files, model);
+  return selectPrimaryMmdMotionCandidate(candidates)?.file ?? chooseShallowestAsset(motions);
+};
+
+export const inspectMmdMotionCandidates = async (
+  files: readonly File[],
+  model?: Pick<LoadedMmdModel, "bones" | "mesh">,
+): Promise<MmdMotionCandidate[]> => {
+  const motions = files.filter(isMmdMotionFile);
+  if (!motions.length) return [];
   const { parseVmd } = await import("@yohawing/three-mmd-loader/parser");
   const target = motionTargetNames(model);
   const candidates: MmdMotionCandidate[] = [];
@@ -376,10 +398,10 @@ export const choosePrimaryMmdMotion = async (
         maxFrame: animation.metadata.maxFrame,
       });
     } catch {
-      // Invalid candidates still reach the normal loader error when none parse successfully.
+      // Invalid VMD files remain visible in the asset list but not in compatible track selectors.
     }
   }
-  return selectPrimaryMmdMotionCandidate(candidates)?.file ?? chooseShallowestAsset(motions);
+  return candidates;
 };
 
 export const chooseMmdMotionTracks = async (
@@ -388,27 +410,7 @@ export const chooseMmdMotionTracks = async (
 ) => {
   const motions = files.filter(isMmdMotionFile);
   if (!motions.length) return {};
-  const { parseVmd } = await import("@yohawing/three-mmd-loader/parser");
-  const target = motionTargetNames(model);
-  const candidates: MmdMotionCandidate[] = [];
-  for (const file of motions) {
-    try {
-      const animation = parseVmd(await file.arrayBuffer());
-      const boneNames = Object.keys(animation.boneTracks);
-      const morphNames = Object.keys(animation.morphTracks);
-      candidates.push({
-        file,
-        path: normalizeAssetPath(file.webkitRelativePath || file.name),
-        boneTrackCount: boneNames.length,
-        morphTrackCount: morphNames.length,
-        matchedBoneTrackCount: boneNames.filter((name) => target.bones.has(name)).length,
-        matchedMorphTrackCount: morphNames.filter((name) => target.morphs.has(name)).length,
-        maxFrame: animation.metadata.maxFrame,
-      });
-    } catch {
-      // Invalid candidates are ignored when compatible parsed tracks exist.
-    }
-  }
+  const candidates = await inspectMmdMotionCandidates(files, model);
   const selected = selectMmdMotionTrackCandidates(candidates);
   return {
     dance: selected.dance?.file,

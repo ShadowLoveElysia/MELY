@@ -19,9 +19,11 @@ import {
   ScanLine,
   Sparkles,
   Sun,
+  Trash2,
   UserRound,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { Box3, MathUtils, Vector3 } from "three";
 import { IconButton } from "./components/IconButton";
 import {
@@ -48,7 +50,10 @@ import {
   evaluateProjectionHeightRisk,
   type HeightLimitMode,
 } from "./core/heightSafety";
-import type { MmdModelCandidate } from "./core/mmdAssets";
+import type {
+  MmdModelCandidate,
+  MmdMotionCandidateTracks,
+} from "./core/mmdAssets";
 import type { LoadedMmdModel } from "./core/mmdModel";
 import {
   areMotionTracksReadyForGeneration,
@@ -194,6 +199,50 @@ const emptyLockedMotionFrames = (): Record<MmdMotionTrackKind, number | null> =>
   dance: null,
   expression: null,
 });
+
+const emptyMotionCandidateTracks = (): MmdMotionCandidateTracks => ({
+  dance: [],
+  expression: [],
+});
+
+const emptySelectedMotionPaths = (): Record<MmdMotionTrackKind, string> => ({
+  dance: "",
+  expression: "",
+});
+
+type ClearResourceKind = "model" | MmdMotionTrackKind;
+
+const emptyClearResourceSelection = (): Record<ClearResourceKind, boolean> => ({
+  model: false,
+  dance: false,
+  expression: false,
+});
+
+const SIDEBAR_WIDTH_STORAGE_KEY = "mely.sidebarWidth";
+const DEFAULT_SIDEBAR_WIDTH = 372;
+const MIN_SIDEBAR_WIDTH = 300;
+const MAX_SIDEBAR_WIDTH = 840;
+const MIN_VIEWPORT_WIDTH = 420;
+
+const clampSidebarWidth = (width: number, viewportWidth = window.innerWidth) => {
+  const viewportMaximum = viewportWidth <= 720
+    ? MAX_SIDEBAR_WIDTH
+    : Math.max(MIN_SIDEBAR_WIDTH, viewportWidth - MIN_VIEWPORT_WIDTH);
+  return Math.round(Math.min(
+    MAX_SIDEBAR_WIDTH,
+    viewportMaximum,
+    Math.max(MIN_SIDEBAR_WIDTH, width),
+  ));
+};
+
+const initialSidebarWidth = () => {
+  try {
+    const stored = Number(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
+    return clampSidebarWidth(Number.isFinite(stored) && stored > 0 ? stored : DEFAULT_SIDEBAR_WIDTH);
+  } catch {
+    return clampSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
+  }
+};
 
 interface MotionTrackRuntime {
   seconds: number;
@@ -450,6 +499,7 @@ export default function App() {
   }
   const motionRuntime = motionRuntimeRef.current;
   const motionScrubCommitTimerRef = useRef<number | null>(null);
+  const sidebarResizeCleanupRef = useRef<(() => void) | null>(null);
   const lockedMotionFramesRef = useRef(emptyLockedMotionFrames());
   const [options, setOptions] = useState(initialOptions);
   const [solidOptions, setSolidOptions] = useState(initialSolidOptions);
@@ -458,6 +508,8 @@ export default function App() {
   const [assets, setAssets] = useState<ImportedAsset[]>([]);
   const [modelCandidates, setModelCandidates] = useState<MmdModelCandidate[]>([]);
   const [selectedModelPath, setSelectedModelPath] = useState("");
+  const [motionCandidates, setMotionCandidates] = useState<MmdMotionCandidateTracks>(emptyMotionCandidateTracks);
+  const [selectedMotionPaths, setSelectedMotionPaths] = useState(emptySelectedMotionPaths);
   const [mmdModel, setMmdModel] = useState<LoadedMmdModel | null>(null);
   const [motionTracks, setMotionTracks] = useState<MmdMotionTracks>(emptyMotionTracks);
   const [lockedMotionFrames, setLockedMotionFrames] = useState(emptyLockedMotionFrames);
@@ -473,6 +525,9 @@ export default function App() {
   const [processing, setProcessing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 720);
+  const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
+  const [physicsEnabled, setPhysicsEnabled] = useState(false);
+  const [physicsLoading, setPhysicsLoading] = useState(false);
   const [cameraMode, setCameraMode] = useState<CameraMode>("perspective");
   const [previewMode, setPreviewMode] = useState<PreviewMode>("source");
   const [showGrid, setShowGrid] = useState(true);
@@ -480,6 +535,8 @@ export default function App() {
   const [nightMode, setNightMode] = useState(false);
   const [heightMode, setHeightMode] = useState<HeightLimitMode>("vanilla");
   const [heightUnlockOpen, setHeightUnlockOpen] = useState(false);
+  const [clearResourcesOpen, setClearResourcesOpen] = useState(false);
+  const [clearResourceSelection, setClearResourceSelection] = useState(emptyClearResourceSelection);
   const [exportCenterOpen, setExportCenterOpen] = useState(false);
   const [exportPreflights, setExportPreflights] = useState<Partial<Record<ExportFormat, ExportPreflightResult>>>({});
   const [bundleFormats, setBundleFormats] = useState({
@@ -492,6 +549,7 @@ export default function App() {
   const [survivalToolsOpen, setSurvivalToolsOpen] = useState(false);
   const [survivalDocument, setSurvivalDocument] = useState<ProjectionDocument | null>(null);
   const survivalToolsTriggerRef = useRef<HTMLButtonElement>(null);
+  const clearResourcesTriggerRef = useRef<HTMLButtonElement>(null);
   const [resetToken, setResetToken] = useState(0);
   const [focusFaceToken, setFocusFaceToken] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
@@ -627,14 +685,30 @@ export default function App() {
 
   const resetMotionTracks = useCallback(() => {
     stopAllMotionPlayback();
-    MOTION_TRACK_KINDS.forEach((kind) => publishMotionSeconds(kind, 0));
+    MOTION_TRACK_KINDS.forEach((kind) => {
+      motionRuntime[kind].info = null;
+      publishMotionSeconds(kind, 0);
+    });
     setMotionTracks(emptyMotionTracks());
     setLockedMotionFrames(emptyLockedMotionFrames());
-  }, [publishMotionSeconds, stopAllMotionPlayback]);
+    setSelectedMotionPaths(emptySelectedMotionPaths());
+  }, [motionRuntime, publishMotionSeconds, stopAllMotionPlayback]);
+
+  const resetMotionTrack = useCallback((kind: MmdMotionTrackKind) => {
+    const runtime = motionRuntime[kind];
+    runtime.info = null;
+    runtime.playing = false;
+    runtime.playbackStore.set(false);
+    publishMotionSeconds(kind, 0);
+    setMotionTracks((current) => ({ ...current, [kind]: null }));
+    setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
+    setSelectedMotionPaths((current) => ({ ...current, [kind]: "" }));
+  }, [motionRuntime, publishMotionSeconds]);
 
   const installMotionTrack = useCallback((
     kind: MmdMotionTrackKind,
     info: MmdMotionTrackInfo,
+    path: string,
   ) => {
     const runtime = motionRuntime[kind];
     runtime.info = info;
@@ -643,6 +717,7 @@ export default function App() {
     publishMotionSeconds(kind, 0);
     setMotionTracks((current) => ({ ...current, [kind]: info }));
     setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
+    setSelectedMotionPaths((current) => ({ ...current, [kind]: path }));
   }, [motionRuntime, publishMotionSeconds]);
 
   const advanceMotionPreview = useCallback((now: number) => {
@@ -650,6 +725,7 @@ export default function App() {
     if (!model || !MOTION_TRACK_KINDS.some((kind) => motionRuntime[kind].info)) return null;
 
     let evaluated = false;
+    let settlePhysics = false;
     MOTION_TRACK_KINDS.forEach((kind) => {
       const runtime = motionRuntime[kind];
       const motion = runtime.info;
@@ -659,6 +735,7 @@ export default function App() {
         runtime.pendingSeconds = null;
         runtime.renderedUiSeconds = runtime.seconds;
         evaluated = true;
+        settlePhysics = true;
         return;
       }
       if (!runtime.playing || motion.durationSeconds <= 0) return;
@@ -673,8 +750,10 @@ export default function App() {
       evaluated = true;
     });
     if (!evaluated) return null;
-    model.updatePreviewPose(currentMotionTimes());
-    return currentMotionTimes();
+    const times = currentMotionTimes();
+    if (settlePhysics && model.physicsEnabled()) model.updatePose(times);
+    else model.updatePreviewPose(times);
+    return times;
   }, [currentMotionTimes, motionRuntime]);
 
   const publishRenderedMotionPreview = useCallback((
@@ -789,6 +868,7 @@ export default function App() {
 
     try {
       setStageKey("app.stage.capturePose");
+      if (model.physicsEnabled()) model.updatePose(currentMotionTimes());
       const includeTextures = mode === "solid";
       const { createMmdMeshSnapshot, releaseMmdMeshSnapshot } = await import("./core/mmdSnapshot");
       const snapshot = await createMmdMeshSnapshot(model, {
@@ -825,13 +905,68 @@ export default function App() {
       setPreviewMode("source");
       setToast(t("toast.generationFailed", { reason: localizeError(error) }));
     }
-  }, [clearProjectionArtifacts, localizeError, t]);
+  }, [clearProjectionArtifacts, currentMotionTimes, localizeError, t]);
 
   useEffect(() => {
     if (!toast) return;
     const timeout = window.setTimeout(() => setToast(null), 2800);
     return () => window.clearTimeout(timeout);
   }, [toast]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth));
+    } catch {
+      // Width persistence is optional when storage is unavailable.
+    }
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth <= 720) return;
+      setSidebarWidth((current) => clampSidebarWidth(current));
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => () => sidebarResizeCleanupRef.current?.(), []);
+
+  const beginSidebarResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || window.innerWidth <= 720) return;
+    event.preventDefault();
+    sidebarResizeCleanupRef.current?.();
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onPointerMove = (pointerEvent: PointerEvent) => {
+      setSidebarWidth(clampSidebarWidth(startWidth + pointerEvent.clientX - startX));
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", cleanup);
+      window.removeEventListener("pointercancel", cleanup);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      if (sidebarResizeCleanupRef.current === cleanup) sidebarResizeCleanupRef.current = null;
+    };
+    sidebarResizeCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", cleanup);
+    window.addEventListener("pointercancel", cleanup);
+  }, [sidebarWidth]);
+
+  const resetSidebarWidth = useCallback(() => {
+    setSidebarWidth(clampSidebarWidth(DEFAULT_SIDEBAR_WIDTH));
+  }, []);
+
+  const stepSidebarWidth = useCallback((delta: number) => {
+    setSidebarWidth((current) => clampSidebarWidth(current + delta));
+  }, []);
 
   const updateOptions = (patch: Partial<HologramOptions>) => {
     const normalizedPatch = patch.targetHeight === undefined
@@ -882,6 +1017,56 @@ export default function App() {
     setGenerationMode(mode);
   };
 
+  const releaseCurrentModel = useCallback(async () => {
+    const previousModel = modelRef.current;
+    modelRef.current = null;
+    setMmdModel(null);
+    setSelectedModelPath("");
+    setMotionCandidates(emptyMotionCandidateTracks());
+    resetMotionTracks();
+    setPhysicsEnabled(false);
+    setPhysicsLoading(false);
+    setPoseEditing(false);
+    setSelectedBoneIndex(null);
+    setPoseState(emptyPoseState);
+
+    if (!previousModel) {
+      await modelReleaseRef.current;
+      return;
+    }
+
+    const release = (async () => {
+      await yieldForModelRelease();
+      previousModel.dispose();
+      await yieldForModelRelease();
+    })();
+    modelReleaseRef.current = release;
+    try {
+      await release;
+    } finally {
+      if (modelReleaseRef.current === release) modelReleaseRef.current = Promise.resolve();
+    }
+  }, [resetMotionTracks]);
+
+  const clearCurrentModel = async () => {
+    if (modelLoading) return;
+    const requestId = crypto.randomUUID();
+    modelLoadRequestRef.current = requestId;
+    invalidateProjection(`model-clear:${requestId}`);
+    setPoseEditing(false);
+    setModelLoading(true);
+    setModelLoadStageKey("app.stage.clearModel");
+    try {
+      await releaseCurrentModel();
+      if (modelLoadRequestRef.current === requestId) setToast(t("toast.modelCleared"));
+    } finally {
+      if (modelLoadRequestRef.current === requestId) {
+        setModelLoading(false);
+        setModelLoadStageKey("app.stage.modelComplete");
+      }
+    }
+  };
+
   const loadModelFromPackage = useCallback(async (
     packageFiles: File[],
     modelFile: File,
@@ -889,28 +1074,7 @@ export default function App() {
     requestId: string,
   ) => {
     setModelLoadStageKey("app.stage.parseModel");
-    const previousModel = modelRef.current;
-    if (previousModel) {
-      modelRef.current = null;
-      setMmdModel(null);
-      resetMotionTracks();
-      setPoseEditing(false);
-      setSelectedBoneIndex(null);
-      setPoseState(emptyPoseState);
-      const release = (async () => {
-        await yieldForModelRelease();
-        previousModel.dispose();
-        await yieldForModelRelease();
-      })();
-      modelReleaseRef.current = release;
-      try {
-        await release;
-      } finally {
-        if (modelReleaseRef.current === release) modelReleaseRef.current = Promise.resolve();
-      }
-    } else {
-      await modelReleaseRef.current;
-    }
+    await releaseCurrentModel();
     if (modelLoadRequestRef.current !== requestId) return;
 
     const { loadMmdModel } = await import("./core/mmdModel");
@@ -923,7 +1087,6 @@ export default function App() {
     modelRef.current = loaded;
     setMmdModel(loaded);
     setSelectedModelPath(modelPath);
-    resetMotionTracks();
     setPoseEditing(false);
     setSelectedBoneIndex(chooseDefaultBone(loaded.bones));
     setPoseState(loaded.poseState());
@@ -942,14 +1105,20 @@ export default function App() {
     setPoseRevision((value) => value + 1);
 
     const loadedTracks: Partial<Record<MmdMotionTrackKind, MmdMotionTrackInfo>> = {};
-    const { chooseMmdMotionTracks } = await import("./core/mmdAssets");
-    const motionFiles = await chooseMmdMotionTracks(packageFiles, loaded);
-    if (motionFiles.dance || motionFiles.expression) {
+    const {
+      groupMmdMotionTrackCandidates,
+      inspectMmdMotionCandidates,
+    } = await import("./core/mmdAssets");
+    const compatibleMotions = groupMmdMotionTrackCandidates(
+      await inspectMmdMotionCandidates(packageFiles, loaded),
+    );
+    setMotionCandidates(compatibleMotions);
+    if (compatibleMotions.dance.length || compatibleMotions.expression.length) {
       setModelLoadStageKey("app.stage.parseMotion");
       for (const kind of MOTION_TRACK_KINDS) {
-        const motionFile = motionFiles[kind];
-        if (!motionFile) continue;
-        loadedTracks[kind] = await loaded.loadMotion(motionFile, kind);
+        const candidate = compatibleMotions[kind][0];
+        if (!candidate) continue;
+        loadedTracks[kind] = await loaded.loadMotion(candidate.file, kind);
         if (modelLoadRequestRef.current !== requestId) {
           if (modelRef.current === loaded) modelRef.current = null;
           loaded.dispose();
@@ -958,7 +1127,8 @@ export default function App() {
       }
       MOTION_TRACK_KINDS.forEach((kind) => {
         const info = loadedTracks[kind];
-        if (info) installMotionTrack(kind, info);
+        const candidate = compatibleMotions[kind][0];
+        if (info && candidate) installMotionTrack(kind, info, candidate.path);
       });
       loaded.updatePose({ dance: 0, expression: 0 });
       setPoseRevision((value) => value + 1);
@@ -972,7 +1142,7 @@ export default function App() {
       motion: loadedMotion ? t("toast.modelLoadedMotion", { frames: number(loadedMotion.maxFrame) }) : "",
       warnings: warnings ? t("toast.modelLoadedWarnings", { count: number(warnings) }) : "",
     }));
-  }, [clearProjectionArtifacts, installMotionTrack, number, resetMotionTracks, t]);
+  }, [clearProjectionArtifacts, installMotionTrack, number, releaseCurrentModel, t]);
 
   const addAssets = async (files: File[]) => {
     const requestId = crypto.randomUUID();
@@ -984,9 +1154,10 @@ export default function App() {
 
     try {
       const {
-        chooseMmdMotionTracks,
         choosePrimaryMmdModel,
         expandMmdAssets,
+        groupMmdMotionTrackCandidates,
+        inspectMmdMotionCandidates,
         inspectMmdModels,
         normalizeAssetPath,
       } = await import("./core/mmdAssets");
@@ -1003,16 +1174,29 @@ export default function App() {
       if (!modelFile) {
         if (modelLoadRequestRef.current === requestId) {
           const currentModel = modelRef.current;
-          const motionFiles = await chooseMmdMotionTracks(expanded, currentModel ?? undefined);
-          if ((motionFiles.dance || motionFiles.expression) && currentModel) {
+          const combinedFiles = [...expandedAssetsRef.current, ...expanded];
+          const compatibleMotions = currentModel
+            ? groupMmdMotionTrackCandidates(
+                await inspectMmdMotionCandidates(combinedFiles, currentModel),
+              )
+            : emptyMotionCandidateTracks();
+          if (currentModel) setMotionCandidates(compatibleMotions);
+          const importedPaths = new Set(expanded.map((file) => normalizeAssetPath(
+            file.webkitRelativePath || file.name,
+          )));
+          const selectedCandidates = Object.fromEntries(MOTION_TRACK_KINDS.map((kind) => [
+            kind,
+            compatibleMotions[kind].find((candidate) => importedPaths.has(candidate.path)),
+          ])) as Partial<Record<MmdMotionTrackKind, MmdMotionCandidateTracks[MmdMotionTrackKind][number]>>;
+          if ((selectedCandidates.dance || selectedCandidates.expression) && currentModel) {
             setModelLoadStageKey("app.stage.parseMotion");
             const loadedTracks: MmdMotionTrackInfo[] = [];
             for (const kind of MOTION_TRACK_KINDS) {
-              const motionFile = motionFiles[kind];
-              if (!motionFile) continue;
-              const loadedMotion = await currentModel.loadMotion(motionFile, kind);
+              const candidate = selectedCandidates[kind];
+              if (!candidate) continue;
+              const loadedMotion = await currentModel.loadMotion(candidate.file, kind);
               if (modelLoadRequestRef.current !== requestId) return;
-              installMotionTrack(kind, loadedMotion);
+              installMotionTrack(kind, loadedMotion, candidate.path);
               loadedTracks.push(loadedMotion);
             }
             currentModel.updatePose(currentMotionTimes());
@@ -1020,7 +1204,7 @@ export default function App() {
             invalidatePoseProjection();
             setPoseRevision((value) => value + 1);
             setAssets((current) => [...current, ...nextAssets]);
-            expandedAssetsRef.current = [...expandedAssetsRef.current, ...expanded];
+            expandedAssetsRef.current = combinedFiles;
             setPreviewMode("source");
             setToast(t("toast.motionLoaded", {
               name: loadedTracks.map((track) => track.name).join(" + "),
@@ -1029,6 +1213,7 @@ export default function App() {
             return;
           }
           setAssets((current) => [...current, ...nextAssets]);
+          expandedAssetsRef.current = combinedFiles;
           setToast(t("toast.assetsWithoutModel", { count: number(expanded.length) }));
         }
         return;
@@ -1076,7 +1261,11 @@ export default function App() {
   }, []);
 
   const selectModelFromPackage = async (path: string) => {
-    if (!path || path === selectedModelPath || modelLoading) return;
+    if (modelLoading || path === selectedModelPath) return;
+    if (!path) {
+      await clearCurrentModel();
+      return;
+    }
     const requestId = crypto.randomUUID();
     modelLoadRequestRef.current = requestId;
     invalidateProjection(`model-switch:${requestId}`);
@@ -1105,6 +1294,130 @@ export default function App() {
         setModelLoadStageKey("app.stage.modelComplete");
       }
     }
+  };
+
+  const selectMotionFromPackage = async (kind: MmdMotionTrackKind, path: string) => {
+    const model = modelRef.current;
+    if (!model || modelLoading || processing || path === selectedMotionPaths[kind]) return;
+
+    if (!path) {
+      model.clearMotion(kind);
+      resetMotionTrack(kind);
+      model.updatePose(currentMotionTimes());
+      setPoseEditing(false);
+      setPoseState(model.poseState());
+      invalidateProjection(`motion-clear:${kind}`);
+      setPoseRevision((value) => value + 1);
+      setPreviewMode("source");
+      setToast(t("toast.motionCleared", {
+        track: t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack"),
+      }));
+      return;
+    }
+
+    const candidate = motionCandidates[kind].find((entry) => entry.path === path);
+    if (!candidate) return;
+    const requestId = crypto.randomUUID();
+    modelLoadRequestRef.current = requestId;
+    invalidateProjection(`motion-switch:${kind}:${requestId}`);
+    setPoseEditing(false);
+    setModelLoading(true);
+    setModelLoadStageKey("app.stage.parseMotion");
+
+    try {
+      const loadedMotion = await model.loadMotion(candidate.file, kind);
+      if (modelLoadRequestRef.current !== requestId || modelRef.current !== model) return;
+      installMotionTrack(kind, loadedMotion, candidate.path);
+      model.updatePose(currentMotionTimes());
+      setPoseState(model.poseState());
+      setPoseRevision((value) => value + 1);
+      setPreviewMode("source");
+      setToast(t("toast.motionLoaded", {
+        name: loadedMotion.name,
+        frames: number(loadedMotion.maxFrame),
+      }));
+    } catch (error) {
+      if (modelLoadRequestRef.current === requestId && modelRef.current === model) {
+        setToast(t("toast.motionSwitchFailed", { reason: localizeError(error) }));
+      }
+    } finally {
+      if (modelLoadRequestRef.current === requestId) {
+        setModelLoading(false);
+        setModelLoadStageKey("app.stage.modelComplete");
+      }
+    }
+  };
+
+  const changePhysicsEnabled = async (enabled: boolean) => {
+    const model = modelRef.current;
+    if (!model || !model.physicsAvailable || physicsLoading || modelLoading || processing) return;
+    setPhysicsLoading(true);
+    stopAllMotionPlayback();
+    try {
+      await model.setPhysicsEnabled(enabled);
+      if (modelRef.current !== model) return;
+      model.updatePose(currentMotionTimes());
+      setPhysicsEnabled(model.physicsEnabled());
+      invalidateProjection("physics");
+      setPoseRevision((value) => value + 1);
+      setPreviewMode("source");
+      setToast(t(enabled ? "toast.physicsEnabled" : "toast.physicsDisabled"));
+    } catch (error) {
+      if (modelRef.current === model) {
+        setPhysicsEnabled(model.physicsEnabled());
+        setToast(t("toast.physicsFailed", { reason: localizeError(error) }));
+      }
+    } finally {
+      if (modelRef.current === model) setPhysicsLoading(false);
+    }
+  };
+
+  const openClearResources = () => {
+    setClearResourceSelection(emptyClearResourceSelection());
+    setClearResourcesOpen(true);
+  };
+
+  const closeClearResources = () => {
+    setClearResourcesOpen(false);
+    setClearResourceSelection(emptyClearResourceSelection());
+  };
+
+  const toggleClearResource = (kind: ClearResourceKind, checked: boolean) => {
+    setClearResourceSelection((current) => {
+      if (kind === "model") {
+        return checked
+          ? { model: true, dance: true, expression: true }
+          : { ...current, model: false };
+      }
+      if (current.model) return current;
+      return { ...current, [kind]: checked };
+    });
+  };
+
+  const confirmClearResources = async () => {
+    const selection = clearResourceSelection;
+    if (!selection.model && !selection.dance && !selection.expression) return;
+    closeClearResources();
+    if (selection.model) {
+      await clearCurrentModel();
+      return;
+    }
+
+    const model = modelRef.current;
+    if (!model) return;
+    const kinds = MOTION_TRACK_KINDS.filter((kind) => selection[kind] && motionRuntime[kind].info);
+    if (!kinds.length) return;
+    stopAllMotionPlayback();
+    if (kinds.length === MOTION_TRACK_KINDS.length) model.clearMotion();
+    else model.clearMotion(kinds[0]);
+    kinds.forEach(resetMotionTrack);
+    model.updatePose(currentMotionTimes());
+    setPoseEditing(false);
+    setPoseState(model.poseState());
+    invalidateProjection("resource-clear");
+    setPoseRevision((value) => value + 1);
+    setPreviewMode("source");
+    setToast(t("toast.resourcesCleared"));
   };
 
   const setMotionPlayingState = (kind: MmdMotionTrackKind, playing: boolean) => {
@@ -1351,10 +1664,6 @@ export default function App() {
 
       model.clearMotion();
       resetMotionTracks();
-      expandedAssetsRef.current = expandedAssetsRef.current.filter((asset) => (
-        !asset.name.toLowerCase().endsWith(".vmd")
-      ));
-      setAssets((current) => current.filter((asset) => asset.type !== "motion"));
 
       const applied = model.importMelyPose(document);
       setPoseEditing(false);
@@ -1847,8 +2156,6 @@ export default function App() {
             previewMode={previewMode}
             stats={stats}
             modelStats={mmdModel?.stats ?? null}
-            modelCandidates={modelCandidates}
-            selectedModelPath={selectedModelPath}
             motionTracks={motionTracks}
             lockedMotionFrames={lockedMotionFrames}
             bones={mmdModel?.bones ?? []}
@@ -1869,12 +2176,19 @@ export default function App() {
             progress={progress}
             stage={t(stageKey)}
             progressDetail={exporting ? exportCurrentFile : ""}
+            sidebarWidth={sidebarWidth}
+            physicsAvailable={mmdModel?.physicsAvailable ?? false}
+            physicsEnabled={physicsEnabled}
+            physicsLoading={physicsLoading}
             onOptionsChange={updateOptions}
             onSolidOptionsChange={updateSolidOptions}
             onGenerationModeChange={changeGenerationMode}
             onPreviewModeChange={changePreviewMode}
             onAssetsAdded={addAssets}
-            onModelSelected={selectModelFromPackage}
+            onPhysicsEnabledChange={changePhysicsEnabled}
+            onSidebarResizeStart={beginSidebarResize}
+            onSidebarResizeStep={stepSidebarWidth}
+            onSidebarResizeReset={resetSidebarWidth}
             onPoseEditingChange={setPoseEditingState}
             onBoneSelected={selectBone}
             onPoseNudge={nudgeSelectedBone}
@@ -1930,6 +2244,16 @@ export default function App() {
 
             <div className="viewport-toolbar viewport-toolbar--right">
               <div className="toolbar-group">
+                <IconButton
+                  ref={clearResourcesTriggerRef}
+                  label={t("toolbar.clearResources")}
+                  className="icon-button--destructive"
+                  aria-haspopup="dialog"
+                  disabled={!mmdModel || modelLoading || processing || exporting}
+                  onClick={openClearResources}
+                >
+                  <Trash2 size={17} />
+                </IconButton>
                 <IconButton label={t("toolbar.resetCamera")} onClick={() => setResetToken((value) => value + 1)}><Focus size={18} /></IconButton>
                 <IconButton
                   label={t("toolbar.focusFace")}
@@ -2051,6 +2375,67 @@ export default function App() {
           restoreFocusTo={survivalToolsTriggerRef.current}
         />
       ) : null}
+
+      <Windows
+        open={clearResourcesOpen}
+        title={t("clearResources.title")}
+        closeLabel={t("common.close")}
+        onClose={closeClearResources}
+        restoreFocusTo={clearResourcesTriggerRef.current}
+        actions={[
+          {
+            label: t("common.cancel"),
+            onClick: closeClearResources,
+          },
+          {
+            label: t("clearResources.confirm"),
+            emphasis: "destructive",
+            disabled: !Object.values(clearResourceSelection).some(Boolean),
+            onClick: () => void confirmClearResources(),
+          },
+        ]}
+      >
+        <p>{t("clearResources.body")}</p>
+        <fieldset className="clear-resource-options">
+          <legend>{t("clearResources.options")}</legend>
+          <label className="clear-resource-option">
+            <input
+              type="checkbox"
+              checked={clearResourceSelection.dance}
+              disabled={clearResourceSelection.model || !motionTracks.dance}
+              onChange={(event) => toggleClearResource("dance", event.currentTarget.checked)}
+            />
+            <span>
+              <strong>{t("clearResources.motion")}</strong>
+              <small>{t("clearResources.motionHint")}</small>
+            </span>
+          </label>
+          <label className="clear-resource-option">
+            <input
+              type="checkbox"
+              checked={clearResourceSelection.expression}
+              disabled={clearResourceSelection.model || !motionTracks.expression}
+              onChange={(event) => toggleClearResource("expression", event.currentTarget.checked)}
+            />
+            <span>
+              <strong>{t("clearResources.expression")}</strong>
+              <small>{t("clearResources.expressionHint")}</small>
+            </span>
+          </label>
+          <label className="clear-resource-option clear-resource-option--model">
+            <input
+              type="checkbox"
+              checked={clearResourceSelection.model}
+              disabled={!mmdModel}
+              onChange={(event) => toggleClearResource("model", event.currentTarget.checked)}
+            />
+            <span>
+              <strong>{t("clearResources.model")}</strong>
+              <small>{t("clearResources.modelHint")}</small>
+            </span>
+          </label>
+        </fieldset>
+      </Windows>
 
       <Windows
         open={heightUnlockOpen}

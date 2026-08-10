@@ -25,9 +25,11 @@ import { createMmdPoseController, type MmdPoseController } from "./mmdPose";
 import {
   evaluateMmdPreviewFrame,
   inspectMmdPreviewRuntime,
+  settleMmdPreviewFrame,
   syncMmdSkeletonForCpuRead,
   type PreviewRuntimeDiagnostics,
 } from "./mmdPreviewRuntime";
+import { createSwitchableMmdPhysicsBackend } from "./mmdPhysics";
 
 export interface LoadedMmdModel {
   id: string;
@@ -40,6 +42,9 @@ export interface LoadedMmdModel {
   bones: readonly MmdBoneInfo[];
   materials: readonly MmdMaterialInfo[];
   translationStep: number;
+  physicsAvailable: boolean;
+  physicsEnabled: () => boolean;
+  setPhysicsEnabled: (enabled: boolean) => Promise<void>;
   loadMotion: (file: File, kind: MmdMotionTrackKind) => Promise<MmdMotionTrackInfo>;
   updatePreviewPose: (times: MmdMotionTimes) => MmdMotionTimes;
   updatePose: (times: MmdMotionTimes) => MmdMotionTimes;
@@ -322,11 +327,12 @@ const sampleExpressionTrack = (
 const combinedMotionAnimation = (
   dance: MmdAnimation | null,
   expression: ExpressionTrackState | null,
+  importedPose: MmdAnimation | null,
 ): MmdAnimation | null => {
-  const source = dance ?? expression?.animation;
+  const source = dance ?? expression?.animation ?? importedPose;
   if (!source) return null;
-  const boneTracks = dance?.boneTracks ?? {};
-  const morphTracks = expression?.morphTracks ?? {};
+  const boneTracks = dance?.boneTracks ?? importedPose?.boneTracks ?? {};
+  const morphTracks = expression?.morphTracks ?? importedPose?.morphTracks ?? {};
   return {
     ...source,
     bytes: new Uint8Array(),
@@ -350,6 +356,29 @@ const combinedMotionAnimation = (
     propertyFrames: dance?.propertyFrames ?? [],
   };
 };
+
+const createEmptyRuntimeAnimation = (modelName: string): MmdAnimation => ({
+  kind: "vmd",
+  bytes: new Uint8Array(),
+  metadata: {
+    modelName,
+    counts: {
+      bones: 0,
+      morphs: 0,
+      cameras: 0,
+      lights: 0,
+      selfShadows: 0,
+      properties: 0,
+    },
+    maxFrame: 0,
+  },
+  boneTracks: {},
+  morphTracks: {},
+  cameraFrames: [],
+  lightFrames: [],
+  selfShadowFrames: [],
+  propertyFrames: [],
+});
 
 const SKIN_KEYWORDS = [
   "皮肤",
@@ -572,7 +601,10 @@ export const loadMmdModel = async (
   const loader = new ThreeMmdLoader({
     textureMap: createMmdTextureMapFromFiles(files, modelFile),
     geometryAwareAlpha: true,
-    runtime: { physics: "none" },
+    runtime: {
+      physics: "external",
+      physicsBackend: createSwitchableMmdPhysicsBackend(),
+    },
   });
   let model: ThreeMmdModel;
   try {
@@ -589,6 +621,8 @@ export const loadMmdModel = async (
     format?: "pmx" | "pmd";
     name?: string;
     englishName?: string;
+    rigidBodyCount?: number;
+    jointCount?: number;
   } | undefined;
   const morphs = model.mesh.userData.mmdMorphs;
   const textureWarnings = model.diagnostics.textures.map((diagnostic) =>
@@ -604,6 +638,16 @@ export const loadMmdModel = async (
   };
   let danceAnimation: MmdAnimation | null = null;
   let expressionTrack: ExpressionTrackState | null = null;
+  let importedPoseAnimation: MmdAnimation | null = null;
+  const physics = (loader.options.runtime?.physicsBackend ?? null) as ReturnType<
+    typeof createSwitchableMmdPhysicsBackend
+  > | null;
+  const physicsAvailable = (metadata?.rigidBodyCount ?? 0) > 0;
+  const emptyRuntimeAnimation = createEmptyRuntimeAnimation(
+    metadata?.englishName || metadata?.name || modelFile.name,
+  );
+  model.setAnimation(emptyRuntimeAnimation);
+  evaluateMmdPreviewFrame(model, 0);
 
   const currentModel = () => {
     if (!activeModel) throw new Error("MMD model has been disposed");
@@ -612,6 +656,16 @@ export const loadMmdModel = async (
   const currentPose = () => {
     if (!pose) throw new Error("MMD model has been disposed");
     return pose;
+  };
+  const installCurrentAnimation = (target: ThreeMmdModel) => {
+    const animation = combinedMotionAnimation(
+      danceAnimation,
+      expressionTrack,
+      importedPoseAnimation,
+    );
+    target.runtime.resetPose();
+    target.setAnimation(animation ?? emptyRuntimeAnimation);
+    return evaluateMmdPreviewFrame(target, 0);
   };
 
   return {
@@ -622,6 +676,16 @@ export const loadMmdModel = async (
     bones,
     materials: collectMaterialInfo(model.mesh),
     translationStep,
+    physicsAvailable,
+    physicsEnabled: () => Boolean(physicsAvailable && physics?.enabled),
+    setPhysicsEnabled: async (enabled) => {
+      if (!physics || !physicsAvailable) return;
+      try {
+        await physics.setEnabled(enabled);
+      } catch (error) {
+        throw appError("error.physics.loadFailed", undefined, error);
+      }
+    },
     textureWarnings,
     stats: {
       name: metadata?.englishName || metadata?.name || modelFile.name.replace(/\.[^.]+$/, ""),
@@ -631,6 +695,8 @@ export const loadMmdModel = async (
       materialCount: materialCount(model.mesh),
       boneCount: model.mesh.skeleton.bones.length,
       morphCount: Array.isArray(morphs) ? morphs.length : Object.keys(model.mesh.morphTargetDictionary ?? {}).length,
+      rigidBodyCount: metadata?.rigidBodyCount ?? 0,
+      jointCount: metadata?.jointCount ?? 0,
       textureWarnings: textureWarnings.length,
     },
     previewRuntime: inspectMmdPreviewRuntime(model.root),
@@ -684,11 +750,8 @@ export const loadMmdModel = async (
           morphTracks: Object.fromEntries(bindings.map(({ name, sampled }) => [name, sampled])),
         };
       }
-      const combined = combinedMotionAnimation(danceAnimation, expressionTrack);
-      if (!combined) throw new Error("MMD motion binding was unexpectedly empty");
       sampleExpressionTrack(expressionTrack, 0);
-      target.setAnimation(combined);
-      const frameState = evaluateMmdPreviewFrame(target, 0);
+      const frameState = installCurrentAnimation(target);
       syncMmdSkeletonForCpuRead(target);
       currentPose().syncAfterRuntimeUpdate();
       const maxFrame = kind === "dance"
@@ -718,7 +781,7 @@ export const loadMmdModel = async (
         ? Math.max(0, Math.min(expressionDuration, times.expression))
         : 0;
       sampleExpressionTrack(expressionTrack, expression * (motionInfo.expression?.frameRate ?? 30));
-      evaluateMmdPreviewFrame(target, dance);
+      evaluateMmdPreviewFrame(target, dance, Boolean(physics?.enabled));
       currentPose().syncAfterRuntimePreview();
       return { dance, expression };
     },
@@ -731,7 +794,8 @@ export const loadMmdModel = async (
         ? Math.max(0, Math.min(expressionDuration, times.expression))
         : 0;
       sampleExpressionTrack(expressionTrack, expression * (motionInfo.expression?.frameRate ?? 30));
-      evaluateMmdPreviewFrame(target, dance);
+      if (physics?.enabled) settleMmdPreviewFrame(target, dance, physics);
+      else evaluateMmdPreviewFrame(target, dance);
       currentPose().syncAfterRuntimeUpdate();
       syncMmdSkeletonForCpuRead(target);
       return { dance, expression };
@@ -746,15 +810,7 @@ export const loadMmdModel = async (
         motionInfo.expression = null;
         expressionTrack = null;
       }
-      const combined = combinedMotionAnimation(danceAnimation, expressionTrack);
-      if (combined) {
-        target.setAnimation(combined);
-        evaluateMmdPreviewFrame(target, 0);
-      } else {
-        target.runtime.clearAnimation();
-        target.runtime.resetPose();
-        evaluateMmdPreviewFrame(target, 0);
-      }
+      installCurrentAnimation(target);
       syncMmdSkeletonForCpuRead(target);
       currentPose().syncAfterRuntimeUpdate();
     },
@@ -767,7 +823,15 @@ export const loadMmdModel = async (
     redoPose: () => currentPose().redo(),
     resetPoseEdits: (recordHistory) => currentPose().reset(recordHistory),
     exportMelyPose: () => currentPose().exportMelyPose(),
-    importMelyPose: (document) => currentPose().importMelyPose(document),
+    importMelyPose: (document) => {
+      const target = currentModel();
+      const applied = currentPose().importMelyPose(document);
+      importedPoseAnimation = currentPose().importedPoseAnimation();
+      installCurrentAnimation(target);
+      currentPose().syncAfterRuntimeUpdate();
+      syncMmdSkeletonForCpuRead(target);
+      return applied;
+    },
     poseState: () => currentPose().state(),
     dispose: () => {
       if (!activeModel) return;
@@ -777,7 +841,9 @@ export const loadMmdModel = async (
       motionInfo.expression = null;
       danceAnimation = null;
       expressionTrack = null;
+      importedPoseAnimation = null;
       pose = null;
+      physics?.dispose?.();
       disposeMmdModelResources(disposedModel, disposeMmdModel);
     },
   };

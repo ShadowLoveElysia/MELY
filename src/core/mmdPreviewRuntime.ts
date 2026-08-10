@@ -1,4 +1,5 @@
 import type { ThreeMmdModel } from "@yohawing/three-mmd-loader";
+import type { SwitchableMmdPhysicsBackend } from "./mmdPhysics";
 import type { MmdFrameState } from "@yohawing/three-mmd-loader/runtime";
 import type { Object3D, Skeleton } from "three";
 
@@ -41,11 +42,35 @@ const disableUnusedDebugCapture = (runtime: RuntimeWithOptionalDebugCapture) => 
 export const evaluateMmdPreviewFrame = (
   model: ThreeMmdModel,
   seconds: number,
+  physics = false,
 ): MmdFrameState => {
   disableUnusedDebugCapture(model.runtime as RuntimeWithOptionalDebugCapture);
   // Vertex deformation remains GPU-side; this only synchronizes the current
   // bone matrices and morph state for the visible SkinnedMesh hierarchy.
-  return model.update(seconds, { physics: false, ik: true });
+  return model.update(seconds, { physics, ik: true });
+};
+
+const PHYSICS_SETTLE_SECONDS = 1;
+const PHYSICS_FIXED_STEP = 1 / 60;
+
+export const settleMmdPreviewFrame = (
+  model: ThreeMmdModel,
+  seconds: number,
+  physics: Pick<SwitchableMmdPhysicsBackend, "setFixedStepOverride">,
+): MmdFrameState => {
+  const targetSeconds = Math.max(0, seconds);
+  evaluateMmdPreviewFrame(model, targetSeconds, false);
+  physics.setFixedStepOverride(PHYSICS_FIXED_STEP);
+  try {
+    let state = evaluateMmdPreviewFrame(model, targetSeconds, true);
+    const stepCount = Math.ceil(PHYSICS_SETTLE_SECONDS / PHYSICS_FIXED_STEP);
+    for (let index = 0; index < stepCount; index += 1) {
+      state = evaluateMmdPreviewFrame(model, targetSeconds, true);
+    }
+    return state;
+  } finally {
+    physics.setFixedStepOverride(null);
+  }
 };
 
 export const syncMmdSkeletonForCpuRead = (model: ThreeMmdModel) => {

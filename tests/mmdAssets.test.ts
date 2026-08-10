@@ -4,6 +4,7 @@ import { zipSync, strToU8 } from "fflate";
 import { AppError } from "../src/core/appError";
 import {
   expandMmdAssets,
+  groupMmdMotionTrackCandidates,
   selectMmdMotionTrackCandidates,
 } from "../src/core/mmdAssets";
 
@@ -73,4 +74,32 @@ test("multi-VMD packages select compatible dance and expression tracks independe
   assert.equal(selected.dance?.matchedBoneTrackCount, 57);
   assert.equal(selected.expression?.file, facial);
   assert.equal(selected.expression?.matchedMorphTrackCount, 27);
+});
+
+test("a mixed VMD remains available in both motion selectors", () => {
+  const mixed = new File([Uint8Array.of(1)], "mixed.vmd");
+  const danceOnly = new File([Uint8Array.of(2)], "dance.vmd");
+  const candidates = groupMmdMotionTrackCandidates([
+    {
+      file: mixed,
+      path: "motions/mixed.vmd",
+      boneTrackCount: 12,
+      morphTrackCount: 8,
+      matchedBoneTrackCount: 10,
+      matchedMorphTrackCount: 7,
+      maxFrame: 240,
+    },
+    {
+      file: danceOnly,
+      path: "motions/dance.vmd",
+      boneTrackCount: 18,
+      morphTrackCount: 0,
+      matchedBoneTrackCount: 18,
+      matchedMorphTrackCount: 0,
+      maxFrame: 180,
+    },
+  ]);
+
+  assert.deepEqual(candidates.dance.map((candidate) => candidate.file), [danceOnly, mixed]);
+  assert.deepEqual(candidates.expression.map((candidate) => candidate.file), [mixed]);
 });

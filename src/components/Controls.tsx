@@ -87,9 +87,10 @@ interface ToggleProps {
   checked: boolean;
   onChange: (value: boolean) => void;
   label: string;
+  disabled?: boolean;
 }
 
-export function Toggle({ checked, onChange, label }: ToggleProps) {
+export function Toggle({ checked, onChange, label, disabled = false }: ToggleProps) {
   return (
     <button
       type="button"
@@ -98,6 +99,7 @@ export function Toggle({ checked, onChange, label }: ToggleProps) {
       aria-label={label}
       title={label}
       className={`toggle ${checked ? "toggle--checked" : ""}`}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
     >
       <span>{checked ? <Check size={11} strokeWidth={3} /> : null}</span>
