@@ -1,7 +1,10 @@
 import {
   BufferGeometry,
+  Box3,
+  Matrix4,
   Skeleton,
   Texture,
+  Vector3,
   type Color,
   type Group,
   type Material,
@@ -9,6 +12,7 @@ import {
 } from "three";
 import type { ThreeMmdModel } from "@yohawing/three-mmd-loader";
 import type { MmdAnimation, VmdMorphTrack } from "@yohawing/three-mmd-loader/parser";
+import { mmdMaterialSuppressesColorAtAlpha } from "@yohawing/three-mmd-loader/three";
 import type {
   MelyPoseApplyResult,
   MelyPoseDocument,
@@ -45,6 +49,9 @@ export interface LoadedMmdModel {
   physicsAvailable: boolean;
   physicsEnabled: () => boolean;
   setPhysicsEnabled: (enabled: boolean) => Promise<void>;
+  setMaterialVisible: (index: number, visible: boolean) => void;
+  visibleBounds: (target?: Box3) => Box3;
+  visibleTriangleCount: () => number;
   loadMotion: (file: File, kind: MmdMotionTrackKind) => Promise<MmdMotionTrackInfo>;
   updatePreviewPose: (times: MmdMotionTimes) => MmdMotionTimes;
   updatePose: (times: MmdMotionTimes) => MmdMotionTimes;
@@ -247,6 +254,81 @@ const materialCount = (mesh: SkinnedMesh) =>
 
 const materialList = (mesh: SkinnedMesh) =>
   (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) as Material[];
+
+const materialIsVisible = (material: Material | undefined) =>
+  Boolean(material?.visible && material.opacity > 0.01);
+
+const runtimeMaterialIsVisible = (material: Material) => {
+  const flags = material.userData.mmdMaterial?.flags;
+  return material.opacity > 0 || mmdMaterialSuppressesColorAtAlpha(material.opacity, flags);
+};
+
+export const computeVisibleMmdBounds = (
+  root: Group,
+  mesh: SkinnedMesh,
+  target = new Box3(),
+) => {
+  const geometry = mesh.geometry;
+  const position = geometry.getAttribute("position");
+  const sourceIndex = geometry.getIndex();
+  const materials = materialList(mesh);
+  const ranges = geometry.groups.length
+    ? geometry.groups
+    : [{ start: 0, count: sourceIndex?.count ?? position.count, materialIndex: 0 }];
+  const splitBodyByMaterial = new Map<number, SkinnedMesh>();
+  const splitBodies = mesh.userData.mmdMorphSplitBodyMeshes;
+  if (Array.isArray(splitBodies)) {
+    splitBodies.forEach((candidate) => {
+      if (!isSkinnedMesh(candidate)) return;
+      const materialIndex = candidate.userData.mmdMorphSplitBody?.materialIndex;
+      if (Number.isInteger(materialIndex)) splitBodyByMaterial.set(materialIndex, candidate);
+    });
+  }
+
+  target.makeEmpty();
+  root.updateMatrixWorld(true);
+  mesh.skeleton.update();
+  const rootWorldInverse = new Matrix4().copy(root.matrixWorld).invert();
+  const meshToRoot = new Matrix4().multiplyMatrices(rootWorldInverse, mesh.matrixWorld);
+  const point = new Vector3();
+  for (const range of ranges) {
+    const materialIndex = range.materialIndex ?? 0;
+    if (!materialIsVisible(materials[materialIndex] ?? materials[0])) continue;
+    const splitBody = splitBodyByMaterial.get(materialIndex);
+    if (splitBody) {
+      const splitToRoot = new Matrix4().multiplyMatrices(rootWorldInverse, splitBody.matrixWorld);
+      const splitPosition = splitBody.geometry.getAttribute("position");
+      for (let index = 0; index < splitPosition.count; index += 1) {
+        splitBody.getVertexPosition(index, point).applyMatrix4(splitToRoot);
+        target.expandByPoint(point);
+      }
+      continue;
+    }
+    const end = Math.min(range.start + range.count, sourceIndex?.count ?? position.count);
+    for (let offset = range.start; offset < end; offset += 1) {
+      const vertexIndex = sourceIndex ? sourceIndex.getX(offset) : offset;
+      mesh.getVertexPosition(vertexIndex, point).applyMatrix4(meshToRoot);
+      target.expandByPoint(point);
+    }
+  }
+  return target;
+};
+
+const countVisibleMmdTriangles = (mesh: SkinnedMesh) => {
+  const geometry = mesh.geometry;
+  const position = geometry.getAttribute("position");
+  const sourceIndex = geometry.getIndex();
+  const materials = materialList(mesh);
+  const ranges = geometry.groups.length
+    ? geometry.groups
+    : [{ start: 0, count: sourceIndex?.count ?? position.count, materialIndex: 0 }];
+  return ranges.reduce((count, range) => {
+    const materialIndex = range.materialIndex ?? 0;
+    if (!materialIsVisible(materials[materialIndex] ?? materials[0])) return count;
+    const end = Math.min(range.start + range.count, sourceIndex?.count ?? position.count);
+    return count + Math.max(0, Math.floor((end - range.start) / 3));
+  }, 0);
+};
 
 interface ExpressionTrackState {
   animation: MmdAnimation;
@@ -553,6 +635,13 @@ const ambientTuple = (material: Material): [number, number, number] => {
     : [0, 0, 0];
 };
 
+const MMD_TEXTURE_RESOURCE_PATTERN = /\.(?:bmp|dds|gif|jpe?g|png|spa|sph|tga|webp)$/i;
+
+export const isMmdTextureResourceLabel = (value: string) => {
+  const labels = value.split("*").map((label) => label.trim()).filter(Boolean);
+  return labels.length > 0 && labels.every((label) => MMD_TEXTURE_RESOURCE_PATTERN.test(label));
+};
+
 const collectMaterialInfo = (mesh: SkinnedMesh): MmdMaterialInfo[] =>
   materialList(mesh).map((material, index) => {
     const metadata = material.userData.mmdMaterial as {
@@ -567,6 +656,9 @@ const collectMaterialInfo = (mesh: SkinnedMesh): MmdMaterialInfo[] =>
     } | undefined;
     const name = metadata?.name || material.name || "";
     const englishName = metadata?.englishName || "";
+    const displayName = [englishName, name].find((label) => (
+      label && !isMmdTextureResourceLabel(label)
+    )) ?? "";
     const color = colorTuple(material);
     const opacity = state?.diffuse?.[3] ?? metadata?.diffuse?.[3] ?? material.opacity;
     const ambient = ambientTuple(material);
@@ -574,7 +666,7 @@ const collectMaterialInfo = (mesh: SkinnedMesh): MmdMaterialInfo[] =>
       index,
       name,
       englishName,
-      displayName: englishName || name,
+      displayName,
       color,
       opacity,
       hasTexture: "map" in material && Boolean(material.map),
@@ -639,6 +731,9 @@ export const loadMmdModel = async (
   let danceAnimation: MmdAnimation | null = null;
   let expressionTrack: ExpressionTrackState | null = null;
   let importedPoseAnimation: MmdAnimation | null = null;
+  const materials = materialList(model.mesh);
+  const materialInfo = collectMaterialInfo(model.mesh);
+  const hiddenMaterialIndices = new Set<number>();
   const physics = (loader.options.runtime?.physicsBackend ?? null) as ReturnType<
     typeof createSwitchableMmdPhysicsBackend
   > | null;
@@ -657,6 +752,11 @@ export const loadMmdModel = async (
     if (!pose) throw new Error("MMD model has been disposed");
     return pose;
   };
+  const applyMaterialVisibility = () => {
+    materials.forEach((material, index) => {
+      if (hiddenMaterialIndices.has(index)) material.visible = false;
+    });
+  };
   const installCurrentAnimation = (target: ThreeMmdModel) => {
     const animation = combinedMotionAnimation(
       danceAnimation,
@@ -665,7 +765,9 @@ export const loadMmdModel = async (
     );
     target.runtime.resetPose();
     target.setAnimation(animation ?? emptyRuntimeAnimation);
-    return evaluateMmdPreviewFrame(target, 0);
+    const frame = evaluateMmdPreviewFrame(target, 0);
+    applyMaterialVisibility();
+    return frame;
   };
 
   return {
@@ -674,7 +776,7 @@ export const loadMmdModel = async (
     root: model.root,
     mesh: model.mesh,
     bones,
-    materials: collectMaterialInfo(model.mesh),
+    materials: materialInfo,
     translationStep,
     physicsAvailable,
     physicsEnabled: () => Boolean(physicsAvailable && physics?.enabled),
@@ -685,6 +787,28 @@ export const loadMmdModel = async (
       } catch (error) {
         throw appError("error.physics.loadFailed", undefined, error);
       }
+    },
+    setMaterialVisible: (index, visible) => {
+      currentModel();
+      const material = materials[index];
+      if (!material) throw new RangeError(`MMD material index is out of range: ${index}`);
+      if (visible) {
+        if (!hiddenMaterialIndices.has(index)) return;
+        hiddenMaterialIndices.delete(index);
+        material.visible = runtimeMaterialIsVisible(material);
+      } else {
+        if (hiddenMaterialIndices.has(index)) return;
+        hiddenMaterialIndices.add(index);
+        material.visible = false;
+      }
+    },
+    visibleBounds: (target) => {
+      currentModel();
+      return computeVisibleMmdBounds(model.root, model.mesh, target);
+    },
+    visibleTriangleCount: () => {
+      currentModel();
+      return countVisibleMmdTriangles(model.mesh);
     },
     textureWarnings,
     stats: {
@@ -783,6 +907,7 @@ export const loadMmdModel = async (
       sampleExpressionTrack(expressionTrack, expression * (motionInfo.expression?.frameRate ?? 30));
       evaluateMmdPreviewFrame(target, dance, Boolean(physics?.enabled));
       currentPose().syncAfterRuntimePreview();
+      applyMaterialVisibility();
       return { dance, expression };
     },
     updatePose: (times) => {
@@ -798,6 +923,7 @@ export const loadMmdModel = async (
       else evaluateMmdPreviewFrame(target, dance);
       currentPose().syncAfterRuntimeUpdate();
       syncMmdSkeletonForCpuRead(target);
+      applyMaterialVisibility();
       return { dance, expression };
     },
     clearMotion: (kind) => {

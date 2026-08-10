@@ -21,6 +21,7 @@ interface Viewport3DProps {
   showBounds: boolean;
   resetToken: number;
   focusFaceToken: number;
+  partsRevision: number;
   poseRevision: number;
   poseEditing: boolean;
   selectedBoneIndex: number | null;
@@ -501,6 +502,7 @@ export function Viewport3D({
   showBounds,
   resetToken,
   focusFaceToken,
+  partsRevision,
   poseRevision,
   poseEditing,
   selectedBoneIndex,
@@ -792,7 +794,12 @@ export function Viewport3D({
     runtime.sourceContent.scale.setScalar(1);
     model.root.updateMatrixWorld(true);
 
-    const rawBounds = new THREE.Box3().setFromObject(model.root, false);
+    const rawBounds = model.visibleBounds();
+    if (rawBounds.isEmpty()) {
+      runtime.sourceBounds.makeEmpty();
+      refreshActiveScene(runtime, previewMode, showBounds, previewMode === "source");
+      return;
+    }
     const rawSize = rawBounds.getSize(new THREE.Vector3());
     const rawCenter = rawBounds.getCenter(new THREE.Vector3());
     const targetSpan = Math.max(1, Math.round(targetHeight) - 1);
@@ -800,9 +807,9 @@ export function Viewport3D({
     runtime.sourceContent.scale.setScalar(scale);
     runtime.sourceContent.position.set(-rawCenter.x * scale, -rawBounds.min.y * scale, -rawCenter.z * scale);
     runtime.sourceContent.updateMatrixWorld(true);
-    runtime.sourceBounds.setFromObject(runtime.sourceContent, false);
+    runtime.sourceBounds.copy(rawBounds).applyMatrix4(model.root.matrixWorld);
     refreshActiveScene(runtime, previewMode, showBounds, previewMode === "source");
-  }, [model, previewMode, showBounds, targetHeight]);
+  }, [model, partsRevision, previewMode, showBounds, targetHeight]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;
@@ -868,7 +875,9 @@ export function Viewport3D({
     const runtime = runtimeRef.current;
     if (!runtime || !model || model.root.parent !== runtime.sourceContent) return;
     runtime.sourceContent.updateMatrixWorld(true);
-    runtime.sourceBounds.setFromObject(runtime.sourceContent, false);
+    const bounds = model.visibleBounds();
+    if (bounds.isEmpty()) runtime.sourceBounds.makeEmpty();
+    else runtime.sourceBounds.copy(bounds).applyMatrix4(model.root.matrixWorld);
     refreshActiveScene(runtime, previewMode, showBounds, false);
     refreshBoneMarkers(runtime, model, selectedBoneIndex);
   }, [model, poseRevision, previewMode, selectedBoneIndex, showBounds]);

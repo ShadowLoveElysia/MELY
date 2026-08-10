@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { orderModelParts } from "../src/core/modelParts";
+import type { MmdMaterialInfo } from "../src/types";
 
 test("resource clearing is only exposed through the viewport trash dialog", () => {
   const app = readFileSync("src/App.tsx", "utf8");
@@ -50,11 +52,50 @@ test("physics is explicit, lazy, and settled before generation snapshots", () =>
   assert.match(physics, /mmd_bullet\.wasm\?url/);
 });
 
+test("model resources expose collapsible parts with hidden entries first", () => {
+  const app = readFileSync("src/App.tsx", "utf8");
+  const sidebar = readFileSync("src/components/Sidebar.tsx", "utf8");
+  const snapshot = readFileSync("src/core/mmdSnapshot.ts", "utf8");
+
+  assert.doesNotMatch(sidebar, /assets\.slice\(0, 5\)/);
+  assert.match(sidebar, /const displayedMaterials = partsExpanded \? orderedMaterials : orderedMaterials\.slice\(0, 3\)/);
+  assert.match(sidebar, /orderModelParts\(materials, hiddenMaterials\)/);
+  assert.match(sidebar, /aria-expanded=\{partsExpanded\}/);
+  assert.match(sidebar, /checked=\{!hidden\}/);
+  assert.match(sidebar, /title=\{cannotHide \? t\("sidebar\.parts\.keepOne"\) : displayName\}/);
+  assert.match(sidebar, /visibleMaterialCount <= 1/);
+  assert.match(app, /model\.setMaterialVisible\(index, visible\)/);
+  assert.match(app, /invalidateProjection\("material-visibility"\)/);
+  assert.match(snapshot, /sourceVertexIndices/);
+  assert.match(snapshot, /const vertexIndex = sourceVertexIndices\[visibleVertexIndex\]/);
+});
+
+test("closed model parts sort ahead of visible parts without disturbing index order", () => {
+  const materials = [0, 1, 2, 3, 4].map((index) => ({
+    index,
+    name: `material_${index}`,
+    englishName: "",
+    displayName: `Material ${index}`,
+    color: [1, 1, 1],
+    opacity: 1,
+    hasTexture: false,
+    suggestedSkin: false,
+    ambient: [0, 0, 0],
+    suggestedEmissive: false,
+  })) as MmdMaterialInfo[];
+
+  const ordered = orderModelParts(materials, new Set([3, 1]));
+  assert.deepEqual(ordered.map((material) => material.index), [1, 3, 0, 2, 4]);
+  assert.deepEqual(ordered.slice(0, 3).map((material) => material.index), [1, 3, 0]);
+});
+
 test("sidebar resizing persists its width while numeric readouts remain visible", () => {
   const app = readFileSync("src/App.tsx", "utf8");
   const sidebar = readFileSync("src/components/Sidebar.tsx", "utf8");
   const styles = readFileSync("src/index.css", "utf8");
 
+  assert.match(app, /const \[sidebarOpen, setSidebarOpen\] = useState\(true\)/);
+  assert.doesNotMatch(app, /window\.innerWidth > 720/);
   assert.match(app, /SIDEBAR_WIDTH_STORAGE_KEY = "mely\.sidebarWidth"/);
   assert.match(app, /window\.addEventListener\("pointermove", onPointerMove\)/);
   assert.match(app, /localStorage\.setItem\(SIDEBAR_WIDTH_STORAGE_KEY, String\(sidebarWidth\)\)/);

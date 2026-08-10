@@ -4,17 +4,16 @@ import {
   Bone,
   Box,
   Boxes,
+  ChevronDown,
+  ChevronUp,
   CircleCheck,
   Download,
-  FileArchive,
   FileBox,
   FolderOpen,
   GripVertical,
-  Image,
   Layers3,
   LoaderCircle,
   Lock,
-  Play,
   Redo2,
   RotateCcw,
   ShieldCheck,
@@ -27,8 +26,8 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, KeyboardEvent, PointerEvent } from "react";
+import { orderModelParts } from "../core/modelParts";
 import { useI18n } from "../i18n/I18nProvider";
-import type { TranslationKey } from "../i18n";
 import type {
   GenerationMode,
   HologramOptions,
@@ -63,10 +62,10 @@ interface SidebarProps {
   lockedMotionFrames: Record<MmdMotionTrackKind, number | null>;
   bones: readonly MmdBoneInfo[];
   materials: readonly MmdMaterialInfo[];
+  hiddenMaterialIndices: readonly number[];
   selectedBoneIndex: number | null;
   poseEditing: boolean;
   poseState: MmdPoseState;
-  assets: ImportedAsset[];
   processing: boolean;
   modelLoading: boolean;
   modelLoadStage: string;
@@ -89,6 +88,7 @@ interface SidebarProps {
   onPreviewModeChange: (mode: PreviewMode) => void;
   onAssetsAdded: (files: File[]) => void | Promise<void>;
   onPhysicsEnabledChange: (enabled: boolean) => void | Promise<void>;
+  onMaterialVisibilityChange: (index: number, visible: boolean) => void;
   onSidebarResizeStart: (event: PointerEvent<HTMLDivElement>) => void;
   onSidebarResizeStep: (delta: number) => void;
   onSidebarResizeReset: () => void;
@@ -106,20 +106,6 @@ interface SidebarProps {
   onExtendedHeightToggle: () => void;
 }
 
-const assetIcon = {
-  model: FileBox,
-  motion: Play,
-  texture: Image,
-  archive: FileArchive,
-};
-
-const assetTypeTranslationKey: Record<ImportedAsset["type"], TranslationKey> = {
-  model: "sidebar.asset.model",
-  motion: "sidebar.asset.motion",
-  texture: "sidebar.asset.texture",
-  archive: "sidebar.asset.archive",
-};
-
 export function Sidebar({
   options,
   solidOptions,
@@ -131,10 +117,10 @@ export function Sidebar({
   lockedMotionFrames,
   bones,
   materials,
+  hiddenMaterialIndices,
   selectedBoneIndex,
   poseEditing,
   poseState,
-  assets,
   processing,
   modelLoading,
   modelLoadStage,
@@ -157,6 +143,7 @@ export function Sidebar({
   onPreviewModeChange,
   onAssetsAdded,
   onPhysicsEnabledChange,
+  onMaterialVisibilityChange,
   onSidebarResizeStart,
   onSidebarResizeStep,
   onSidebarResizeReset,
@@ -178,10 +165,19 @@ export function Sidebar({
   const folderInputRef = useRef<HTMLInputElement>(null);
   const poseInputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
+  const [partsExpanded, setPartsExpanded] = useState(false);
   const selectedBone = selectedBoneIndex === null ? null : bones[selectedBoneIndex] ?? null;
   const boneDisplayName = (bone: MmdBoneInfo) => bone.displayName
     || t("model.boneFallback", { index: number(bone.index + 1) });
   const selectedSkinMaterials = new Set(solidOptions.skinMaterialIndices);
+  const hiddenMaterials = new Set(hiddenMaterialIndices);
+  const hiddenMaterialCount = materials.reduce(
+    (count, material) => count + (hiddenMaterials.has(material.index) ? 1 : 0),
+    0,
+  );
+  const visibleMaterialCount = materials.length - hiddenMaterialCount;
+  const orderedMaterials = orderModelParts(materials, hiddenMaterials);
+  const displayedMaterials = partsExpanded ? orderedMaterials : orderedMaterials.slice(0, 3);
   const unlockedMotionTracks = (["dance", "expression"] as const)
     .filter((kind) => motionTracks[kind] && lockedMotionFrames[kind] === null)
     .map((kind) => t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack"));
@@ -210,6 +206,8 @@ export function Sidebar({
     input.setAttribute("webkitdirectory", "");
     input.setAttribute("directory", "");
   }, []);
+
+  useEffect(() => setPartsExpanded(false), [materials]);
 
   const addFiles = (files: FileList | null) => {
     if (!files?.length || modelLoading) return;
@@ -362,24 +360,67 @@ export function Sidebar({
             </div>
           ) : null}
 
-          {assets.length ? (
-            <div className="asset-list">
-              {assets.slice(0, 5).map((asset, index) => {
-                const AssetIcon = assetIcon[asset.type];
-                return (
-                  <div className="asset-row" key={`${asset.path}-${index}`} title={asset.path}>
-                    <span className={`asset-icon asset-icon--${asset.type}`}>
-                      <AssetIcon size={15} />
-                    </span>
-                    <span className="asset-name">
-                      <strong>{asset.name}</strong>
-                      <small>{t(assetTypeTranslationKey[asset.type])}</small>
-                    </span>
-                    <CircleCheck size={15} className="asset-ready" />
-                  </div>
-                );
-              })}
-              {assets.length > 5 ? <div className="asset-more">{t("sidebar.asset.more", { count: number(assets.length - 5) })}</div> : null}
+          {modelStats && materials.length ? (
+            <div className="model-parts">
+              <button
+                type="button"
+                className="model-parts__toggle"
+                aria-expanded={partsExpanded}
+                aria-controls="model-parts-list"
+                title={t(partsExpanded ? "sidebar.parts.collapse" : "sidebar.parts.expand")}
+                disabled={materials.length <= 3}
+                onClick={() => setPartsExpanded((current) => !current)}
+              >
+                <span>
+                  <Layers3 size={15} />
+                  <strong>{t("sidebar.parts.title")}</strong>
+                </span>
+                <span>
+                  <small>{t("sidebar.parts.visibleCount", {
+                    visible: number(visibleMaterialCount),
+                    total: number(materials.length),
+                  })}</small>
+                  {materials.length > 3
+                    ? partsExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />
+                    : null}
+                </span>
+              </button>
+              <div
+                id="model-parts-list"
+                className={`model-parts__list ${partsExpanded ? "model-parts__list--expanded" : ""}`}
+              >
+                {displayedMaterials.map((material) => {
+                  const hidden = hiddenMaterials.has(material.index);
+                  const displayName = material.displayName
+                    || t("model.materialFallback", { index: number(material.index + 1) });
+                  const cannotHide = !hidden && visibleMaterialCount <= 1;
+                  return (
+                    <label
+                      className={`model-part ${hidden ? "model-part--hidden" : ""}`}
+                      key={material.index}
+                      title={cannotHide ? t("sidebar.parts.keepOne") : displayName}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!hidden}
+                        disabled={cannotHide || modelLoading || processing}
+                        onChange={(event) => onMaterialVisibilityChange(material.index, event.target.checked)}
+                      />
+                      <span
+                        className="model-part__swatch"
+                        style={{ backgroundColor: `rgb(${material.color.map((value) => Math.round(value * 255)).join(",")})` }}
+                      />
+                      <span className="model-part__name">
+                        <strong>{displayName}</strong>
+                        <small>{t("sidebar.parts.materialIndex", {
+                          index: material.index.toString().padStart(2, "0"),
+                        })}</small>
+                      </span>
+                      {hidden ? <small className="model-part__status">{t("sidebar.parts.hidden")}</small> : null}
+                    </label>
+                  );
+                })}
+              </div>
             </div>
           ) : (
             <div className="demo-source">
@@ -675,7 +716,11 @@ export function Sidebar({
                   </div>
                   <div className="material-picker__list">
                     {materials.map((material) => (
-                      <label className="material-item" key={material.index} title={`${material.name} ${material.englishName}`}>
+                      <label
+                        className="material-item"
+                        key={material.index}
+                        title={material.displayName || t("model.materialFallback", { index: number(material.index + 1) })}
+                      >
                         <input
                           type="checkbox"
                           checked={solidOptions.emissiveMaterialIndices.includes(material.index)}
@@ -735,7 +780,11 @@ export function Sidebar({
                   </div>
                   <div className="material-picker__list">
                     {materials.map((material) => (
-                      <label className="material-item" key={material.index} title={`${material.name} ${material.englishName}`}>
+                      <label
+                        className="material-item"
+                        key={material.index}
+                        title={material.displayName || t("model.materialFallback", { index: number(material.index + 1) })}
+                      >
                         <input
                           type="checkbox"
                           checked={selectedSkinMaterials.has(material.index)}

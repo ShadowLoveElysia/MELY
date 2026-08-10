@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { Box3, MathUtils, Vector3 } from "three";
+import { MathUtils, Vector3 } from "three";
 import { IconButton } from "./components/IconButton";
 import {
   MotionTrackFrameReadout,
@@ -337,6 +337,7 @@ const textureByteEstimate = (model: LoadedMmdModel | null) => {
   let bytes = 0;
   const materials = Array.isArray(model.mesh.material) ? model.mesh.material : [model.mesh.material];
   for (const material of materials) {
+    if (!material.visible || material.opacity <= 0.01) continue;
     const map = (material as typeof material & { map?: import("three").Texture | null }).map;
     if (!map || seen.has(map.uuid)) continue;
     seen.add(map.uuid);
@@ -430,7 +431,9 @@ const estimateModelDimensions = (
 ): [number, number, number] => {
   if (!model) return [Math.max(1, Math.round(targetHeight * 0.45)), targetHeight, Math.max(1, Math.round(targetHeight * 0.3))];
   model.root.updateMatrixWorld(true);
-  const size = new Box3().setFromObject(model.root, false).getSize(new Vector3());
+  const bounds = model.visibleBounds();
+  if (bounds.isEmpty()) return [1, Math.max(1, Math.round(targetHeight)), 1];
+  const size = bounds.getSize(new Vector3());
   const scale = Math.max(1, targetHeight) / Math.max(size.y, 0.001);
   return [
     Math.max(1, Math.ceil(size.x * scale)),
@@ -514,6 +517,7 @@ export default function App() {
   const [motionTracks, setMotionTracks] = useState<MmdMotionTracks>(emptyMotionTracks);
   const [lockedMotionFrames, setLockedMotionFrames] = useState(emptyLockedMotionFrames);
   const [poseRevision, setPoseRevision] = useState(0);
+  const [partsRevision, setPartsRevision] = useState(0);
   const [poseEditing, setPoseEditing] = useState(false);
   const [selectedBoneIndex, setSelectedBoneIndex] = useState<number | null>(null);
   const [poseState, setPoseState] = useState<MmdPoseState>(emptyPoseState);
@@ -524,10 +528,12 @@ export default function App() {
   const [exportCurrentFile, setExportCurrentFile] = useState("");
   const [processing, setProcessing] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 720);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
   const [physicsEnabled, setPhysicsEnabled] = useState(false);
   const [physicsLoading, setPhysicsLoading] = useState(false);
+  const hiddenMaterialIndicesRef = useRef<number[]>([]);
+  const [hiddenMaterialIndices, setHiddenMaterialIndices] = useState<number[]>([]);
   const [cameraMode, setCameraMode] = useState<CameraMode>("perspective");
   const [previewMode, setPreviewMode] = useState<PreviewMode>("source");
   const [showGrid, setShowGrid] = useState(true);
@@ -796,7 +802,7 @@ export default function App() {
   const extendedHeightActive = heightRisk.requiresExportConfirmation;
   const estimatedDimensions = useMemo(
     () => estimateModelDimensions(mmdModel, targetHeight),
-    [mmdModel, targetHeight],
+    [mmdModel, partsRevision, targetHeight],
   );
   const estimatedBlockCount = useMemo(() => result?.stats.blockCount ?? (mmdModel
     ? estimateProjectionBlocks(
@@ -812,7 +818,7 @@ export default function App() {
         targetHeight,
         width: estimatedDimensions[0],
         depth: estimatedDimensions[2],
-        triangleCount: mmdModel.stats.triangleCount,
+        triangleCount: mmdModel.visibleTriangleCount(),
         textureBytes: generationMode === "solid" ? textureByteEstimate(mmdModel) : 0,
         fillMode: generationMode === "solid" ? solidOptions.fillMode : "shell",
         estimatedBlocks: estimatedBlockCount,
@@ -845,7 +851,7 @@ export default function App() {
       targetHeight,
       width: dimensions[0],
       depth: dimensions[2],
-      triangleCount: model.stats.triangleCount,
+      triangleCount: model.visibleTriangleCount(),
       textureBytes: mode === "solid" ? textureByteEstimate(model) : 0,
       fillMode: mode === "solid" ? nextSolidOptions.fillMode : "shell",
       estimatedBlocks,
@@ -1026,6 +1032,8 @@ export default function App() {
     resetMotionTracks();
     setPhysicsEnabled(false);
     setPhysicsLoading(false);
+    hiddenMaterialIndicesRef.current = [];
+    setHiddenMaterialIndices([]);
     setPoseEditing(false);
     setSelectedBoneIndex(null);
     setPoseState(emptyPoseState);
@@ -1371,6 +1379,25 @@ export default function App() {
       if (modelRef.current === model) setPhysicsLoading(false);
     }
   };
+
+  const changeMaterialVisibility = useCallback((index: number, visible: boolean) => {
+    const model = modelRef.current;
+    if (!model || modelLoading || processing || !model.materials[index]) return;
+    const hidden = new Set(hiddenMaterialIndicesRef.current);
+    if (visible) {
+      if (!hidden.delete(index)) return;
+    } else {
+      if (hidden.has(index) || model.materials.length - hidden.size <= 1) return;
+      hidden.add(index);
+    }
+    model.setMaterialVisible(index, visible);
+    const next = [...hidden].sort((left, right) => left - right);
+    hiddenMaterialIndicesRef.current = next;
+    setHiddenMaterialIndices(next);
+    invalidateProjection("material-visibility");
+    setPartsRevision((value) => value + 1);
+    setPreviewMode("source");
+  }, [invalidateProjection, modelLoading, processing]);
 
   const openClearResources = () => {
     setClearResourceSelection(emptyClearResourceSelection());
@@ -2160,10 +2187,10 @@ export default function App() {
             lockedMotionFrames={lockedMotionFrames}
             bones={mmdModel?.bones ?? []}
             materials={mmdModel?.materials ?? []}
+            hiddenMaterialIndices={hiddenMaterialIndices}
             selectedBoneIndex={selectedBoneIndex}
             poseEditing={poseEditing}
             poseState={poseState}
-            assets={assets}
             processing={processing}
             modelLoading={modelLoading}
             modelLoadStage={t(modelLoadStageKey)}
@@ -2186,6 +2213,7 @@ export default function App() {
             onPreviewModeChange={changePreviewMode}
             onAssetsAdded={addAssets}
             onPhysicsEnabledChange={changePhysicsEnabled}
+            onMaterialVisibilityChange={changeMaterialVisibility}
             onSidebarResizeStart={beginSidebarResize}
             onSidebarResizeStep={stepSidebarWidth}
             onSidebarResizeReset={resetSidebarWidth}
@@ -2281,6 +2309,7 @@ export default function App() {
               showBounds={showBounds}
               resetToken={resetToken}
               focusFaceToken={focusFaceToken}
+              partsRevision={partsRevision}
               poseRevision={poseRevision}
               poseEditing={poseEditing}
               selectedBoneIndex={selectedBoneIndex}

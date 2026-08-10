@@ -258,7 +258,24 @@ const collectVisibleTriangles = (mesh: THREE.SkinnedMesh) => {
       triangleMaterials[triangleOffset++] = range.materialIndex;
     }
   }
-  return { indices, triangleMaterials };
+  const sourceToVisible = new Int32Array(vertexCount);
+  sourceToVisible.fill(-1);
+  const sourceVertexIndices: number[] = [];
+  for (let offset = 0; offset < indices.length; offset += 1) {
+    const sourceVertexIndex = indices[offset];
+    let visibleVertexIndex = sourceToVisible[sourceVertexIndex];
+    if (visibleVertexIndex < 0) {
+      visibleVertexIndex = sourceVertexIndices.length;
+      sourceToVisible[sourceVertexIndex] = visibleVertexIndex;
+      sourceVertexIndices.push(sourceVertexIndex);
+    }
+    indices[offset] = visibleVertexIndex;
+  }
+  return {
+    indices,
+    triangleMaterials,
+    sourceVertexIndices: Uint32Array.from(sourceVertexIndices),
+  };
 };
 
 const textureImageSize = (image: unknown) => {
@@ -518,6 +535,8 @@ export const createMmdMeshSnapshot = async (
   const sdefRW0 = geometry.getAttribute("matricesSdefRW0");
   const sdefRW1 = geometry.getAttribute("matricesSdefRW1");
   const qdefEnabled = geometry.getAttribute("matricesQdefEnabled");
+  const triangles = collectVisibleTriangles(mesh);
+  const sourceVertexIndices = triangles.sourceVertexIndices;
 
   model.root.updateMatrixWorld(true);
   mesh.skeleton.update();
@@ -533,7 +552,7 @@ export const createMmdMeshSnapshot = async (
   );
   const identityMatrix = new THREE.Matrix4();
   const splitBindings = splitMorphBindings(mesh);
-  const positions = new Float32Array(position.count * 3);
+  const positions = new Float32Array(sourceVertexIndices.length * 3);
   const morphedPosition = new THREE.Vector3();
   const morphBase = new THREE.Vector3();
   const morphOffset = new THREE.Vector3();
@@ -543,12 +562,13 @@ export const createMmdMeshSnapshot = async (
   const sdefWeighted0 = new THREE.Vector3();
   const sdefWeighted1 = new THREE.Vector3();
 
-  for (let vertexIndex = 0; vertexIndex < position.count; vertexIndex += 1) {
-    if (vertexIndex > 0 && vertexIndex % SNAPSHOT_CHUNK_SIZE === 0) {
+  for (let visibleVertexIndex = 0; visibleVertexIndex < sourceVertexIndices.length; visibleVertexIndex += 1) {
+    if (visibleVertexIndex > 0 && visibleVertexIndex % SNAPSHOT_CHUNK_SIZE === 0) {
       throwIfCancelled(options);
-      options.onProgress?.(vertexIndex / position.count);
+      options.onProgress?.(visibleVertexIndex / sourceVertexIndices.length);
       await yieldToMainThread();
     }
+    const vertexIndex = sourceVertexIndices[visibleVertexIndex];
 
     const morphSource = morphMeshForVertex(mesh, vertexIndex, splitBindings);
     getMorphedPosition(
@@ -597,20 +617,25 @@ export const createMmdMeshSnapshot = async (
     }
 
     skinned.applyMatrix4(meshToRoot);
-    positions[vertexIndex * 3] = skinned.x;
-    positions[vertexIndex * 3 + 1] = skinned.y;
-    positions[vertexIndex * 3 + 2] = skinned.z;
+    positions[visibleVertexIndex * 3] = skinned.x;
+    positions[visibleVertexIndex * 3 + 1] = skinned.y;
+    positions[visibleVertexIndex * 3 + 2] = skinned.z;
   }
 
   throwIfCancelled(options);
   options.onProgress?.(1);
-  const triangles = collectVisibleTriangles(mesh);
-  if (options.includeTextures === false) return { positions, ...triangles, faceFrame };
+  const visibleTriangles = {
+    indices: triangles.indices,
+    triangleMaterials: triangles.triangleMaterials,
+  };
+  if (options.includeTextures === false) return { positions, ...visibleTriangles, faceFrame };
   const uvAttribute = geometry.getAttribute("uv");
   const uvs = uvAttribute
-    ? Float32Array.from({ length: uvAttribute.count * 2 }, (_, offset) => {
-        const vertexIndex = Math.floor(offset / 2);
-        return offset % 2 === 0 ? uvAttribute.getX(vertexIndex) : uvAttribute.getY(vertexIndex);
+    ? Float32Array.from({ length: sourceVertexIndices.length * 2 }, (_, offset) => {
+        const sourceVertexIndex = sourceVertexIndices[Math.floor(offset / 2)];
+        return offset % 2 === 0
+          ? uvAttribute.getX(sourceVertexIndex)
+          : uvAttribute.getY(sourceVertexIndex);
       })
     : undefined;
   const materialData = captureMaterials(
@@ -622,7 +647,7 @@ export const createMmdMeshSnapshot = async (
       options.textureByteBudget ?? MMD_SNAPSHOT_TEXTURE_BUDGET,
     ))),
   );
-  return { positions, uvs, ...triangles, ...materialData, faceFrame };
+  return { positions, uvs, ...visibleTriangles, ...materialData, faceFrame };
 };
 
 export const releaseMmdMeshSnapshot = (snapshot: MmdMeshSnapshot) => {

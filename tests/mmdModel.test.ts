@@ -6,6 +6,7 @@ import {
   disposeMmdModelResources,
   isSuggestedEmissiveMaterial,
   isSuggestedSkinMaterial,
+  isMmdTextureResourceLabel,
   loadMmdModel,
   MMD_MODEL_LOAD_OPTIONS,
   releaseMmdLoaderReferences,
@@ -133,6 +134,16 @@ test("emissive suggestions require explicit glow data or material semantics", ()
   assert.equal(isSuggestedEmissiveMaterial("普通材质", "", [0.1, 0.1, 0.1]), false);
 });
 
+test("texture resource filenames are not treated as model part labels", () => {
+  assert.equal(isMmdTextureResourceLabel("mc1.png"), true);
+  assert.equal(isMmdTextureResourceLabel("toon01.bmp"), true);
+  assert.equal(isMmdTextureResourceLabel("body.png*body.sph"), true);
+  assert.equal(isMmdTextureResourceLabel("textures/dress.TGA"), true);
+  assert.equal(isMmdTextureResourceLabel("裙摆"), false);
+  assert.equal(isMmdTextureResourceLabel("Dress"), false);
+  assert.equal(isMmdTextureResourceLabel("cloth.png detail"), false);
+});
+
 test("model disposal releases owned decoded sources and severs CPU geometry references", () => {
   const previousImageBitmap = globalThis.ImageBitmap;
   class TestImageBitmap {
@@ -240,6 +251,31 @@ test("disposed model pose methods no longer retain a usable pose controller", as
 
   assert.throws(readPoseState, /disposed/);
   assert.throws(() => nudgeBone(0, "x", 1), /disposed/);
+});
+
+test("hidden model materials stay hidden across runtime pose evaluation", async () => {
+  const bytes = await import("node:fs/promises").then(({ readFile }) => (
+    readFile(new URL("./fixtures/mely-input-e2e.pmd", import.meta.url))
+  ));
+  const file = new File([bytes], "mely-input-e2e.pmd");
+  const model = await loadMmdModel([file], file);
+  const materials = Array.isArray(model.mesh.material) ? model.mesh.material : [model.mesh.material];
+
+  try {
+    assert.ok(materials.length > 0);
+    model.setMaterialVisible(0, false);
+    assert.equal(materials[0].visible, false);
+
+    model.updatePreviewPose({ dance: 0, expression: 0 });
+    assert.equal(materials[0].visible, false);
+    model.updatePose({ dance: 0, expression: 0 });
+    assert.equal(materials[0].visible, false);
+
+    model.setMaterialVisible(0, true);
+    assert.equal(materials[0].visible, true);
+  } finally {
+    model.dispose();
+  }
 });
 
 test("dance and expression tracks sample independent frames from one VMD", async () => {

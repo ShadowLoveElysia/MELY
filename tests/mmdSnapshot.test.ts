@@ -6,7 +6,7 @@ import {
   createMmdMeshSnapshot,
   releaseMmdMeshSnapshot,
 } from "../src/core/mmdSnapshot";
-import type { LoadedMmdModel } from "../src/core/mmdModel";
+import { computeVisibleMmdBounds, type LoadedMmdModel } from "../src/core/mmdModel";
 
 const vectorFromTuple = (tuple: readonly [number, number, number]) =>
   new THREE.Vector3(tuple[0], tuple[1], tuple[2]);
@@ -317,6 +317,67 @@ test("CPU snapshots apply active vertex morphs before bone deformation", async (
 
   const snapshot = await createMmdMeshSnapshot(model, { includeTextures: false });
   assertPosition(snapshot.positions, 0, new THREE.Vector3(1.5, 0, 0));
+});
+
+test("hidden material geometry is removed from snapshots and visible bounds", async () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute([
+    0, 0, 0,
+    1, 0, 0,
+    0, 1, 0,
+    100, 0, 0,
+    101, 0, 0,
+    100, 1, 0,
+  ], 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute([
+    0, 0,
+    1, 0,
+    0, 1,
+    0.25, 0.25,
+    0.75, 0.25,
+    0.25, 0.75,
+  ], 2));
+  geometry.setAttribute("skinIndex", new THREE.Uint16BufferAttribute([
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+  ], 4));
+  geometry.setAttribute("skinWeight", new THREE.Float32BufferAttribute([
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+  ], 4));
+  geometry.setIndex([0, 1, 2, 3, 4, 5]);
+  geometry.addGroup(0, 3, 0);
+  geometry.addGroup(3, 3, 1);
+
+  const visible = new THREE.MeshBasicMaterial();
+  const hidden = new THREE.MeshBasicMaterial();
+  hidden.visible = false;
+  const mesh = new THREE.SkinnedMesh(geometry, [visible, hidden]);
+  const bone = new THREE.Bone();
+  mesh.add(bone);
+  mesh.bind(new THREE.Skeleton([bone]));
+  const root = new THREE.Group();
+  root.add(mesh);
+  root.updateMatrixWorld(true);
+
+  const snapshotModel = { root, mesh } as unknown as LoadedMmdModel;
+  const snapshot = await createMmdMeshSnapshot(snapshotModel, { includeTextures: true });
+  assert.deepEqual([...snapshot.positions], [0, 0, 0, 1, 0, 0, 0, 1, 0]);
+  assert.deepEqual([...snapshot.indices], [0, 1, 2]);
+  assert.deepEqual([...snapshot.triangleMaterials], [0]);
+  assert.deepEqual([...snapshot.uvs ?? []], [0, 0, 1, 0, 0, 1]);
+
+  const bounds = computeVisibleMmdBounds(root, mesh);
+  assert.deepEqual(bounds.min.toArray(), [0, 0, 0]);
+  assert.deepEqual(bounds.max.toArray(), [1, 1, 0]);
 });
 
 test("material snapshots do not treat ambient light as emissive", async () => {
