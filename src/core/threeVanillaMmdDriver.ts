@@ -14,6 +14,7 @@ import { FallbackCore } from "@yohawing/three-mmd-loader/parser";
 import { appError } from "./appError";
 import { createMmdResourceUrlBundle } from "./mmdResourceUrls";
 import { normalizeMelyBoneName } from "./melyPose";
+import { withThreeMmdBindPose } from "./threeMmdBindPose";
 import {
   createThreeMmdModel,
   type LoadedThreeMmdModel,
@@ -29,6 +30,7 @@ interface VanillaHelperInternals {
   objects: WeakMap<SkinnedMesh, VanillaHelperObject>;
   _setupMeshPhysics: (mesh: SkinnedMesh, params: {
     physics: true;
+    animationWarmup: false;
     warmup: number;
     unitStep: number;
     maxStepNum: number;
@@ -356,11 +358,14 @@ export const loadThreeVanillaMmdModel = async (
           const pendingCapture = installAmmoCapture(ammo) as AmmoPhysicsCapture & { restore: () => void };
           try {
             if (disposed || requestId !== physicsRequestId) return;
-            helperInternals._setupMeshPhysics(loadedMesh, {
-              physics: true,
-              warmup: 0,
-              unitStep: 1 / 120,
-              maxStepNum: 10,
+            withThreeMmdBindPose(loadedMesh, () => {
+              helperInternals._setupMeshPhysics(loadedMesh, {
+                physics: true,
+                animationWarmup: false,
+                warmup: 0,
+                unitStep: 1 / 120,
+                maxStepNum: 10,
+              });
             });
             if (disposed || requestId !== physicsRequestId) {
               helper.enable("physics", false);

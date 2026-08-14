@@ -4,6 +4,7 @@ import {
   Color4,
   DirectionalLight,
   Engine,
+  GetTextureDataAsync,
   HemisphericLight,
   Matrix,
   Mesh,
@@ -32,6 +33,7 @@ import {
   MmdAnimation,
   MmdBufferKind,
   MmdModelAnimationContainer,
+  MmdStandardMaterialBuilder,
   MmdStandardMaterialProxy,
   MmdWasmInstanceTypeSPR,
   MmdWasmPhysics,
@@ -73,6 +75,7 @@ import {
   reflectMmdQuaternionZ,
   threeToBabylonPosition,
 } from "./mmdCoordinates";
+import { createBabylonMmdReferenceFiles } from "./babylonMmdResources";
 import { isSuggestedEmissiveMaterial, isSuggestedSkinMaterial } from "./mmdModel";
 
 type BabylonModel = MmdWasmModel;
@@ -128,6 +131,54 @@ const emptyMotion = (): BabylonMotionState => ({
   danceHandle: null,
   expressionTracks: [],
 });
+
+class DiagnosticMmdMaterialBuilder extends MmdStandardMaterialBuilder {
+  public constructor(private readonly warnings: string[]) {
+    super();
+  }
+
+  private warn(kind: string, path: string) {
+    const warning = `${kind}: ${path}`;
+    if (!this.warnings.includes(warning)) this.warnings.push(warning);
+  }
+
+  public override async loadDiffuseTexture(
+    ...args: Parameters<MmdStandardMaterialBuilder["loadDiffuseTexture"]>
+  ) {
+    await super.loadDiffuseTexture(...args);
+    const [, material, , imagePathTable, textureInfo] = args;
+    const path = imagePathTable[textureInfo?.imagePathIndex ?? -1];
+    if (path !== undefined && (!material.diffuseTexture || material.diffuseTexture.loadingError)) {
+      this.warn("diffuse", path);
+    }
+  }
+
+  public override async loadSphereTexture(
+    ...args: Parameters<MmdStandardMaterialBuilder["loadSphereTexture"]>
+  ) {
+    await super.loadSphereTexture(...args);
+    const [, material, materialInfo, imagePathTable, textureInfo] = args;
+    const path = imagePathTable[textureInfo?.imagePathIndex ?? -1];
+    if (
+      materialInfo.sphereTextureMode !== 0
+      && path !== undefined
+      && (!material.sphereTexture || material.sphereTexture.loadingError)
+    ) this.warn("sphere", path);
+  }
+
+  public override async loadToonTexture(
+    ...args: Parameters<MmdStandardMaterialBuilder["loadToonTexture"]>
+  ) {
+    await super.loadToonTexture(...args);
+    const [, material, materialInfo, imagePathTable, textureInfo] = args;
+    const path = imagePathTable[textureInfo?.imagePathIndex ?? -1];
+    if (
+      !materialInfo.isSharedToonTexture
+      && path !== undefined
+      && (!material.toonTexture || material.toonTexture.loadingError)
+    ) this.warn("toon", path);
+  }
+}
 
 /**
  * Evaluate a bound Babylon animation at an explicit MMD frame. The normal
@@ -370,13 +421,11 @@ const captureTexture = async (
   const width = Math.max(1, Math.floor(size.width * scale));
   const height = Math.max(1, Math.floor(size.height * scale));
   try {
-    const raw = await texture.readPixels(0, 0, null, true, false, 0, 0, width, height);
-    if (raw) {
-      const data = Uint8ClampedArray.from(raw as unknown as ArrayLike<number>);
-      return { width, height, pixels: data.length === width * height * 4 ? data : data.slice(0, width * height * 4) };
-    }
+    const raw = await GetTextureDataAsync(texture, width, height);
+    if (raw.length !== width * height * 4) return null;
+    return { width, height, pixels: Uint8ClampedArray.from(raw) };
   } catch {
-    // Some browser texture backends do not expose readPixels before a frame is rendered.
+    // Some browser texture backends do not expose texture readback before a frame is rendered.
   }
   return null;
 };
@@ -802,11 +851,15 @@ export const loadBabylonMmdModel = async (
     light.intensity = 1.8;
     const hemi = new HemisphericLight("mely-babylon-hemi", new Vector3(0, 1, 0), scene);
     hemi.intensity = 0.65;
+    const referenceBundle = createBabylonMmdReferenceFiles(files, modelFile);
+    const textureWarnings = [...referenceBundle.warnings];
+    const materialBuilder = new DiagnosticMmdMaterialBuilder(textureWarnings);
 
     const loadedContainer = await LoadAssetContainerAsync(modelFile, scene, {
       pluginOptions: {
         mmdmodel: {
-          referenceFiles: files,
+          referenceFiles: referenceBundle.referenceFiles,
+          materialBuilder,
           optimizeSubmeshes: false,
           optimizeSingleMaterialModel: false,
           useSdef: true,
@@ -879,6 +932,12 @@ export const loadBabylonMmdModel = async (
       )),
     ])).filter((name): name is string => Boolean(name));
     const materials = [...new Set(sourceMeshes.flatMap(materialArray))];
+    const textureNameMap = (rootMesh.metadata as {
+      textureNameMap?: Map<BaseTexture, string>;
+    } | null)?.textureNameMap;
+    textureNameMap?.forEach((path, texture) => {
+      if (texture.loadingError) textureWarnings.push(path || texture.name);
+    });
     // Keep the loader-provided alpha separate from the application visibility
     // toggle. A hide/show cycle must not turn an originally translucent MMD
     // material into an opaque one.
@@ -1126,7 +1185,7 @@ export const loadBabylonMmdModel = async (
       morphCount: runtimeMorphs.length,
       rigidBodyCount: metadata.rigidBodies?.length ?? 0,
       jointCount: metadata.joints?.length ?? 0,
-      textureWarnings: 0,
+      textureWarnings: textureWarnings.length,
     };
     const visibleBounds = (target?: Box3) => {
       const matrices = mmdModel
@@ -1242,7 +1301,7 @@ export const loadBabylonMmdModel = async (
       fileName: modelFile.name,
       viewport,
       stats,
-      textureWarnings: [],
+      textureWarnings,
       bones: boneInfos,
       morphNames,
       materials: materialInfo,
