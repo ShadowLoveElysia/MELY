@@ -33,6 +33,7 @@ import {
 type Point = [number, number, number];
 type Uv = [number, number];
 type Rgba = [number, number, number, number];
+type LinearRgba = [number, number, number, number];
 interface VoxelSample {
   x: number;
   y: number;
@@ -149,6 +150,7 @@ const normalizeMesh = (snapshot: MmdMeshSnapshot, targetHeight: number): Normali
       englishName: "default",
       baseColor: [0.72, 0.72, 0.72, 1],
       textureFactor: [1, 1, 1, 1],
+      hasTexture: false,
       textureIndex: -1,
       textureMatrix: [1, 0, 0, 0, 1, 0, 0, 0, 1],
       wrapS: ClampToEdgeWrapping,
@@ -308,10 +310,28 @@ const pixel = (
   ];
 };
 
+const srgbToLinear = (value: number) => value <= 0.04045
+  ? value / 12.92
+  : ((value + 0.055) / 1.055) ** 2.4;
+
+const linearToSrgb = (value: number) => value <= 0.0031308
+  ? value * 12.92
+  : 1.055 * value ** (1 / 2.4) - 0.055;
+
+const clamp01 = (value: number) => Math.max(0, Math.min(1, value));
+const normalizedToByte = (value: number) => Math.round(clamp01(value) * 255);
+const linearToSrgbByte = (value: number) => normalizedToByte(linearToSrgb(clamp01(value)));
+const SRGB_BYTE_TO_LINEAR = Float32Array.from(
+  { length: 256 },
+  (_, value) => srgbToLinear(value / 255),
+);
+const srgbByteToLinear = (value: number) => SRGB_BYTE_TO_LINEAR[value];
+const byteToNormalized = (value: number) => value / 255;
+
 const sampleTexture = (
   texture: NonNullable<MmdMeshSnapshot["textures"]>[number],
   uv: Uv,
-): Rgba => {
+): LinearRgba => {
   const x = uv[0] * Math.max(0, texture.width - 1);
   const y = uv[1] * Math.max(0, texture.height - 1);
   const x0 = Math.floor(x);
@@ -320,13 +340,49 @@ const sampleTexture = (
   const y1 = Math.min(texture.height - 1, y0 + 1);
   const tx = x - x0;
   const ty = y - y0;
-  const samples = [pixel(texture, x0, y0), pixel(texture, x1, y0), pixel(texture, x0, y1), pixel(texture, x1, y1)];
-  return [0, 1, 2, 3].map((channel) => {
-    const top = samples[0][channel] * (1 - tx) + samples[1][channel] * tx;
-    const bottom = samples[2][channel] * (1 - tx) + samples[3][channel] * tx;
+  const topLeft = pixel(texture, x0, y0);
+  const topRight = pixel(texture, x1, y0);
+  const bottomLeft = pixel(texture, x0, y1);
+  const bottomRight = pixel(texture, x1, y1);
+  const interpolate = (channel: number, decode: (value: number) => number) => {
+    const top = decode(topLeft[channel]) * (1 - tx) + decode(topRight[channel]) * tx;
+    const bottom = decode(bottomLeft[channel]) * (1 - tx) + decode(bottomRight[channel]) * tx;
     return top * (1 - ty) + bottom * ty;
-  }) as Rgba;
+  };
+  return [
+    interpolate(0, srgbByteToLinear),
+    interpolate(1, srgbByteToLinear),
+    interpolate(2, srgbByteToLinear),
+    interpolate(3, byteToNormalized),
+  ];
 };
+
+const applyMmdTextureColorLinear = (
+  baseColor: readonly [number, number, number],
+  texel: readonly [number, number, number],
+  multiplicative: readonly [number, number, number, number],
+  additive: readonly [number, number, number, number],
+): [number, number, number] => [0, 1, 2].map((channel) => {
+  const textureMul = 1 - multiplicative[3]
+    + texel[channel] * multiplicative[channel] * multiplicative[3];
+  const textureColor = Math.max(
+    0,
+    Math.min(1, textureMul + (textureMul - 1) * additive[3]),
+  ) + additive[channel];
+  return linearToSrgbByte(srgbToLinear(baseColor[channel]) * textureColor);
+}) as [number, number, number];
+
+export const applyMmdTextureColor = (
+  baseColor: readonly [number, number, number],
+  texel: readonly [number, number, number],
+  multiplicative: readonly [number, number, number, number],
+  additive: readonly [number, number, number, number] = [0, 0, 0, 0],
+): [number, number, number] => applyMmdTextureColorLinear(
+  baseColor,
+  [srgbToLinear(texel[0]), srgbToLinear(texel[1]), srgbToLinear(texel[2])],
+  multiplicative,
+  additive,
+);
 
 const materialSample = (
   mesh: NormalizedMesh,
@@ -335,15 +391,29 @@ const materialSample = (
 ) => {
   const material = mesh.materials[materialIndex] ?? mesh.materials[0];
   const texture = material.textureIndex >= 0 ? mesh.textures[material.textureIndex] : undefined;
-  const sampled: Rgba = texture ? sampleTexture(texture, transformUv(uv, material)) : [255, 255, 255, 255];
+  if (!texture) {
+    if (material.hasTexture || material.textureIndex >= 0) {
+      throw appError("error.snapshot.textureCaptureFailed", { material: material.name || materialIndex });
+    }
+    return {
+      rgb: [
+        normalizedToByte(material.baseColor[0]),
+        normalizedToByte(material.baseColor[1]),
+        normalizedToByte(material.baseColor[2]),
+      ] as [number, number, number],
+      alpha: material.baseColor[3],
+    };
+  }
+  const sampled = sampleTexture(texture, transformUv(uv, material));
   const factor = material.textureFactor;
-  const factorAlpha = Math.max(0, Math.min(1, factor[3]));
-  const rgb = [0, 1, 2].map((channel) => {
-    const texel = sampled[channel] / 255;
-    const textureMul = 1 - factorAlpha + texel * factor[channel] * factorAlpha;
-    return Math.round(Math.max(0, Math.min(1, material.baseColor[channel] * textureMul)) * 255);
-  }) as [number, number, number];
-  return { rgb, alpha: material.baseColor[3] * sampled[3] / 255 };
+  const additive = material.textureAdditiveFactor ?? [0, 0, 0, 0];
+  const rgb = applyMmdTextureColorLinear(
+    [material.baseColor[0], material.baseColor[1], material.baseColor[2]],
+    [sampled[0], sampled[1], sampled[2]],
+    factor,
+    additive,
+  );
+  return { rgb, alpha: material.baseColor[3] * sampled[3] };
 };
 
 const createVoxelKeyCodec = (

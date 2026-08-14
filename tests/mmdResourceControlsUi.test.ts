@@ -40,16 +40,39 @@ test("resource clearing is only exposed through the viewport trash dialog", () =
 
 test("physics is explicit, lazy, and settled before generation snapshots", () => {
   const app = readFileSync("src/App.tsx", "utf8");
+  const viewport = readFileSync("src/components/Viewport3D.tsx", "utf8");
   const model = readFileSync("src/core/mmdModel.ts", "utf8");
   const physics = readFileSync("src/core/mmdPhysics.ts", "utf8");
+  const threeRuntime = readFileSync("src/core/threeMmdRuntime.ts", "utf8");
+  const vanillaDriver = readFileSync("src/core/threeVanillaMmdDriver.ts", "utf8");
+  const babylonRuntime = readFileSync("src/core/babylonMmdRuntime.ts", "utf8");
 
   assert.match(app, /const \[physicsEnabled, setPhysicsEnabled\] = useState\(false\)/);
   assert.match(app, /await model\.setPhysicsEnabled\(enabled\)/);
-  assert.match(app, /setStageKey\("app\.stage\.capturePose"\);[\s\S]*if \(model\.physicsEnabled\(\)\) model\.updatePose\(currentMotionTimes\(\)\);[\s\S]*createMmdMeshSnapshot/);
+  assert.match(app, /setStageKey\("app\.stage\.capturePose"\);[\s\S]*if \(model\.physicsEnabled\(\)\) model\.updatePose\(currentMotionTimes\(\)\);[\s\S]*model\.createSnapshot\(/);
   assert.match(model, /physics: "external"/);
   assert.match(model, /model\.setAnimation\(emptyRuntimeAnimation\)/);
   assert.match(physics, /mmd_bullet\.js\?raw/);
   assert.match(physics, /mmd_bullet\.wasm\?url/);
+  const livePreview = app.match(/const advanceMotionPreview = useCallback\([\s\S]*?\n  \}, \[currentMotionTimes, motionRuntime\]\);/)?.[0] ?? "";
+  assert.match(livePreview, /computeMmdLivePhysicsDeltaSeconds/);
+  assert.match(livePreview, /model\.updateLivePose\(times, deltaSeconds\)/);
+  assert.doesNotMatch(livePreview, /model\.updatePose\(/);
+  assert.match(livePreview, /runtime\.clock\.startSeconds = runtime\.seconds;\s*runtime\.clock\.startedAt = now;/);
+  assert.match(app, /const hadPendingScrubCommit = motionScrubCommitTimerRef\.current !== null;[\s\S]*if \(playing\) \{\s*if \(hadPendingScrubCommit && model\.physicsEnabled\(\)\) \{\s*model\.updatePose\(currentMotionTimes\(\)\);/);
+  assert.match(threeRuntime, /updateLivePose: \(times, deltaSeconds\) => \{[\s\S]*evaluateFrame\(times, deltaSeconds, true\)/);
+  assert.match(threeRuntime, /updatePose: \(times\) => \{[\s\S]*settleFrame\(times\)/);
+  assert.match(vanillaDriver, /setLinearVelocity\?\.\(zero\)/);
+  assert.match(vanillaDriver, /setAngularVelocity\?\.\(zero\)/);
+  assert.match(vanillaDriver, /clearForces\?\.\(\)/);
+  assert.match(viewport, /sourceContent\.position\.set\(0, 0, 0\)/);
+  assert.match(viewport, /sourceContent\.scale\.setScalar\(1\)/);
+  assert.doesNotMatch(viewport, /sourceContent\.scale\.setScalar\(scale\)|targetSpan/);
+  assert.match(viewport, /new THREE\.Color\(\)\.setRGB\([\s\S]{0,180}THREE\.SRGBColorSpace/);
+  assert.match(babylonRuntime, /updateLivePose: \(times, deltaSeconds\) => \{\s*evaluate\(times, physicsEnabledState, deltaSeconds\)/);
+  assert.match(babylonRuntime, /updatePose: \(times\) => \{\s*evaluate\(times, physicsEnabledState\)/);
+  const babylonSnapshot = babylonRuntime.match(/createSnapshot: async \(options = \{\}\) => \{[\s\S]*?\n\s*\},\n\s*clearMotion:/)?.[0] ?? "";
+  assert.doesNotMatch(babylonSnapshot, /initializeMmdModelPhysics|beforePhysics\(/);
 });
 
 test("model resources expose collapsible parts with hidden entries first", () => {

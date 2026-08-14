@@ -3,17 +3,21 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { getBlockDefinition } from "../core/blockRegistry";
-import type { LoadedMmdModel } from "../core/mmdModel";
+import { isThreeMmdModel } from "../core/mmdRuntime";
+import type { LoadedMmdModel, ThreeMmdViewportSource } from "../core/mmdRuntime";
 import { createMmdFaceFrameSnapshot } from "../core/mmdSnapshot";
 import { useI18n } from "../i18n/I18nProvider";
 import type { CameraMode, MmdMotionTimes, PreviewMode, ProjectionResult } from "../types";
+import type { RendererViewportBinding } from "./rendererViewportTypes";
 
-interface Viewport3DProps {
+export interface Viewport3DProps {
   result: ProjectionResult | null;
   model: LoadedMmdModel | null;
   previewMode: PreviewMode;
-  targetHeight: number;
   modelLoading: boolean;
+  isPlaying?: boolean;
+  backendBusy?: boolean;
+  lifecycleBinding?: RendererViewportBinding;
   glow: number;
   nightMode: boolean;
   cameraMode: CameraMode;
@@ -29,8 +33,11 @@ interface Viewport3DProps {
   onPoseCommitted: () => void;
   onBeforeRender?: (now: number) => MmdMotionTimes | null;
   onAfterRender?: (now: number, evaluatedMotionTimes: MmdMotionTimes | null, gpuSynchronized: boolean) => void;
-  onReady?: () => void;
+  onReady?: (binding?: RendererViewportBinding) => void;
+  onUnmount?: (binding?: RendererViewportBinding) => void;
 }
+
+type ViewportThreeModel = LoadedMmdModel & ThreeMmdViewportSource;
 
 interface ViewportRuntime {
   mount: HTMLDivElement;
@@ -254,7 +261,7 @@ const disposePoseHelpers = (runtime: ViewportRuntime) => {
   runtime.markerBoneIndices = [];
 };
 
-const collectMarkerBoneIndices = (model: LoadedMmdModel) => {
+const collectMarkerBoneIndices = (model: ViewportThreeModel) => {
   const indices = new Set<number>();
   const skinIndex = model.mesh.geometry.getAttribute("skinIndex");
   const skinWeight = model.mesh.geometry.getAttribute("skinWeight");
@@ -286,7 +293,7 @@ const collectMarkerBoneIndices = (model: LoadedMmdModel) => {
 
 const refreshBoneMarkers = (
   runtime: ViewportRuntime,
-  model: LoadedMmdModel | null,
+  model: ViewportThreeModel | null,
   selectedBoneIndex: number | null,
 ) => {
   const markers = runtime.boneMarkers;
@@ -391,7 +398,7 @@ const fitCameraToBounds = (
 
 const focusCameraOnFace = (
   runtime: ViewportRuntime,
-  model: LoadedMmdModel,
+  model: ViewportThreeModel,
   result: ProjectionResult | null,
 ) => {
   const projectionFrame = runtime.activeMode === "hologram" ? result?.faceFrame : undefined;
@@ -491,10 +498,11 @@ const updateRendererSize = (
 
 export function Viewport3D({
   result,
-  model,
+  model: modelValue,
   previewMode,
-  targetHeight,
   modelLoading,
+  backendBusy = false,
+  isPlaying = false,
   glow,
   nightMode,
   cameraMode,
@@ -511,12 +519,17 @@ export function Viewport3D({
   onBeforeRender,
   onAfterRender,
   onReady,
+  onUnmount,
+  lifecycleBinding,
 }: Viewport3DProps) {
+  const model = modelValue && isThreeMmdModel(modelValue)
+    ? modelValue as ViewportThreeModel
+    : null;
   const { t } = useI18n();
   const mountRef = useRef<HTMLDivElement>(null);
   const runtimeRef = useRef<ViewportRuntime | null>(null);
   const modelRef = useRef(model);
-  const attachedModelRef = useRef<LoadedMmdModel | null>(null);
+  const attachedModelRef = useRef<ViewportThreeModel | null>(null);
   const resultRef = useRef(result);
   const poseEditingRef = useRef(poseEditing);
   const selectedBoneIndexRef = useRef(selectedBoneIndex);
@@ -524,6 +537,12 @@ export function Viewport3D({
   const onPoseCommittedRef = useRef(onPoseCommitted);
   const onBeforeRenderRef = useRef(onBeforeRender);
   const onAfterRenderRef = useRef(onAfterRender);
+  const onReadyRef = useRef(onReady);
+  const onUnmountRef = useRef(onUnmount);
+  const isPlayingRef = useRef(isPlaying);
+  const backendBusyRef = useRef(backendBusy);
+  const fallbackTimeRef = useRef(0);
+  const previousNowRef = useRef<number | null>(null);
 
   modelRef.current = model;
   resultRef.current = result;
@@ -533,10 +552,20 @@ export function Viewport3D({
   onPoseCommittedRef.current = onPoseCommitted;
   onBeforeRenderRef.current = onBeforeRender;
   onAfterRenderRef.current = onAfterRender;
+  onReadyRef.current = onReady;
+  onUnmountRef.current = onUnmount;
+  isPlayingRef.current = isPlaying;
+  backendBusyRef.current = backendBusy;
 
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
+    // Lifecycle acknowledgements belong to this mounted viewport instance;
+    // capture them so a later render cannot let an old cleanup resolve a new
+    // renderer transaction.
+    const readyCallback = onReadyRef.current;
+    const unmountCallback = onUnmountRef.current;
+    const instanceBinding = lifecycleBinding;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(DAY_BACKGROUND);
@@ -634,6 +663,7 @@ export function Viewport3D({
     };
     const selectBoneAtPointer = (event: PointerEvent) => {
       if (event.button !== 0 || transformControls.dragging || transformControls.axis) return;
+      if (backendBusyRef.current) return;
       const activeModel = modelRef.current;
       if (!poseEditingRef.current || runtime.activeMode !== "source" || !activeModel || !runtime.boneMarkers) return;
       updatePointer(event);
@@ -644,6 +674,7 @@ export function Viewport3D({
       onBoneSelectedRef.current(boneIndex);
     };
     const beginTransform = () => {
+      if (backendBusyRef.current) return;
       const activeModel = modelRef.current;
       const boneIndex = selectedBoneIndexRef.current;
       if (!activeModel || boneIndex === null) return;
@@ -651,6 +682,7 @@ export function Viewport3D({
       controls.enabled = false;
     };
     const updateTransform = () => {
+      if (backendBusyRef.current) return;
       const activeModel = modelRef.current;
       const boneIndex = selectedBoneIndexRef.current;
       if (!activeModel || boneIndex === null) return;
@@ -662,9 +694,10 @@ export function Viewport3D({
       refreshBoneMarkers(runtime, activeModel, boneIndex);
     };
     const commitTransform = () => {
+      controls.enabled = true;
+      if (backendBusyRef.current) return;
       const activeModel = modelRef.current;
       const boneIndex = selectedBoneIndexRef.current;
-      controls.enabled = true;
       if (!activeModel || boneIndex === null) return;
       if (activeModel.endBoneEdit(boneIndex)) onPoseCommittedRef.current();
     };
@@ -673,8 +706,22 @@ export function Viewport3D({
     transformControls.addEventListener("objectChange", updateTransform);
     transformControls.addEventListener("mouseUp", commitTransform);
 
+    let disposed = false;
+    let readyNotified = false;
     const animate = (now: number) => {
-      const evaluatedMotionTimes = onBeforeRenderRef.current?.(now) ?? null;
+      if (disposed) return;
+      const previous = previousNowRef.current;
+      previousNowRef.current = now;
+      const delta = previous === null ? 0 : Math.max(0, Math.min(0.1, (now - previous) / 1000));
+      let evaluatedMotionTimes = onBeforeRenderRef.current?.(now) ?? null;
+      if (!onBeforeRenderRef.current && isPlayingRef.current && modelRef.current) {
+        fallbackTimeRef.current += delta;
+        evaluatedMotionTimes = {
+          dance: fallbackTimeRef.current,
+          expression: fallbackTimeRef.current,
+        };
+        modelRef.current.updatePreviewPose(evaluatedMotionTimes);
+      }
       controls.update();
       if (poseEditingRef.current && runtime.activeMode === "source") {
         refreshBoneMarkers(runtime, modelRef.current, selectedBoneIndexRef.current);
@@ -684,8 +731,16 @@ export function Viewport3D({
         __MELY_E2E_GPU_PROBE__?: boolean;
       }).__MELY_E2E_GPU_PROBE__);
       if (gpuSynchronized) renderer.getContext().finish();
+      if (!readyNotified) {
+        readyNotified = true;
+        try {
+          readyCallback?.(instanceBinding);
+        } catch {
+          // A host readiness callback must not stop the render loop.
+        }
+      }
       onAfterRenderRef.current?.(performance.now(), evaluatedMotionTimes, gpuSynchronized);
-      runtime.animationFrame = requestAnimationFrame(animate);
+      if (!disposed) runtime.animationFrame = requestAnimationFrame(animate);
     };
     runtime.animationFrame = requestAnimationFrame(animate);
 
@@ -698,28 +753,52 @@ export function Viewport3D({
       updateRendererSize(renderer, width, height);
     });
     resizeObserver.observe(mount);
-    onReady?.();
-
     return () => {
-      resizeObserver.disconnect();
-      cancelAnimationFrame(runtime.animationFrame);
-      renderer.domElement.removeEventListener("pointerdown", selectBoneAtPointer);
-      transformControls.removeEventListener("mouseDown", beginTransform);
-      transformControls.removeEventListener("objectChange", updateTransform);
-      transformControls.removeEventListener("mouseUp", commitTransform);
-      disposePoseHelpers(runtime);
-      scene.remove(transformControls.getHelper());
-      transformControls.dispose();
-      controls.dispose();
-      sourceContent.clear();
-      disposeGeneratedContent(hologramContent);
-      grid.geometry.dispose();
-      (grid.material as THREE.Material).dispose();
-      bounds.geometry.dispose();
-      boundsMaterials.forEach((material) => material.dispose());
-      renderer.dispose();
-      renderer.domElement.remove();
-      runtimeRef.current = null;
+      disposed = true;
+      const attempt = (cleanup: () => void) => {
+        try {
+          cleanup();
+        } catch {
+          // Cleanup is best effort; all remaining releases must still run.
+        }
+      };
+      try {
+        attempt(() => resizeObserver.disconnect());
+        attempt(() => cancelAnimationFrame(runtime.animationFrame));
+        attempt(() => renderer.domElement.removeEventListener("pointerdown", selectBoneAtPointer));
+        attempt(() => transformControls.removeEventListener("mouseDown", beginTransform));
+        attempt(() => transformControls.removeEventListener("objectChange", updateTransform));
+        attempt(() => transformControls.removeEventListener("mouseUp", commitTransform));
+        attempt(() => disposePoseHelpers(runtime));
+        attempt(() => scene.remove(transformControls.getHelper()));
+        attempt(() => transformControls.dispose());
+        attempt(() => controls.dispose());
+        attempt(() => sourceContent.clear());
+        attempt(() => disposeGeneratedContent(hologramContent));
+        attempt(() => grid.geometry.dispose());
+        attempt(() => (grid.material as THREE.Material).dispose());
+        attempt(() => bounds.geometry.dispose());
+        attempt(() => boundsMaterials.forEach((material) => material.dispose()));
+        // Explicitly ask the browser to release the WebGL context before a
+        // different renderer is mounted. This matters when users switch from
+        // one MMD backend to another in the same viewport element.
+        attempt(() => renderer.forceContextLoss());
+        attempt(() => renderer.dispose());
+        attempt(() => renderer.domElement.remove());
+        // A delayed cleanup from an older viewport must not remove a canvas
+        // that a replacement renderer has already mounted in this container.
+        attempt(() => {
+          if (mount.childElementCount === 0) mount.replaceChildren();
+        });
+      } finally {
+        runtimeRef.current = null;
+        previousNowRef.current = null;
+        try {
+          unmountCallback?.(instanceBinding);
+        } catch {
+          // Acknowledgement errors must not escape React's cleanup phase.
+        }
+      }
     };
   }, []);
 
@@ -800,16 +879,10 @@ export function Viewport3D({
       refreshActiveScene(runtime, previewMode, showBounds, previewMode === "source");
       return;
     }
-    const rawSize = rawBounds.getSize(new THREE.Vector3());
-    const rawCenter = rawBounds.getCenter(new THREE.Vector3());
-    const targetSpan = Math.max(1, Math.round(targetHeight) - 1);
-    const scale = targetSpan / Math.max(rawSize.y, 0.001);
-    runtime.sourceContent.scale.setScalar(scale);
-    runtime.sourceContent.position.set(-rawCenter.x * scale, -rawBounds.min.y * scale, -rawCenter.z * scale);
     runtime.sourceContent.updateMatrixWorld(true);
     runtime.sourceBounds.copy(rawBounds).applyMatrix4(model.root.matrixWorld);
     refreshActiveScene(runtime, previewMode, showBounds, previewMode === "source");
-  }, [model, partsRevision, previewMode, showBounds, targetHeight]);
+  }, [model, partsRevision, previewMode, showBounds]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;
@@ -903,7 +976,12 @@ export function Viewport3D({
       const meshes = result.palette.map((entry, paletteIndex) => {
         const [red, green, blue] = entry.color;
         const material = new THREE.MeshStandardMaterial({
-          color: new THREE.Color(red / 255, green / 255, blue / 255),
+          color: new THREE.Color().setRGB(
+            red / 255,
+            green / 255,
+            blue / 255,
+            THREE.SRGBColorSpace,
+          ),
           roughness: 0.82,
           metalness: entry.blockId.includes("iron_block") ? 0.18 : 0,
         });

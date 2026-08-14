@@ -4,8 +4,10 @@ import { DefaultMmdRuntime } from "@yohawing/three-mmd-loader";
 import * as THREE from "three";
 import { parseMelyPoseJson, stringifyMelyPose } from "../src/core/melyPose";
 import { createMmdPoseController } from "../src/core/mmdPose";
-import { createMmdMeshSnapshot } from "../src/core/mmdSnapshot";
-import type { LoadedMmdModel } from "../src/core/mmdModel";
+import {
+  createMmdMeshSnapshot,
+  type ThreeMmdSnapshotSource,
+} from "../src/core/mmdSnapshot";
 
 const createRig = () => {
   const geometry = new THREE.BufferGeometry();
@@ -58,7 +60,7 @@ const createRig = () => {
     mesh,
     root,
     arm,
-    model: { root: modelRoot, mesh } as unknown as LoadedMmdModel,
+    model: { root: modelRoot, mesh } satisfies ThreeMmdSnapshotSource,
   };
 };
 

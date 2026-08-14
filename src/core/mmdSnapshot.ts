@@ -1,5 +1,6 @@
 import * as THREE from "three";
-import { isSuggestedEmissiveMaterial, type LoadedMmdModel } from "./mmdModel";
+import { isSuggestedEmissiveMaterial } from "./mmdModel";
+import type { MmdSnapshotOptions } from "./mmdRuntime";
 import type {
   FaceFrameSnapshot,
   MeshMaterialSnapshot,
@@ -11,12 +12,9 @@ import { appError } from "./appError";
 type FourNumbers = [number, number, number, number];
 type FourMatrices = [THREE.Matrix4, THREE.Matrix4, THREE.Matrix4, THREE.Matrix4];
 
-interface MmdSnapshotOptions {
-  onProgress?: (progress: number) => void;
-  isCancelled?: () => boolean;
-  includeTextures?: boolean;
-  textureMaxEdge?: number;
-  textureByteBudget?: number;
+export interface ThreeMmdSnapshotSource {
+  root: THREE.Group;
+  mesh: THREE.SkinnedMesh;
 }
 
 const SNAPSHOT_CHUNK_SIZE = 12_000;
@@ -87,7 +85,7 @@ const orthogonalize = (
 };
 
 export const createMmdFaceFrameSnapshot = (
-  model: LoadedMmdModel,
+  model: ThreeMmdSnapshotSource,
 ): FaceFrameSnapshot | undefined => {
   const bones = model.mesh.skeleton.bones;
   const boneInverses = model.mesh.skeleton.boneInverses;
@@ -369,6 +367,7 @@ const captureTexture = (
 
 const readMaterialSnapshot = (
   material: THREE.Material,
+  hasTexture: boolean,
   textureIndex: number,
 ): MeshMaterialSnapshot => {
   const metadata = material.userData.mmdMaterial as {
@@ -384,22 +383,49 @@ const readMaterialSnapshot = (
     ambient?: number[];
     emissive?: number[];
   } | undefined;
-  const diffuse = state?.diffuse ?? metadata?.diffuse;
-  const materialColor = (material as THREE.Material & { color?: THREE.Color }).color;
-  const fallbackColor = materialColor
-    ? materialColor.clone().convertLinearToSRGB()
-    : new THREE.Color(1, 1, 1);
-  const baseColor: [number, number, number, number] = diffuse && diffuse.length >= 4
-    ? [diffuse[0], diffuse[1], diffuse[2], diffuse[3]]
-    : [fallbackColor.r, fallbackColor.g, fallbackColor.b, material.opacity];
+  const liveMaterial = material as THREE.Material & {
+    isMMDMaterial?: boolean;
+    color?: THREE.Color;
+    ambient?: THREE.Color;
+    textureMultiplicativeColor?: THREE.Vector4;
+    textureAdditiveColor?: THREE.Vector4;
+  };
+  const stateDiffuse = state?.diffuse;
+  const isMoeruMaterial = liveMaterial.isMMDMaterial === true;
+  const liveColor = liveMaterial.color?.clone().convertLinearToSRGB();
+  const metadataDiffuse = metadata?.diffuse;
+  const baseColor: [number, number, number, number] = stateDiffuse && stateDiffuse.length >= 4
+    ? [stateDiffuse[0], stateDiffuse[1], stateDiffuse[2], stateDiffuse[3]]
+    : isMoeruMaterial && liveColor
+      ? [liveColor.r, liveColor.g, liveColor.b, material.opacity]
+      : metadataDiffuse && metadataDiffuse.length >= 4
+        ? [metadataDiffuse[0], metadataDiffuse[1], metadataDiffuse[2], metadataDiffuse[3]]
+        : liveColor
+          ? [liveColor.r, liveColor.g, liveColor.b, material.opacity]
+          : [1, 1, 1, material.opacity];
   const factor = state?.textureFactor;
+  const liveMultiplicative = liveMaterial.textureMultiplicativeColor;
   const textureFactor: [number, number, number, number] = factor && factor.length >= 4
     ? [factor[0], factor[1], factor[2], factor[3]]
+    : liveMultiplicative
+      ? [liveMultiplicative.x, liveMultiplicative.y, liveMultiplicative.z, liveMultiplicative.w]
     : [1, 1, 1, 1];
-  const ambientSource = state?.ambient ?? metadata?.ambient;
+  const liveAdditive = liveMaterial.textureAdditiveColor;
+  const textureAdditiveFactor: [number, number, number, number] = liveAdditive
+    ? [liveAdditive.x, liveAdditive.y, liveAdditive.z, liveAdditive.w]
+    : [0, 0, 0, 0];
+  const ambientSource = state?.ambient;
+  const liveAmbient = liveMaterial.ambient?.clone().convertLinearToSRGB();
+  const metadataAmbient = metadata?.ambient;
   const ambient: [number, number, number] = ambientSource && ambientSource.length >= 3
     ? [ambientSource[0], ambientSource[1], ambientSource[2]]
-    : [0, 0, 0];
+    : isMoeruMaterial && liveAmbient
+      ? [liveAmbient.r, liveAmbient.g, liveAmbient.b]
+      : metadataAmbient && metadataAmbient.length >= 3
+        ? [metadataAmbient[0], metadataAmbient[1], metadataAmbient[2]]
+        : liveAmbient
+          ? [liveAmbient.r, liveAmbient.g, liveAmbient.b]
+          : [0, 0, 0];
   const name = metadata?.name || material.name || "";
   const englishName = metadata?.englishName || "";
   const map = "map" in material && material.map instanceof THREE.Texture ? material.map : null;
@@ -410,6 +436,8 @@ const readMaterialSnapshot = (
     englishName,
     baseColor,
     textureFactor,
+    textureAdditiveFactor,
+    hasTexture,
     textureIndex,
     textureMatrix: [
       matrix[0], matrix[1], matrix[2],
@@ -437,14 +465,14 @@ const captureMaterials = (
   const textureIndices = new Map<string, number>();
   const textures: MeshTextureSnapshot[] = [];
   let capturedTextureBytes = 0;
-  const materials = materialList.map((material) => {
+  const materials = materialList.map((material, materialIndex) => {
     const map = "map" in material && material.map instanceof THREE.Texture ? material.map : null;
     let textureIndex = -1;
-    if (map && materialIsVisible(material) && capturedTextureBytes < textureByteBudget) {
+    if (map && materialIsVisible(material)) {
       const cached = textureIndices.get(map.uuid);
       if (cached !== undefined) {
         textureIndex = cached;
-      } else {
+      } else if (capturedTextureBytes < textureByteBudget) {
         const captured = captureTexture(
           map,
           maxTextureEdge,
@@ -458,7 +486,13 @@ const captureMaterials = (
         }
       }
     }
-    return readMaterialSnapshot(material, textureIndex);
+    if (map && materialIsVisible(material) && textureIndex < 0) {
+      const metadata = material.userData.mmdMaterial as { name?: string } | undefined;
+      throw appError("error.snapshot.textureCaptureFailed", {
+        material: metadata?.name || material.name || materialIndex,
+      });
+    }
+    return readMaterialSnapshot(material, map !== null, textureIndex);
   });
   return { materials, textures };
 };
@@ -519,7 +553,7 @@ const morphMeshForVertex = (
 };
 
 export const createMmdMeshSnapshot = async (
-  model: LoadedMmdModel,
+  model: ThreeMmdSnapshotSource,
   options: MmdSnapshotOptions = {},
 ): Promise<MmdMeshSnapshot> => {
   const { computeMmdSdefSkinnedPosition, computeQdefSkinnedPosition } = await import(
@@ -530,10 +564,14 @@ export const createMmdMeshSnapshot = async (
   const position = geometry.getAttribute("position");
   const skinIndex = geometry.getAttribute("skinIndex");
   const skinWeight = geometry.getAttribute("skinWeight");
-  const sdefEnabled = geometry.getAttribute("matricesSdefEnabled");
-  const sdefC = geometry.getAttribute("matricesSdefC");
-  const sdefRW0 = geometry.getAttribute("matricesSdefRW0");
-  const sdefRW1 = geometry.getAttribute("matricesSdefRW1");
+  const sdefEnabled = geometry.getAttribute("matricesSdefEnabled")
+    ?? geometry.getAttribute("mmdSdefMask");
+  const sdefC = geometry.getAttribute("matricesSdefC")
+    ?? geometry.getAttribute("mmdSdefC");
+  const sdefRW0 = geometry.getAttribute("matricesSdefRW0")
+    ?? geometry.getAttribute("mmdSdefRW0");
+  const sdefRW1 = geometry.getAttribute("matricesSdefRW1")
+    ?? geometry.getAttribute("mmdSdefRW1");
   const qdefEnabled = geometry.getAttribute("matricesQdefEnabled");
   const triangles = collectVisibleTriangles(mesh);
   const sourceVertexIndices = triangles.sourceVertexIndices;

@@ -382,7 +382,7 @@ test("preview evaluation synchronizes renderer-facing bones without CPU skinning
   skeleton.update = () => { skeletonUpdates += 1; };
   const runtime = {
     captureDebugStage: () => { debugCaptures += 1; },
-    tick() {
+    tick(_seconds: number) {
       this.captureDebugStage();
       mesh.updateMatrixWorld(true);
       skeleton.update();

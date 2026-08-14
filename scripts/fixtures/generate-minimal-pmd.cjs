@@ -173,6 +173,7 @@ const createMinimalPmd = (options = {}) => {
     uint32(activeBones.length),
     ...activeBones.flatMap((_bone, index) => [uint16(index), uint8(1)]),
     uint8(0),
+    ...Array.from({ length: 10 }, () => fixedAscii("", 100)),
     uint32(0),
     uint32(0),
   ]));

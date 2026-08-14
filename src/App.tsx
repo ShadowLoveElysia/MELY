@@ -22,7 +22,7 @@ import {
   Trash2,
   UserRound,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { MathUtils, Vector3 } from "three";
 import { IconButton } from "./components/IconButton";
@@ -33,7 +33,7 @@ import {
 } from "./components/MotionTimeline";
 import { Sidebar, type ImportedAsset } from "./components/Sidebar";
 import { SurvivalTools, type SurvivalToolsLabels } from "./components/SurvivalTools";
-import { Viewport3D } from "./components/Viewport3D";
+import { RendererViewport } from "./components/RendererViewport";
 import { Windows } from "./components/Windows";
 import { appError, errorDescriptor } from "./core/appError";
 import {
@@ -54,7 +54,13 @@ import type {
   MmdModelCandidate,
   MmdMotionCandidateTracks,
 } from "./core/mmdAssets";
-import type { LoadedMmdModel } from "./core/mmdModel";
+import { loadMmdModelForRenderer } from "./core/mmdRendererFactory";
+import {
+  computeMmdLivePhysicsDeltaSeconds,
+  type LoadedMmdModel,
+  type MmdPoseTransferState,
+  type MmdRendererMode,
+} from "./core/mmdRuntime";
 import {
   areMotionTracksReadyForGeneration,
   canToggleMotionPlayback,
@@ -260,6 +266,39 @@ interface MotionTrackRuntime {
   };
 }
 
+interface ActiveMmdSource {
+  files: File[];
+  modelFile: File;
+  modelPath: string;
+  rendererMode: MmdRendererMode;
+}
+
+interface MmdRuntimeRestoreState {
+  poseTransfer: MmdPoseTransferState | null;
+  hiddenMaterialIndices: readonly number[];
+  motionPaths: Record<MmdMotionTrackKind, string>;
+  motionTimes: MmdMotionTimes;
+  lockedFrames: Record<MmdMotionTrackKind, number | null>;
+  playing: Record<MmdMotionTrackKind, boolean>;
+  selectedBoneIndex: number | null;
+  poseEditing: boolean;
+  physicsEnabled: boolean;
+}
+
+interface ViewportBinding {
+  generation: number;
+  modelId: string;
+}
+
+interface ViewportLifecycleWaiter {
+  generation: number;
+  modelId: string;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+  timer: number;
+  promise: Promise<void>;
+}
+
 const createMotionTrackRuntime = (): MotionTrackRuntime => ({
   seconds: 0,
   timeStore: createMotionTimeStore(),
@@ -332,23 +371,7 @@ const saveBinaryFile = async (
 const yieldToBrowser = () => new Promise<void>((resolve) => window.setTimeout(resolve, 0));
 
 const textureByteEstimate = (model: LoadedMmdModel | null) => {
-  if (!model) return 0;
-  const seen = new Set<string>();
-  let bytes = 0;
-  const materials = Array.isArray(model.mesh.material) ? model.mesh.material : [model.mesh.material];
-  for (const material of materials) {
-    if (!material.visible || material.opacity <= 0.01) continue;
-    const map = (material as typeof material & { map?: import("three").Texture | null }).map;
-    if (!map || seen.has(map.uuid)) continue;
-    seen.add(map.uuid);
-    const image = map.source.data ?? map.image;
-    if (!image || typeof image !== "object") continue;
-    const dimensions = image as { width?: number; height?: number; naturalWidth?: number; naturalHeight?: number };
-    const width = dimensions.naturalWidth ?? dimensions.width ?? 0;
-    const height = dimensions.naturalHeight ?? dimensions.height ?? 0;
-    bytes += Math.max(0, width) * Math.max(0, height) * 4;
-  }
-  return bytes;
+  return model?.textureByteEstimate() ?? 0;
 };
 
 const buildSurvivalLabels = (
@@ -430,7 +453,6 @@ const estimateModelDimensions = (
   targetHeight: number,
 ): [number, number, number] => {
   if (!model) return [Math.max(1, Math.round(targetHeight * 0.45)), targetHeight, Math.max(1, Math.round(targetHeight * 0.3))];
-  model.root.updateMatrixWorld(true);
   const bounds = model.visibleBounds();
   if (bounds.isEmpty()) return [1, Math.max(1, Math.round(targetHeight)), 1];
   const size = bounds.getSize(new Vector3());
@@ -487,8 +509,25 @@ export default function App() {
   const modelLoadRequestRef = useRef<string>("");
   const modelRef = useRef<LoadedMmdModel | null>(null);
   const modelReleaseRef = useRef<Promise<void>>(Promise.resolve());
+  // Holds a lease for the active or in-flight renderer model. A new backend
+  // cannot allocate a context until the previous lease is disposed.
+  const rendererLeaseRef = useRef<Promise<void>>(Promise.resolve());
+  const viewportUnmountPromiseRef = useRef<Promise<void> | null>(null);
+  const viewportUnmountWaiterRef = useRef<ViewportLifecycleWaiter | null>(null);
+  // React StrictMode may run an effect cleanup as a development probe. Keep a
+  // binding-level request marker so only an unmount explicitly requested by a
+  // renderer transaction can advance the release handshake.
+  const viewportUnmountRequestRef = useRef<ViewportBinding | null>(null);
+  const viewportReadyWaiterRef = useRef<ViewportLifecycleWaiter | null>(null);
+  const viewportGenerationRef = useRef(0);
+  const activeViewportRef = useRef<{ generation: number; modelId: string } | null>(null);
+  const readyViewportRef = useRef<{ generation: number; modelId: string } | null>(null);
+  const backendOperationRef = useRef<string | null>(null);
+  const rendererSwitchOwnerRef = useRef<string | null>(null);
+  const rendererSwitchingRef = useRef(false);
   const addAssetsRef = useRef<(files: File[]) => void | Promise<void>>(() => undefined);
   const expandedAssetsRef = useRef<File[]>([]);
+  const activeMmdSourceRef = useRef<ActiveMmdSource | null>(null);
   const projectionDocumentRef = useRef<{
     result: ProjectionResult;
     document: ProjectionDocument;
@@ -502,6 +541,7 @@ export default function App() {
   }
   const motionRuntime = motionRuntimeRef.current;
   const motionScrubCommitTimerRef = useRef<number | null>(null);
+  const lastLivePhysicsFrameRef = useRef<number | null>(null);
   const sidebarResizeCleanupRef = useRef<(() => void) | null>(null);
   const lockedMotionFramesRef = useRef(emptyLockedMotionFrames());
   const [options, setOptions] = useState(initialOptions);
@@ -514,6 +554,14 @@ export default function App() {
   const [motionCandidates, setMotionCandidates] = useState<MmdMotionCandidateTracks>(emptyMotionCandidateTracks);
   const [selectedMotionPaths, setSelectedMotionPaths] = useState(emptySelectedMotionPaths);
   const [mmdModel, setMmdModel] = useState<LoadedMmdModel | null>(null);
+  const [renderMode, setRenderMode] = useState<MmdRendererMode>("vanilla");
+  const renderModeRef = useRef<MmdRendererMode>("vanilla");
+  renderModeRef.current = renderMode;
+  const [viewportMounted, setViewportMounted] = useState(false);
+  const viewportMountedRef = useRef(false);
+  viewportMountedRef.current = viewportMounted;
+  const [viewportBinding, setViewportBinding] = useState<ViewportBinding | null>(null);
+  const [viewportReadyBinding, setViewportReadyBinding] = useState<ViewportBinding | null>(null);
   const [motionTracks, setMotionTracks] = useState<MmdMotionTracks>(emptyMotionTracks);
   const [lockedMotionFrames, setLockedMotionFrames] = useState(emptyLockedMotionFrames);
   const [poseRevision, setPoseRevision] = useState(0);
@@ -522,6 +570,10 @@ export default function App() {
   const [selectedBoneIndex, setSelectedBoneIndex] = useState<number | null>(null);
   const [poseState, setPoseState] = useState<MmdPoseState>(emptyPoseState);
   const [modelLoading, setModelLoading] = useState(false);
+  // Expose the ref-backed operation mutex to viewport input handlers. Ref
+  // writes alone do not trigger a render, so the mirror keeps transform
+  // controls from mutating a model during an async backend operation.
+  const [backendOperationBusy, setBackendOperationBusy] = useState(false);
   const [modelLoadStageKey, setModelLoadStageKey] = useState<AppStageKey>("app.stage.prepareModel");
   const [progress, setProgress] = useState(0);
   const [stageKey, setStageKey] = useState<AppStageKey | WorkerStageKey>("app.stage.prepareGeneration");
@@ -559,6 +611,24 @@ export default function App() {
   const [resetToken, setResetToken] = useState(0);
   const [focusFaceToken, setFocusFaceToken] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
+
+  const acquireBackendOperation = useCallback(() => {
+    if (backendOperationRef.current) return null;
+    const operationId = crypto.randomUUID();
+    backendOperationRef.current = operationId;
+    setBackendOperationBusy(true);
+    return operationId;
+  }, []);
+
+  const releaseBackendOperation = useCallback((operationId: string) => {
+    if (backendOperationRef.current !== operationId) return;
+    backendOperationRef.current = null;
+    setBackendOperationBusy(false);
+  }, []);
+
+  const ownsBackendOperation = useCallback((operationId: string) => (
+    backendOperationRef.current === operationId
+  ), []);
 
   MOTION_TRACK_KINDS.forEach((kind) => {
     motionRuntime[kind].info = motionTracks[kind];
@@ -645,8 +715,11 @@ export default function App() {
       const timer = motionRuntime[kind].uiPublishTimer;
       if (timer !== null) window.clearTimeout(timer);
     });
-    modelRef.current?.dispose();
+    const model = modelRef.current;
     modelRef.current = null;
+    if (model) {
+      modelReleaseRef.current = Promise.resolve(model.dispose()).catch(() => undefined);
+    }
   }, [motionRuntime]);
 
   const invalidateProjection = useCallback((reason = "settings") => {
@@ -663,9 +736,17 @@ export default function App() {
 
   const commitMotionScrub = useCallback(() => {
     motionScrubCommitTimerRef.current = null;
+    const model = modelRef.current;
+    if (!backendOperationRef.current && model?.physicsEnabled()) {
+      model.updatePose({
+        dance: motionRuntime.dance.seconds,
+        expression: motionRuntime.expression.seconds,
+      });
+      lastLivePhysicsFrameRef.current = null;
+    }
     invalidatePoseProjection();
     setPoseRevision((value) => value + 1);
-  }, [invalidatePoseProjection]);
+  }, [invalidatePoseProjection, motionRuntime]);
 
   const scheduleMotionScrubCommit = useCallback(() => {
     if (motionScrubCommitTimerRef.current !== null) {
@@ -680,6 +761,7 @@ export default function App() {
   }), [motionRuntime]);
 
   const stopAllMotionPlayback = useCallback(() => {
+    lastLivePhysicsFrameRef.current = null;
     MOTION_TRACK_KINDS.forEach((kind) => {
       const runtime = motionRuntime[kind];
       runtime.playing = false;
@@ -727,11 +809,27 @@ export default function App() {
   }, [motionRuntime, publishMotionSeconds]);
 
   const advanceMotionPreview = useCallback((now: number) => {
+    // Snapshotting, physics toggles and renderer transitions may yield while
+    // retaining the active model. Do not let the shared RAF mutate that model
+    // until the owning backend operation has released its lease.
+    if (backendOperationRef.current) {
+      // Keep active playback clocks frozen while the backend is reserved. The
+      // next frame after release therefore resumes from the same timeline
+      // position instead of jumping by the operation duration.
+      MOTION_TRACK_KINDS.forEach((kind) => {
+        const runtime = motionRuntime[kind];
+        if (!runtime.playing) return;
+        runtime.clock.startSeconds = runtime.seconds;
+        runtime.clock.startedAt = now;
+      });
+      lastLivePhysicsFrameRef.current = now;
+      return null;
+    }
     const model = modelRef.current;
     if (!model || !MOTION_TRACK_KINDS.some((kind) => motionRuntime[kind].info)) return null;
 
     let evaluated = false;
-    let settlePhysics = false;
+    let livePlaybackEvaluated = false;
     MOTION_TRACK_KINDS.forEach((kind) => {
       const runtime = motionRuntime[kind];
       const motion = runtime.info;
@@ -741,13 +839,13 @@ export default function App() {
         runtime.pendingSeconds = null;
         runtime.renderedUiSeconds = runtime.seconds;
         evaluated = true;
-        settlePhysics = true;
         return;
       }
       if (!runtime.playing || motion.durationSeconds <= 0) return;
       runtime.seconds = (
         runtime.clock.startSeconds + Math.max(0, now - runtime.clock.startedAt) / 1000
       ) % motion.durationSeconds;
+      livePlaybackEvaluated = true;
       const displayedFrame = Math.round(runtime.seconds * motion.frameRate);
       if (displayedFrame !== runtime.clock.lastUiFrame) {
         runtime.clock.lastUiFrame = displayedFrame;
@@ -757,8 +855,21 @@ export default function App() {
     });
     if (!evaluated) return null;
     const times = currentMotionTimes();
-    if (settlePhysics && model.physicsEnabled()) model.updatePose(times);
-    else model.updatePreviewPose(times);
+    // Keep the active renderer's physics solver in the live playback path.
+    // `updatePreviewPose` intentionally skips physics in all three backends;
+    // using it while physics is enabled would make clothing/body collisions
+    // disappear during playback and only reappear after a scrub or snapshot.
+    if (model.physicsEnabled() && livePlaybackEvaluated) {
+      const deltaSeconds = computeMmdLivePhysicsDeltaSeconds(
+        now,
+        lastLivePhysicsFrameRef.current,
+      );
+      lastLivePhysicsFrameRef.current = now;
+      model.updateLivePose(times, deltaSeconds);
+    } else {
+      lastLivePhysicsFrameRef.current = null;
+      model.updatePreviewPose(times);
+    }
     return times;
   }, [currentMotionTimes, motionRuntime]);
 
@@ -862,31 +973,41 @@ export default function App() {
       }));
       return;
     }
+    // Generation reads and mutates the active renderer while capturing the
+    // snapshot. Keep the same backend lease used by model/renderer changes so
+    // a programmatic switch cannot dispose the model between those steps.
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     const jobId = crypto.randomUUID();
-    currentJobRef.current = jobId;
-    workerLifecycle.start(jobId);
-    clearProjectionArtifacts();
-    setPreviewMode("source");
-    setProcessing(true);
-    setExportCurrentFile("");
-    setProgress(0.04);
-    setStageKey("app.stage.createJob");
 
     try {
+      currentJobRef.current = jobId;
+      workerLifecycle.start(jobId);
+      clearProjectionArtifacts();
+      setPreviewMode("source");
+      setProcessing(true);
+      setExportCurrentFile("");
+      setProgress(0.04);
+      setStageKey("app.stage.createJob");
       setStageKey("app.stage.capturePose");
+      if (modelRef.current !== model) {
+        workerLifecycle.cancel();
+        setProcessing(false);
+        return;
+      }
       if (model.physicsEnabled()) model.updatePose(currentMotionTimes());
       const includeTextures = mode === "solid";
-      const { createMmdMeshSnapshot, releaseMmdMeshSnapshot } = await import("./core/mmdSnapshot");
-      const snapshot = await createMmdMeshSnapshot(model, {
+      const { releaseMmdMeshSnapshot } = await import("./core/mmdSnapshot");
+      const snapshot = await model.createSnapshot({
         includeTextures,
-        isCancelled: () => !workerLifecycle.isCurrent(jobId),
+        isCancelled: () => !workerLifecycle.isCurrent(jobId) || modelRef.current !== model,
         onProgress: (value) => {
-          if (!workerLifecycle.isCurrent(jobId)) return;
+          if (!workerLifecycle.isCurrent(jobId) || modelRef.current !== model) return;
           setProgress(0.04 + value * 0.12);
         },
       });
       try {
-        if (!workerLifecycle.isCurrent(jobId)) return;
+        if (!workerLifecycle.isCurrent(jobId) || modelRef.current !== model) return;
         const command: WorkerCommand = mode === "solid"
           ? {
               type: "GENERATE_SOLID",
@@ -905,13 +1026,19 @@ export default function App() {
         releaseMmdMeshSnapshot(snapshot);
       }
     } catch (error) {
-      if (currentJobRef.current !== jobId || (error instanceof Error && error.name === "AbortError")) return;
+      if (
+        currentJobRef.current !== jobId
+        || modelRef.current !== model
+        || (error instanceof Error && error.name === "AbortError")
+      ) return;
       workerLifecycle.cancel();
       setProcessing(false);
       setPreviewMode("source");
       setToast(t("toast.generationFailed", { reason: localizeError(error) }));
+    } finally {
+      releaseBackendOperation(operationId);
     }
-  }, [clearProjectionArtifacts, currentMotionTimes, localizeError, t]);
+  }, [acquireBackendOperation, clearProjectionArtifacts, currentMotionTimes, localizeError, releaseBackendOperation, t]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1023,8 +1150,241 @@ export default function App() {
     setGenerationMode(mode);
   };
 
-  const releaseCurrentModel = useCallback(async () => {
+  const captureMmdRuntimeRestoreState = useCallback((
+    model: LoadedMmdModel,
+  ): MmdRuntimeRestoreState => ({
+    poseTransfer: model.exportPoseTransferState(),
+    hiddenMaterialIndices: [...hiddenMaterialIndicesRef.current],
+    motionPaths: { ...selectedMotionPaths },
+    motionTimes: currentMotionTimes(),
+    lockedFrames: { ...lockedMotionFrames },
+    playing: Object.fromEntries(MOTION_TRACK_KINDS.map((kind) => [kind, motionRuntime[kind].playing])) as Record<MmdMotionTrackKind, boolean>,
+    selectedBoneIndex,
+    poseEditing,
+    physicsEnabled: model.physicsEnabled(),
+  }), [currentMotionTimes, lockedMotionFrames, motionRuntime, poseEditing, selectedBoneIndex, selectedMotionPaths]);
+
+  const loadRendererModelWithLease = useCallback(async (
+    mode: MmdRendererMode,
+    files: readonly File[],
+    modelFile: File,
+  ): Promise<LoadedMmdModel> => {
+    const previousLease = rendererLeaseRef.current.catch(() => undefined);
+    let releaseLease!: () => void;
+    const lease = new Promise<void>((resolve) => {
+      releaseLease = resolve;
+    });
+    const queuedLease = previousLease.then(() => lease);
+    rendererLeaseRef.current = queuedLease;
+    await previousLease;
+
+    let loaded: LoadedMmdModel;
+    try {
+      loaded = await loadMmdModelForRenderer(mode, files, modelFile);
+    } catch (error) {
+      releaseLease();
+      if (rendererLeaseRef.current === queuedLease) rendererLeaseRef.current = Promise.resolve();
+      throw error;
+    }
+
+    const originalDispose = loaded.dispose.bind(loaded);
+    let disposePromise: Promise<void> | null = null;
+    loaded.dispose = async () => {
+      if (disposePromise) return disposePromise;
+      disposePromise = (async () => {
+        try {
+          await originalDispose();
+        } finally {
+          releaseLease();
+          if (rendererLeaseRef.current === queuedLease) rendererLeaseRef.current = Promise.resolve();
+        }
+      })();
+      return disposePromise;
+    };
+    return loaded;
+  }, []);
+
+  const resolveViewportLifecycleWaiter = useCallback((
+    waiterRef: MutableRefObject<ViewportLifecycleWaiter | null>,
+    generation: number,
+    modelId: string,
+  ) => {
+    const waiter = waiterRef.current;
+    if (!waiter || waiter.generation !== generation || waiter.modelId !== modelId) return false;
+    waiterRef.current = null;
+    window.clearTimeout(waiter.timer);
+    waiter.resolve();
+    return true;
+  }, []);
+
+  const rejectViewportLifecycleWaiter = useCallback((
+    waiterRef: MutableRefObject<ViewportLifecycleWaiter | null>,
+    generation: number,
+    modelId: string,
+    error: unknown,
+  ) => {
+    const waiter = waiterRef.current;
+    if (!waiter || waiter.generation !== generation || waiter.modelId !== modelId) return false;
+    waiterRef.current = null;
+    window.clearTimeout(waiter.timer);
+    waiter.reject(error);
+    return true;
+  }, []);
+
+  const waitForViewportReady = useCallback((binding: { generation: number; modelId: string }) => {
+    if (
+      readyViewportRef.current?.generation === binding.generation
+      && readyViewportRef.current.modelId === binding.modelId
+    ) return Promise.resolve();
+    const existing = viewportReadyWaiterRef.current;
+    if (existing?.generation === binding.generation && existing.modelId === binding.modelId) {
+      return existing.promise;
+    }
+    let resolveWaiter!: () => void;
+    let rejectWaiter!: (error: unknown) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolveWaiter = resolve;
+      rejectWaiter = reject;
+    });
+    const waiter = {
+      generation: binding.generation,
+      modelId: binding.modelId,
+      resolve: resolveWaiter,
+      reject: rejectWaiter,
+      timer: 0,
+      promise,
+    } satisfies ViewportLifecycleWaiter;
+    waiter.timer = window.setTimeout(() => {
+      rejectViewportLifecycleWaiter(
+        viewportReadyWaiterRef,
+        binding.generation,
+        binding.modelId,
+        new Error("Renderer viewport did not become ready"),
+      );
+    }, 15000);
+    viewportReadyWaiterRef.current = waiter;
+    return promise;
+  }, [rejectViewportLifecycleWaiter]);
+
+  const acknowledgeViewportReady = useCallback((binding: { generation: number; modelId: string }) => {
+    if (
+      activeViewportRef.current?.generation !== binding.generation
+      || activeViewportRef.current.modelId !== binding.modelId
+    ) return;
+    readyViewportRef.current = binding;
+    setViewportReadyBinding(binding);
+    resolveViewportLifecycleWaiter(viewportReadyWaiterRef, binding.generation, binding.modelId);
+  }, [resolveViewportLifecycleWaiter]);
+
+  const acknowledgeViewportUnmount = useCallback((binding: { generation: number; modelId: string }) => {
+    const requested = viewportUnmountRequestRef.current;
+    if (
+      !requested
+      || requested.generation !== binding.generation
+      || requested.modelId !== binding.modelId
+    ) return;
+    viewportUnmountRequestRef.current = null;
+    if (
+      activeViewportRef.current?.generation === binding.generation
+      && activeViewportRef.current.modelId === binding.modelId
+    ) {
+      activeViewportRef.current = null;
+      readyViewportRef.current = null;
+      setViewportReadyBinding(null);
+    }
+    rejectViewportLifecycleWaiter(
+      viewportReadyWaiterRef,
+      binding.generation,
+      binding.modelId,
+      new Error("Renderer viewport was unmounted before it became ready"),
+    );
+    resolveViewportLifecycleWaiter(viewportUnmountWaiterRef, binding.generation, binding.modelId);
+  }, [rejectViewportLifecycleWaiter, resolveViewportLifecycleWaiter]);
+
+  const waitForViewportUnmount = useCallback(async () => {
+    if (viewportUnmountPromiseRef.current) return viewportUnmountPromiseRef.current;
+    const binding = activeViewportRef.current;
+    if (!binding) {
+      await yieldForModelRelease();
+      return;
+    }
+    // A binding is committed before React necessarily commits the viewport
+    // element. In that small window there is no unmount callback to await, but
+    // the binding still has to be invalidated before the next backend loads.
+    // Relying on viewportMountedRef here can otherwise leave a failed load's
+    // identity mounted in state and allow a stale cleanup to race the next
+    // renderer transaction.
+    if (!viewportMountedRef.current) {
+      rejectViewportLifecycleWaiter(
+        viewportReadyWaiterRef,
+        binding.generation,
+        binding.modelId,
+        new Error("Renderer viewport was released before mounting"),
+      );
+      activeViewportRef.current = null;
+      readyViewportRef.current = null;
+      viewportUnmountRequestRef.current = null;
+      setViewportMounted(false);
+      setViewportBinding(null);
+      setViewportReadyBinding(null);
+      await yieldForModelRelease();
+      return;
+    }
+    let resolveWaiter!: () => void;
+    let rejectWaiter!: (error: unknown) => void;
+    const unmounted = new Promise<void>((resolve, reject) => {
+      resolveWaiter = resolve;
+      rejectWaiter = reject;
+    });
+    const waiter = {
+      generation: binding.generation,
+      modelId: binding.modelId,
+      resolve: resolveWaiter,
+      reject: rejectWaiter,
+      timer: 0,
+      promise: unmounted,
+    } satisfies ViewportLifecycleWaiter;
+    viewportUnmountRequestRef.current = binding;
+    waiter.timer = window.setTimeout(() => {
+      if (
+        viewportUnmountRequestRef.current?.generation === binding.generation
+        && viewportUnmountRequestRef.current.modelId === binding.modelId
+      ) {
+        viewportUnmountRequestRef.current = null;
+      }
+      rejectViewportLifecycleWaiter(
+        viewportUnmountWaiterRef,
+        binding.generation,
+        binding.modelId,
+        new Error("Renderer viewport did not finish unmounting"),
+      );
+    }, 15000);
+    viewportUnmountWaiterRef.current = waiter;
+    const pending = (async () => {
+      setViewportMounted(false);
+      setViewportBinding(null);
+      setViewportReadyBinding(null);
+      await unmounted;
+    })();
+    const settled = pending.finally(() => {
+      if (
+        viewportUnmountRequestRef.current?.generation === binding.generation
+        && viewportUnmountRequestRef.current.modelId === binding.modelId
+      ) {
+        viewportUnmountRequestRef.current = null;
+      }
+      if (viewportUnmountPromiseRef.current === settled) viewportUnmountPromiseRef.current = null;
+    });
+    viewportUnmountPromiseRef.current = settled;
+    return settled;
+  }, [rejectViewportLifecycleWaiter]);
+
+  const releaseCurrentModel = useCallback(async (expectedModel?: LoadedMmdModel | null) => {
     const previousModel = modelRef.current;
+    // A stale load task must never clear a model that a newer transaction has
+    // already committed. The identity check is intentionally synchronous,
+    // before any state is reset or viewport unmount is requested.
+    if (expectedModel !== undefined && previousModel !== expectedModel) return;
     modelRef.current = null;
     setMmdModel(null);
     setSelectedModelPath("");
@@ -1038,15 +1398,43 @@ export default function App() {
     setSelectedBoneIndex(null);
     setPoseState(emptyPoseState);
 
+    const viewportRelease = waitForViewportUnmount();
+
     if (!previousModel) {
-      await modelReleaseRef.current;
+      await modelReleaseRef.current.catch(() => undefined);
+      let viewportError: unknown = null;
+      try {
+        await viewportRelease;
+      } catch (error) {
+        viewportError = error;
+      }
+      await yieldForModelRelease();
+      if (viewportError) throw viewportError;
       return;
     }
 
+    const previousRelease = modelReleaseRef.current.catch(() => undefined);
     const release = (async () => {
+      await previousRelease;
+      // A lifecycle timeout must not skip model disposal. The viewport is
+      // still asked to unmount first, but disposal is forced in the finally
+      // path so the renderer lease cannot remain held forever.
+      let viewportError: unknown = null;
+      try {
+        await viewportRelease;
+      } catch (error) {
+        viewportError = error;
+      }
       await yieldForModelRelease();
-      previousModel.dispose();
+      let disposeError: unknown = null;
+      try {
+        await previousModel.dispose();
+      } catch (error) {
+        disposeError = error;
+      }
       await yieldForModelRelease();
+      if (disposeError) throw disposeError;
+      if (viewportError) throw viewportError;
     })();
     modelReleaseRef.current = release;
     try {
@@ -1054,13 +1442,19 @@ export default function App() {
     } finally {
       if (modelReleaseRef.current === release) modelReleaseRef.current = Promise.resolve();
     }
-  }, [resetMotionTracks]);
+  }, [resetMotionTracks, waitForViewportUnmount]);
 
   const clearCurrentModel = async () => {
-    if (modelLoading) return;
+    if (modelLoading || physicsLoading || rendererSwitchingRef.current) return;
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     const requestId = crypto.randomUUID();
     modelLoadRequestRef.current = requestId;
     invalidateProjection(`model-clear:${requestId}`);
+    // Clearing the model invalidates the source identity before teardown. If
+    // viewport cleanup rejects, no stale package can be reused by a later
+    // renderer-switch request.
+    activeMmdSourceRef.current = null;
     setPoseEditing(false);
     setModelLoading(true);
     setModelLoadStageKey("app.stage.clearModel");
@@ -1072,6 +1466,7 @@ export default function App() {
         setModelLoading(false);
         setModelLoadStageKey("app.stage.modelComplete");
       }
+      releaseBackendOperation(operationId);
     }
   };
 
@@ -1080,79 +1475,280 @@ export default function App() {
     modelFile: File,
     modelPath: string,
     requestId: string,
+    rendererMode: MmdRendererMode = renderModeRef.current,
+    restoreState?: MmdRuntimeRestoreState,
   ) => {
+    if (modelLoadRequestRef.current !== requestId) return;
     setModelLoadStageKey("app.stage.parseModel");
-    await releaseCurrentModel();
+    // A normal model replacement invalidates the previous source immediately.
+    // If viewport teardown later rejects, no stale source may remain eligible
+    // for a renderer switch while the model identity has already been cleared.
+    if (!restoreState) activeMmdSourceRef.current = null;
+    const modelBeforeRelease = modelRef.current;
+    await releaseCurrentModel(modelBeforeRelease);
     if (modelLoadRequestRef.current !== requestId) return;
 
-    const { loadMmdModel } = await import("./core/mmdModel");
-    const loaded = await loadMmdModel(packageFiles, modelFile);
-    if (modelLoadRequestRef.current !== requestId) {
-      loaded.dispose();
-      return;
-    }
+    let loaded: LoadedMmdModel | null = null;
+    try {
+      loaded = await loadRendererModelWithLease(rendererMode, packageFiles, modelFile);
+      if (modelLoadRequestRef.current !== requestId) {
+        await loaded.dispose();
+        return;
+      }
 
-    modelRef.current = loaded;
-    setMmdModel(loaded);
-    setSelectedModelPath(modelPath);
-    setPoseEditing(false);
-    setSelectedBoneIndex(chooseDefaultBone(loaded.bones));
-    setPoseState(loaded.poseState());
-    setSolidOptions((current) => ({
-      ...current,
-      skinMaterialIndices: loaded.materials
-        .filter((material) => material.suggestedSkin)
-        .map((material) => material.index),
-      emissiveMaterialIndices: loaded.materials
-        .filter((material) => material.suggestedEmissive)
-        .map((material) => material.index),
-    }));
-    clearProjectionArtifacts();
-    setPreviewMode("source");
-    setResetToken((value) => value + 1);
-    setPoseRevision((value) => value + 1);
-
-    const loadedTracks: Partial<Record<MmdMotionTrackKind, MmdMotionTrackInfo>> = {};
-    const {
-      groupMmdMotionTrackCandidates,
-      inspectMmdMotionCandidates,
-    } = await import("./core/mmdAssets");
-    const compatibleMotions = groupMmdMotionTrackCandidates(
-      await inspectMmdMotionCandidates(packageFiles, loaded),
-    );
-    setMotionCandidates(compatibleMotions);
-    if (compatibleMotions.dance.length || compatibleMotions.expression.length) {
+      const loadedTracks: Partial<Record<MmdMotionTrackKind, MmdMotionTrackInfo>> = {};
+      const loadedTrackPaths: Partial<Record<MmdMotionTrackKind, string>> = {};
+      const {
+        groupMmdMotionTrackCandidates,
+        inspectMmdMotionCandidates,
+      } = await import("./core/mmdAssets");
+      const compatibleMotions = groupMmdMotionTrackCandidates(
+        await inspectMmdMotionCandidates(packageFiles, loaded),
+      );
+      if (modelLoadRequestRef.current !== requestId) {
+        await loaded.dispose();
+        return;
+      }
       setModelLoadStageKey("app.stage.parseMotion");
       for (const kind of MOTION_TRACK_KINDS) {
-        const candidate = compatibleMotions[kind][0];
-        if (!candidate) continue;
+        const preferredPath = restoreState?.motionPaths[kind];
+        const candidate = restoreState
+          ? (preferredPath
+            ? compatibleMotions[kind].find((entry) => entry.path === preferredPath)
+            : undefined)
+          : compatibleMotions[kind][0];
+        if (!candidate) {
+          if (restoreState && preferredPath) {
+            throw appError("error.motion.loadFailed");
+          }
+          continue;
+        }
         loadedTracks[kind] = await loaded.loadMotion(candidate.file, kind);
+        loadedTrackPaths[kind] = candidate.path;
         if (modelLoadRequestRef.current !== requestId) {
-          if (modelRef.current === loaded) modelRef.current = null;
-          loaded.dispose();
+          await loaded.dispose();
           return;
         }
       }
+
+      if (restoreState?.poseTransfer) {
+        const applied = loaded.importPoseTransferState(restoreState.poseTransfer);
+        if (applied.missingBoneNames.length || applied.missingMorphNames.length) {
+          throw appError("error.model.loadFailed");
+        }
+      }
+      if (restoreState?.physicsEnabled && loaded.physicsAvailable) {
+        await loaded.setPhysicsEnabled(true);
+        if (modelLoadRequestRef.current !== requestId) {
+          if (modelRef.current === loaded) await releaseCurrentModel(loaded);
+          else await loaded.dispose();
+          return;
+        }
+        if (!loaded.physicsEnabled()) throw appError("error.physics.loadFailed");
+      } else if (restoreState?.physicsEnabled && !loaded.physicsAvailable) {
+        throw appError("error.physics.loadFailed");
+      }
+      const restoredTimes = restoreState?.motionTimes ?? { dance: 0, expression: 0 };
+      loaded.updatePose(restoredTimes);
+      for (const index of restoreState?.hiddenMaterialIndices ?? []) {
+        if (loaded.materials[index]) loaded.setMaterialVisible(index, false);
+      }
+
+      if (modelLoadRequestRef.current !== requestId) {
+        await loaded.dispose();
+        return;
+      }
+
+      const binding: ViewportBinding = {
+        generation: ++viewportGenerationRef.current,
+        modelId: loaded.id,
+      };
+      // A new binding is the commit point for a replacement backend. Any
+      // previous unmount request has already settled or timed out by this
+      // point, so a later stale cleanup must not affect the new viewport.
+      viewportUnmountRequestRef.current = null;
+      activeViewportRef.current = binding;
+      readyViewportRef.current = null;
+      setViewportReadyBinding(null);
+      modelRef.current = loaded;
+      setMmdModel(loaded);
+      setViewportBinding(binding);
+      setViewportMounted(true);
+      setSelectedModelPath(modelPath);
+      setPoseEditing(Boolean(restoreState?.poseEditing) && !MOTION_TRACK_KINDS.some((kind) => restoreState?.playing[kind]));
+      const restoredSelectedBone = restoreState?.selectedBoneIndex;
+      setSelectedBoneIndex(
+        restoredSelectedBone !== null
+          && restoredSelectedBone !== undefined
+          && loaded.bones[restoredSelectedBone]
+          ? restoredSelectedBone
+          : chooseDefaultBone(loaded.bones),
+      );
+      setPoseState(loaded.poseState());
+      setSolidOptions((current) => ({
+        ...current,
+        skinMaterialIndices: loaded!.materials
+          .filter((material) => material.suggestedSkin)
+          .map((material) => material.index),
+        emissiveMaterialIndices: loaded!.materials
+          .filter((material) => material.suggestedEmissive)
+          .map((material) => material.index),
+      }));
+      setMotionCandidates(compatibleMotions);
       MOTION_TRACK_KINDS.forEach((kind) => {
         const info = loadedTracks[kind];
-        const candidate = compatibleMotions[kind][0];
-        if (info && candidate) installMotionTrack(kind, info, candidate.path);
+        if (info) installMotionTrack(kind, info, loadedTrackPaths[kind] ?? restoreState?.motionPaths[kind] ?? info.name);
       });
-      loaded.updatePose({ dance: 0, expression: 0 });
+      if (restoreState) {
+        MOTION_TRACK_KINDS.forEach((kind) => {
+          const info = loadedTracks[kind];
+          if (!info) return;
+          const restoredSeconds = Math.max(0, Math.min(info.durationSeconds, restoredTimes[kind]));
+          publishMotionSeconds(kind, restoredSeconds);
+          setLockedMotionFrames((current) => ({ ...current, [kind]: restoreState.lockedFrames[kind] }));
+          const runtime = motionRuntime[kind];
+          const playing = Boolean(restoreState.playing[kind]) && restoreState.lockedFrames[kind] === null;
+          runtime.playing = playing;
+          runtime.playbackStore.set(playing);
+          runtime.clock = {
+            startedAt: performance.now(),
+            startSeconds: restoredSeconds,
+            lastUiFrame: Math.round(restoredSeconds * info.frameRate),
+          };
+        });
+      }
+      setPhysicsEnabled(loaded.physicsEnabled());
+      hiddenMaterialIndicesRef.current = [...(restoreState?.hiddenMaterialIndices ?? [])];
+      setHiddenMaterialIndices(hiddenMaterialIndicesRef.current);
+      activeMmdSourceRef.current = {
+        files: [...packageFiles],
+        modelFile,
+        modelPath,
+        rendererMode,
+      };
+      setRenderMode(rendererMode);
+      clearProjectionArtifacts();
+      setPreviewMode("source");
+      setResetToken((value) => value + 1);
       setPoseRevision((value) => value + 1);
-    }
 
-    const warnings = loaded.stats.textureWarnings;
-    const loadedMotion = loadedTracks.dance ?? loadedTracks.expression;
-    setToast(t("toast.modelLoaded", {
-      name: loaded.stats.name,
-      vertices: number(loaded.stats.vertexCount),
-      motion: loadedMotion ? t("toast.modelLoadedMotion", { frames: number(loadedMotion.maxFrame) }) : "",
-      warnings: warnings ? t("toast.modelLoadedWarnings", { count: number(warnings) }) : "",
-    }));
-  }, [clearProjectionArtifacts, installMotionTrack, number, releaseCurrentModel, t]);
+      await waitForViewportReady(binding);
+      if (modelLoadRequestRef.current !== requestId || modelRef.current !== loaded) {
+        if (modelRef.current === loaded) await releaseCurrentModel(loaded);
+        else await loaded.dispose();
+        return;
+      }
+
+      const warnings = loaded.stats.textureWarnings;
+      const loadedMotion = loadedTracks.dance ?? loadedTracks.expression;
+      setToast(t("toast.modelLoaded", {
+        name: loaded.stats.name,
+        vertices: number(loaded.stats.vertexCount),
+        motion: loadedMotion ? t("toast.modelLoadedMotion", { frames: number(loadedMotion.maxFrame) }) : "",
+        warnings: warnings ? t("toast.modelLoadedWarnings", { count: number(warnings) }) : "",
+      }));
+      return loaded;
+    } catch (error) {
+      if (loaded && modelRef.current === loaded) {
+        // Once a binding has been committed, failure (including a readiness
+        // timeout) must use the same requested-unmount handshake as a normal
+        // renderer transition. Directly clearing state would bypass the gate
+        // and leave the old viewport binding orphaned.
+        await releaseCurrentModel(loaded);
+      } else if (loaded) {
+        await loaded.dispose();
+      }
+      throw error;
+    }
+  }, [clearProjectionArtifacts, installMotionTrack, loadRendererModelWithLease, motionRuntime, number, publishMotionSeconds, releaseCurrentModel, t, waitForViewportReady]);
+
+  /**
+   * Renderer changes are serialized as an unload-then-load transaction. The
+   * old model is fully disposed before a new WebGL owner is created; if the
+   * new backend fails, the same source files and pose state rebuild the old
+   * backend so conversion remains usable.
+   */
+  const switchRenderer = useCallback(async (nextMode: MmdRendererMode) => {
+    const current = modelRef.current;
+    const source = activeMmdSourceRef.current;
+    const previousMode = current?.rendererMode ?? renderModeRef.current;
+    if (!current || !source || nextMode === previousMode || rendererSwitchingRef.current) return;
+    if (modelLoading || processing || exporting || physicsLoading) return;
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
+
+    rendererSwitchingRef.current = true;
+    const requestId = crypto.randomUUID();
+    rendererSwitchOwnerRef.current = requestId;
+    modelLoadRequestRef.current = requestId;
+    let restoreState: MmdRuntimeRestoreState;
+    try {
+      restoreState = captureMmdRuntimeRestoreState(current);
+    } catch (error) {
+      // Keep a synchronous pose-export failure from leaving the renderer
+      // transaction permanently locked in the switching state.
+      rendererSwitchOwnerRef.current = null;
+      rendererSwitchingRef.current = false;
+      releaseBackendOperation(operationId);
+      setToast(t("toast.rendererSwitchFailed", { reason: localizeError(error) }));
+      return;
+    }
+    stopAllMotionPlayback();
+    invalidateProjection(`renderer-switch:${nextMode}:${requestId}`);
+    setPoseEditing(false);
+    setModelLoading(true);
+    setModelLoadStageKey("app.stage.parseModel");
+
+    try {
+      await loadModelFromPackage(
+        source.files,
+        source.modelFile,
+        source.modelPath,
+        requestId,
+        nextMode,
+        restoreState,
+      );
+      if (modelLoadRequestRef.current === requestId) {
+        setToast(t("toast.rendererSwitched", { mode: nextMode }));
+      }
+    } catch (error) {
+      if (modelLoadRequestRef.current !== requestId) return;
+      setRenderMode(previousMode);
+      try {
+        await loadModelFromPackage(
+          source.files,
+          source.modelFile,
+          source.modelPath,
+          requestId,
+          previousMode,
+          restoreState,
+        );
+        setToast(t("toast.rendererSwitchFailedRollback", {
+          reason: localizeError(error),
+        }));
+      } catch (rollbackError) {
+        activeMmdSourceRef.current = null;
+        setToast(t("toast.rendererSwitchFailed", {
+          reason: `${localizeError(error)}; ${localizeError(rollbackError)}`,
+        }));
+      }
+    } finally {
+      if (rendererSwitchOwnerRef.current === requestId) {
+        rendererSwitchOwnerRef.current = null;
+        rendererSwitchingRef.current = false;
+        releaseBackendOperation(operationId);
+        if (modelLoadRequestRef.current === requestId) {
+          setModelLoading(false);
+          setModelLoadStageKey("app.stage.modelComplete");
+        }
+      }
+    }
+  }, [acquireBackendOperation, captureMmdRuntimeRestoreState, exporting, invalidateProjection, loadModelFromPackage, localizeError, modelLoading, physicsLoading, processing, releaseBackendOperation, stopAllMotionPlayback, t]);
 
   const addAssets = async (files: File[]) => {
+    if (physicsLoading || rendererSwitchingRef.current) return;
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     const requestId = crypto.randomUUID();
     modelLoadRequestRef.current = requestId;
     invalidateProjection(`model-load:${requestId}`);
@@ -1170,7 +1766,9 @@ export default function App() {
         normalizeAssetPath,
       } = await import("./core/mmdAssets");
       const expanded = await expandMmdAssets(files);
+      if (modelLoadRequestRef.current !== requestId) return;
       const candidates = await inspectMmdModels(expanded);
+      if (modelLoadRequestRef.current !== requestId) return;
       const modelFile = choosePrimaryMmdModel(expanded, candidates);
       const nextAssets = expanded.map((file) => ({
         name: file.name,
@@ -1188,6 +1786,10 @@ export default function App() {
                 await inspectMmdMotionCandidates(combinedFiles, currentModel),
               )
             : emptyMotionCandidateTracks();
+          if (
+            modelLoadRequestRef.current !== requestId
+            || (currentModel && modelRef.current !== currentModel)
+          ) return;
           if (currentModel) setMotionCandidates(compatibleMotions);
           const importedPaths = new Set(expanded.map((file) => normalizeAssetPath(
             file.webkitRelativePath || file.name,
@@ -1202,17 +1804,25 @@ export default function App() {
             for (const kind of MOTION_TRACK_KINDS) {
               const candidate = selectedCandidates[kind];
               if (!candidate) continue;
+              if (modelLoadRequestRef.current !== requestId || modelRef.current !== currentModel) return;
               const loadedMotion = await currentModel.loadMotion(candidate.file, kind);
-              if (modelLoadRequestRef.current !== requestId) return;
+              if (modelLoadRequestRef.current !== requestId || modelRef.current !== currentModel) return;
               installMotionTrack(kind, loadedMotion, candidate.path);
               loadedTracks.push(loadedMotion);
             }
+            if (modelLoadRequestRef.current !== requestId || modelRef.current !== currentModel) return;
             currentModel.updatePose(currentMotionTimes());
             setPoseEditing(false);
             invalidatePoseProjection();
             setPoseRevision((value) => value + 1);
             setAssets((current) => [...current, ...nextAssets]);
             expandedAssetsRef.current = combinedFiles;
+            if (activeMmdSourceRef.current && modelRef.current === currentModel) {
+              activeMmdSourceRef.current = {
+                ...activeMmdSourceRef.current,
+                files: [...combinedFiles],
+              };
+            }
             setPreviewMode("source");
             setToast(t("toast.motionLoaded", {
               name: loadedTracks.map((track) => track.name).join(" + "),
@@ -1220,8 +1830,15 @@ export default function App() {
             }));
             return;
           }
+          if (modelLoadRequestRef.current !== requestId) return;
           setAssets((current) => [...current, ...nextAssets]);
           expandedAssetsRef.current = combinedFiles;
+          if (activeMmdSourceRef.current && currentModel && modelRef.current === currentModel) {
+            activeMmdSourceRef.current = {
+              ...activeMmdSourceRef.current,
+              files: [...combinedFiles],
+            };
+          }
           setToast(t("toast.assetsWithoutModel", { count: number(expanded.length) }));
         }
         return;
@@ -1241,6 +1858,7 @@ export default function App() {
         setModelLoading(false);
         setModelLoadStageKey("app.stage.modelComplete");
       }
+      releaseBackendOperation(operationId);
     }
   };
   addAssetsRef.current = addAssets;
@@ -1269,11 +1887,13 @@ export default function App() {
   }, []);
 
   const selectModelFromPackage = async (path: string) => {
-    if (modelLoading || path === selectedModelPath) return;
+    if (modelLoading || physicsLoading || rendererSwitchingRef.current || path === selectedModelPath) return;
     if (!path) {
       await clearCurrentModel();
       return;
     }
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     const requestId = crypto.randomUUID();
     modelLoadRequestRef.current = requestId;
     invalidateProjection(`model-switch:${requestId}`);
@@ -1301,14 +1921,16 @@ export default function App() {
         setModelLoading(false);
         setModelLoadStageKey("app.stage.modelComplete");
       }
+      releaseBackendOperation(operationId);
     }
   };
 
   const selectMotionFromPackage = async (kind: MmdMotionTrackKind, path: string) => {
     const model = modelRef.current;
-    if (!model || modelLoading || processing || path === selectedMotionPaths[kind]) return;
+    if (!model || modelLoading || physicsLoading || processing || rendererSwitchingRef.current || path === selectedMotionPaths[kind]) return;
 
     if (!path) {
+      if (backendOperationRef.current) return;
       model.clearMotion(kind);
       resetMotionTrack(kind);
       model.updatePose(currentMotionTimes());
@@ -1325,6 +1947,8 @@ export default function App() {
 
     const candidate = motionCandidates[kind].find((entry) => entry.path === path);
     if (!candidate) return;
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     const requestId = crypto.randomUUID();
     modelLoadRequestRef.current = requestId;
     invalidateProjection(`motion-switch:${kind}:${requestId}`);
@@ -1353,17 +1977,21 @@ export default function App() {
         setModelLoading(false);
         setModelLoadStageKey("app.stage.modelComplete");
       }
+      releaseBackendOperation(operationId);
     }
   };
 
   const changePhysicsEnabled = async (enabled: boolean) => {
     const model = modelRef.current;
-    if (!model || !model.physicsAvailable || physicsLoading || modelLoading || processing) return;
+    if (!model || !model.physicsAvailable || physicsLoading || modelLoading || processing || rendererSwitchingRef.current) return;
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     setPhysicsLoading(true);
     stopAllMotionPlayback();
     try {
       await model.setPhysicsEnabled(enabled);
       if (modelRef.current !== model) return;
+      lastLivePhysicsFrameRef.current = null;
       model.updatePose(currentMotionTimes());
       setPhysicsEnabled(model.physicsEnabled());
       invalidateProjection("physics");
@@ -1376,11 +2004,13 @@ export default function App() {
         setToast(t("toast.physicsFailed", { reason: localizeError(error) }));
       }
     } finally {
-      if (modelRef.current === model) setPhysicsLoading(false);
+      if (ownsBackendOperation(operationId)) setPhysicsLoading(false);
+      releaseBackendOperation(operationId);
     }
   };
 
   const changeMaterialVisibility = useCallback((index: number, visible: boolean) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model || modelLoading || processing || !model.materials[index]) return;
     const hidden = new Set(hiddenMaterialIndicesRef.current);
@@ -1430,34 +2060,46 @@ export default function App() {
       return;
     }
 
-    const model = modelRef.current;
-    if (!model) return;
-    const kinds = MOTION_TRACK_KINDS.filter((kind) => selection[kind] && motionRuntime[kind].info);
-    if (!kinds.length) return;
-    stopAllMotionPlayback();
-    if (kinds.length === MOTION_TRACK_KINDS.length) model.clearMotion();
-    else model.clearMotion(kinds[0]);
-    kinds.forEach(resetMotionTrack);
-    model.updatePose(currentMotionTimes());
-    setPoseEditing(false);
-    setPoseState(model.poseState());
-    invalidateProjection("resource-clear");
-    setPoseRevision((value) => value + 1);
-    setPreviewMode("source");
-    setToast(t("toast.resourcesCleared"));
+    if (backendOperationRef.current) return;
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
+    try {
+      const model = modelRef.current;
+      if (!model) return;
+      const kinds = MOTION_TRACK_KINDS.filter((kind) => selection[kind] && motionRuntime[kind].info);
+      if (!kinds.length) return;
+      stopAllMotionPlayback();
+      if (kinds.length === MOTION_TRACK_KINDS.length) model.clearMotion();
+      else model.clearMotion(kinds[0]);
+      kinds.forEach(resetMotionTrack);
+      model.updatePose(currentMotionTimes());
+      setPoseEditing(false);
+      setPoseState(model.poseState());
+      invalidateProjection("resource-clear");
+      setPoseRevision((value) => value + 1);
+      setPreviewMode("source");
+      setToast(t("toast.resourcesCleared"));
+    } finally {
+      releaseBackendOperation(operationId);
+    }
   };
 
   const setMotionPlayingState = (kind: MmdMotionTrackKind, playing: boolean) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     const motion = motionTracks[kind];
     const runtime = motionRuntime[kind];
     if (!motion || !model) return;
     if (playing && !canToggleMotionPlayback(true, lockedMotionFrames[kind])) return;
+    const hadPendingScrubCommit = motionScrubCommitTimerRef.current !== null;
     if (motionScrubCommitTimerRef.current !== null) {
       window.clearTimeout(motionScrubCommitTimerRef.current);
       motionScrubCommitTimerRef.current = null;
     }
     if (playing) {
+      if (hadPendingScrubCommit && model.physicsEnabled()) {
+        model.updatePose(currentMotionTimes());
+      }
       runtime.pendingSeconds = null;
       setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
       if (result || previewMode !== "source") invalidatePoseProjection();
@@ -1467,7 +2109,9 @@ export default function App() {
         startSeconds: runtime.seconds,
         lastUiFrame: Math.round(runtime.seconds * motion.frameRate),
       };
+      lastLivePhysicsFrameRef.current = runtime.clock.startedAt;
     } else {
+      lastLivePhysicsFrameRef.current = null;
       runtime.playing = false;
       runtime.pendingSeconds = null;
       runtime.timeStore.set(runtime.seconds);
@@ -1478,6 +2122,7 @@ export default function App() {
   };
 
   const setMotionFrame = (kind: MmdMotionTrackKind, frame: number) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     const motion = motionTracks[kind];
     const runtime = motionRuntime[kind];
@@ -1492,7 +2137,7 @@ export default function App() {
     const seconds = clampedFrame / motion.frameRate;
     runtime.pendingSeconds = seconds;
     runtime.seconds = seconds;
-    if (result) scheduleMotionScrubCommit();
+    if (result || model.physicsEnabled()) scheduleMotionScrubCommit();
     if (previewMode !== "source") setPreviewMode("source");
   };
 
@@ -1520,6 +2165,7 @@ export default function App() {
   };
 
   const toggleMotionLock = (kind: MmdMotionTrackKind) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     const motion = motionTracks[kind];
     const runtime = motionRuntime[kind];
@@ -1570,6 +2216,7 @@ export default function App() {
   };
 
   const commitPoseMutation = useCallback(() => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model) return;
     invalidatePoseProjection();
@@ -1579,6 +2226,7 @@ export default function App() {
   }, [invalidatePoseProjection]);
 
   const setPoseEditingState = (editing: boolean) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model) return;
     if (editing) {
@@ -1594,6 +2242,7 @@ export default function App() {
   };
 
   const selectBone = (index: number | null) => {
+    if (backendOperationRef.current) return;
     setSelectedBoneIndex(index);
     if (index !== null && !poseEditing) {
       setPoseEditingState(true);
@@ -1601,6 +2250,7 @@ export default function App() {
   };
 
   const nudgeSelectedBone = (axis: "x" | "y" | "z", direction: -1 | 1) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model || selectedBoneIndex === null) return;
     const bone = model.bones[selectedBoneIndex];
@@ -1612,6 +2262,7 @@ export default function App() {
   };
 
   const resetSelectedBone = () => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model || selectedBoneIndex === null || !model.resetBone(selectedBoneIndex)) return;
     commitPoseMutation();
@@ -1619,18 +2270,21 @@ export default function App() {
   };
 
   const undoPose = useCallback(() => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model?.undoPose()) return;
     commitPoseMutation();
   }, [commitPoseMutation]);
 
   const redoPose = useCallback(() => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model?.redoPose()) return;
     commitPoseMutation();
   }, [commitPoseMutation]);
 
   const resetPoseEdits = () => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model?.resetPoseEdits()) return;
     commitPoseMutation();
@@ -1648,11 +2302,14 @@ export default function App() {
     .join("");
 
   const exportCurrentPose = async () => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model) {
       setToast(t("toast.modelRequired"));
       return;
     }
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     try {
       if (MOTION_TRACK_KINDS.some((kind) => motionRuntime[kind].playing)) {
         stopAllMotionPlayback();
@@ -1676,15 +2333,20 @@ export default function App() {
       }));
     } catch (error) {
       setToast(t("toast.poseExportFailed", { reason: localizeError(error) }));
+    } finally {
+      releaseBackendOperation(operationId);
     }
   };
 
   const importExternalPose = async (file: File) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model) {
       setToast(t("toast.modelRequired"));
       return;
     }
+    const operationId = acquireBackendOperation();
+    if (!operationId) return;
     try {
       const { parseMelyPoseJson } = await import("./core/melyPose");
       const document = parseMelyPoseJson(await file.text());
@@ -1721,6 +2383,8 @@ export default function App() {
       }
     } catch (error) {
       setToast(t("toast.poseImportFailed", { reason: localizeError(error) }));
+    } finally {
+      releaseBackendOperation(operationId);
     }
   };
 
@@ -2095,6 +2759,12 @@ export default function App() {
 
   const stats = result?.stats ?? null;
   const hasMotion = MOTION_TRACK_KINDS.some((kind) => Boolean(motionTracks[kind]));
+  // Mount as soon as the model/backend identity is committed. The viewport
+  // reports its real first-frame readiness asynchronously; gating the mount on
+  // that acknowledgement would deadlock the loader before onReady can fire.
+  const viewportReady = viewportMounted && Boolean(
+    mmdModel && mmdModel.rendererMode === renderMode && viewportBinding,
+  );
   const statusText = useMemo(() => {
     if (modelLoading) return t(modelLoadStageKey);
     if (processing) return t(stageKey);
@@ -2150,6 +2820,18 @@ export default function App() {
               onChange={(event) => setLocale(event.target.value as LocaleCode)}
             >
               {locales.map((entry) => <option key={entry} value={entry}>{t(languageLabelKeys[entry])}</option>)}
+            </select>
+          </label>
+          <label className="renderer-control" title={t("toolbar.renderer")}>
+            <select
+              aria-label={t("toolbar.renderer")}
+              value={renderMode}
+              disabled={!mmdModel || modelLoading || processing || exporting || physicsLoading}
+              onChange={(event) => void switchRenderer(event.target.value as MmdRendererMode)}
+            >
+              <option value="vanilla">{t("renderer.vanilla")}</option>
+              <option value="moeru">{t("renderer.moeru")}</option>
+              <option value="babylon">{t("renderer.babylon")}</option>
             </select>
           </label>
           <IconButton label={sidebarOpen ? t("toolbar.hideSidebar") : t("toolbar.showSidebar")} onClick={() => setSidebarOpen((value) => !value)}>
@@ -2296,9 +2978,13 @@ export default function App() {
               </div>
             </div>
 
-            <Viewport3D
+            {viewportReady ? <RendererViewport
               result={result}
               model={mmdModel}
+              renderMode={renderMode}
+              backendBusy={backendOperationBusy}
+              lifecycleBinding={viewportBinding ?? undefined}
+              isPlaying={MOTION_TRACK_KINDS.some((kind) => motionRuntime[kind].playing)}
               previewMode={previewMode}
               targetHeight={options.targetHeight}
               modelLoading={modelLoading}
@@ -2317,7 +3003,13 @@ export default function App() {
               onPoseCommitted={commitPoseMutation}
               onBeforeRender={advanceMotionPreview}
               onAfterRender={publishRenderedMotionPreview}
-            />
+              onReady={(binding) => {
+                if (binding) acknowledgeViewportReady(binding);
+              }}
+              onUnmount={(binding) => {
+                if (binding) acknowledgeViewportUnmount(binding);
+              }}
+            /> : null}
 
             {modelLoading || !mmdModel ? (
               <div className="viewport-loading">

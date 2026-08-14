@@ -33,4 +33,10 @@ export default defineConfig({
     minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG),
   },
+  // babylon-mmd ships worker modules that use code splitting. IIFE workers
+  // cannot import those chunks, while ES workers can be bundled correctly by
+  // Vite and loaded by both the web and Tauri runtimes.
+  worker: {
+    format: "es",
+  },
 });

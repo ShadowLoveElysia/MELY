@@ -24,6 +24,11 @@ import type {
   MmdMotionTrackKind,
   MmdPoseState,
 } from "../types";
+import type {
+  LoadedMmdModel,
+  MmdSnapshotOptions,
+  ThreeMmdViewportSource,
+} from "./mmdRuntime";
 import { AppError, appError } from "./appError";
 import { createMmdPoseController, type MmdPoseController } from "./mmdPose";
 import {
@@ -35,39 +40,13 @@ import {
 } from "./mmdPreviewRuntime";
 import { createSwitchableMmdPhysicsBackend } from "./mmdPhysics";
 
-export interface LoadedMmdModel {
-  id: string;
-  fileName: string;
+export type { LoadedMmdModel, MmdRendererMode, MmdSnapshotOptions } from "./mmdRuntime";
+
+export interface LoadedThreeMmdModel extends LoadedMmdModel {
+  viewport: ThreeMmdViewportSource;
   root: Group;
   mesh: SkinnedMesh;
-  stats: MmdModelStats;
   previewRuntime: PreviewRuntimeDiagnostics;
-  textureWarnings: readonly string[];
-  bones: readonly MmdBoneInfo[];
-  materials: readonly MmdMaterialInfo[];
-  translationStep: number;
-  physicsAvailable: boolean;
-  physicsEnabled: () => boolean;
-  setPhysicsEnabled: (enabled: boolean) => Promise<void>;
-  setMaterialVisible: (index: number, visible: boolean) => void;
-  visibleBounds: (target?: Box3) => Box3;
-  visibleTriangleCount: () => number;
-  loadMotion: (file: File, kind: MmdMotionTrackKind) => Promise<MmdMotionTrackInfo>;
-  updatePreviewPose: (times: MmdMotionTimes) => MmdMotionTimes;
-  updatePose: (times: MmdMotionTimes) => MmdMotionTimes;
-  clearMotion: (kind?: MmdMotionTrackKind) => void;
-  beginBoneEdit: (index: number) => void;
-  updateBoneEdit: (index: number) => void;
-  endBoneEdit: (index: number) => boolean;
-  nudgeBone: (index: number, axis: "x" | "y" | "z", amount: number) => boolean;
-  resetBone: (index: number) => boolean;
-  undoPose: () => boolean;
-  redoPose: () => boolean;
-  resetPoseEdits: (recordHistory?: boolean) => boolean;
-  exportMelyPose: () => MelyPoseDocument;
-  importMelyPose: (document: MelyPoseDocument) => MelyPoseApplyResult;
-  poseState: () => MmdPoseState;
-  dispose: () => void;
 }
 
 type DisposeMmdModel = (
@@ -683,7 +662,7 @@ const collectMaterialInfo = (mesh: SkinnedMesh): MmdMaterialInfo[] =>
 export const loadMmdModel = async (
   files: readonly File[],
   modelFile: File,
-): Promise<LoadedMmdModel> => {
+): Promise<LoadedThreeMmdModel> => {
   const {
     ThreeMmdLoader,
     createMmdTextureMapFromFiles,
@@ -717,6 +696,16 @@ export const loadMmdModel = async (
     jointCount?: number;
   } | undefined;
   const morphs = model.mesh.userData.mmdMorphs;
+  const morphNames = Array.from(new Set([
+    ...Object.keys(model.mesh.morphTargetDictionary ?? {}),
+    ...(Array.isArray(morphs) ? morphs.flatMap((morph) => {
+      if (!morph || typeof morph !== "object") return [];
+      const candidate = morph as { name?: unknown; englishName?: unknown };
+      return [candidate.name, candidate.englishName].filter((name): name is string => (
+        typeof name === "string" && name.length > 0
+      ));
+    }) : []),
+  ]));
   const textureWarnings = model.diagnostics.textures.map((diagnostic) =>
     `${diagnostic.textureKind}: ${diagnostic.path}`,
   );
@@ -770,12 +759,16 @@ export const loadMmdModel = async (
     return frame;
   };
 
-  return {
+  let loadedModel: LoadedThreeMmdModel;
+  loadedModel = {
     id: crypto.randomUUID(),
+    rendererMode: "vanilla",
     fileName: modelFile.name,
+    viewport: { kind: "three", root: model.root, mesh: model.mesh },
     root: model.root,
     mesh: model.mesh,
     bones,
+    morphNames,
     materials: materialInfo,
     translationStep,
     physicsAvailable,
@@ -809,6 +802,27 @@ export const loadMmdModel = async (
     visibleTriangleCount: () => {
       currentModel();
       return countVisibleMmdTriangles(model.mesh);
+    },
+    textureByteEstimate: () => {
+      currentModel();
+      const seen = new Set<string>();
+      return materials.reduce((bytes, material) => {
+        if (!materialIsVisible(material)) return bytes;
+        const map = "map" in material && material.map instanceof Texture ? material.map : null;
+        if (!map || seen.has(map.uuid)) return bytes;
+        seen.add(map.uuid);
+        const image = map.source.data ?? map.image;
+        if (!image || typeof image !== "object") return bytes;
+        const dimensions = image as {
+          width?: number;
+          height?: number;
+          naturalWidth?: number;
+          naturalHeight?: number;
+        };
+        const width = dimensions.naturalWidth ?? dimensions.width ?? 0;
+        const height = dimensions.naturalHeight ?? dimensions.height ?? 0;
+        return bytes + Math.max(0, width) * Math.max(0, height) * 4;
+      }, 0);
     },
     textureWarnings,
     stats: {
@@ -905,7 +919,27 @@ export const loadMmdModel = async (
         ? Math.max(0, Math.min(expressionDuration, times.expression))
         : 0;
       sampleExpressionTrack(expressionTrack, expression * (motionInfo.expression?.frameRate ?? 30));
-      evaluateMmdPreviewFrame(target, dance, Boolean(physics?.enabled));
+      evaluateMmdPreviewFrame(target, dance, false);
+      currentPose().syncAfterRuntimePreview();
+      applyMaterialVisibility();
+      return { dance, expression };
+    },
+    updateLivePose: (times, deltaSeconds) => {
+      const target = currentModel();
+      const danceDuration = motionInfo.dance?.durationSeconds ?? 0;
+      const expressionDuration = motionInfo.expression?.durationSeconds ?? 0;
+      const dance = danceDuration > 0 ? Math.max(0, Math.min(danceDuration, times.dance)) : 0;
+      const expression = expressionDuration > 0
+        ? Math.max(0, Math.min(expressionDuration, times.expression))
+        : 0;
+      sampleExpressionTrack(expressionTrack, expression * (motionInfo.expression?.frameRate ?? 30));
+      const liveDelta = Number.isFinite(deltaSeconds) ? Math.max(0, deltaSeconds) : 0;
+      physics?.setFixedStepOverride(liveDelta);
+      try {
+        evaluateMmdPreviewFrame(target, dance, Boolean(physics?.enabled && liveDelta > 0));
+      } finally {
+        physics?.setFixedStepOverride(null);
+      }
       currentPose().syncAfterRuntimePreview();
       applyMaterialVisibility();
       return { dance, expression };
@@ -925,6 +959,10 @@ export const loadMmdModel = async (
       syncMmdSkeletonForCpuRead(target);
       applyMaterialVisibility();
       return { dance, expression };
+    },
+    createSnapshot: async (options: MmdSnapshotOptions = {}) => {
+      const { createMmdMeshSnapshot } = await import("./mmdSnapshot");
+      return createMmdMeshSnapshot(loadedModel, options);
     },
     clearMotion: (kind) => {
       const target = currentModel();
@@ -958,6 +996,16 @@ export const loadMmdModel = async (
       syncMmdSkeletonForCpuRead(target);
       return applied;
     },
+    exportPoseTransferState: () => currentPose().exportTransferState(),
+    importPoseTransferState: (state) => {
+      const target = currentModel();
+      const applied = currentPose().importTransferState(state);
+      importedPoseAnimation = currentPose().importedPoseAnimation();
+      installCurrentAnimation(target);
+      currentPose().syncAfterRuntimeUpdate();
+      syncMmdSkeletonForCpuRead(target);
+      return applied;
+    },
     poseState: () => currentPose().state(),
     dispose: () => {
       if (!activeModel) return;
@@ -973,4 +1021,5 @@ export const loadMmdModel = async (
       disposeMmdModelResources(disposedModel, disposeMmdModel);
     },
   };
+  return loadedModel;
 };

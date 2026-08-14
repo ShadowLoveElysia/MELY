@@ -12,6 +12,7 @@ import type {
   MmdBoneInfo,
   MmdPoseState,
 } from "../types";
+import type { MmdPoseTransferState } from "./mmdRuntime";
 import {
   captureMelyPose,
   resolveMelyPose,
@@ -69,7 +70,10 @@ export interface MmdPoseController {
   reset: (recordHistory?: boolean) => boolean;
   exportMelyPose: () => MelyPoseDocument;
   importMelyPose: (pose: MelyPoseDocument) => MelyPoseApplyResult;
+  exportTransferState: () => MmdPoseTransferState;
+  importTransferState: (state: MmdPoseTransferState) => MelyPoseApplyResult;
   importedPoseAnimation: () => MmdAnimation | null;
+  importedPoseClip: () => THREE.AnimationClip | null;
   state: () => MmdPoseState;
 }
 
@@ -238,6 +242,124 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
   let editStart: SerializedOffset[] | null = null;
   let runtimeBaseDirty = false;
   let importedAnimation: MmdAnimation | null = null;
+  let importedClip: THREE.AnimationClip | null = null;
+  let importedPose: MelyPoseDocument | null = null;
+
+  const clonePoseDocument = (document: MelyPoseDocument): MelyPoseDocument => ({
+    generator: "MELY",
+    version: "1.0",
+    bones: document.bones.map((bone) => ({
+      name: bone.name,
+      pos: [...bone.pos],
+      rot: [...bone.rot],
+    })),
+    ...(document.morphs?.length ? {
+      morphs: document.morphs.map((morph) => ({ ...morph })),
+    } : {}),
+  });
+
+  const applyImportedPose = (document: MelyPoseDocument | null) => {
+    skeletonBones.forEach((_bone, index) => {
+      basePositions[index].copy(restPositions[index]);
+      baseQuaternions[index].copy(restQuaternions[index]);
+    });
+    morphInfluences.fill(0);
+
+    if (!document) {
+      importedAnimation = null;
+      importedClip = null;
+      importedPose = null;
+      syncMorphSplitTargets();
+      return null;
+    }
+
+    const currentMorphBindings = morphBindings();
+    const resolved = resolveMelyPose(document, poseBindings, currentMorphBindings);
+    resolved.bones.forEach((bone) => {
+      basePositions[bone.index].add(bone.positionOffset);
+      baseQuaternions[bone.index].multiply(bone.quaternionOffset).normalize();
+    });
+    resolved.morphs.forEach((morph) => {
+      morphInfluences[morph.index] = morph.weight;
+    });
+
+    const boneTracks = Object.fromEntries(resolved.bones.flatMap((bone) => {
+      const name = boneInfos[bone.index]?.name;
+      if (!name) return [];
+      return [[name, createStaticBoneTrack(
+        bone.positionOffset,
+        restQuaternions[bone.index],
+        bone.quaternionOffset,
+      )]];
+    })) as Record<string, VmdBoneTrack>;
+    const morphNames = new Map(currentMorphBindings.map((binding) => [
+      binding.index,
+      binding.name || binding.englishName,
+    ]));
+    const morphTracks = Object.fromEntries(resolved.morphs.flatMap((morph) => {
+      const name = morphNames.get(morph.index);
+      return name ? [[name, createStaticMorphTrack(morph.weight)]] : [];
+    })) as Record<string, VmdMorphTrack>;
+    importedAnimation = Object.keys(boneTracks).length || Object.keys(morphTracks).length
+      ? {
+          kind: "vmd",
+          bytes: new Uint8Array(),
+          metadata: {
+            modelName: "MELY Pose",
+            counts: {
+              bones: Object.keys(boneTracks).length,
+              morphs: Object.keys(morphTracks).length,
+              cameras: 0,
+              lights: 0,
+              selfShadows: 0,
+              properties: 0,
+            },
+            maxFrame: 0,
+          },
+          boneTracks,
+          morphTracks,
+          cameraFrames: [],
+          lightFrames: [],
+          selfShadowFrames: [],
+          propertyFrames: [],
+        }
+      : null;
+    const clipTracks: THREE.KeyframeTrack[] = [];
+    resolved.bones.forEach((bone) => {
+      const info = boneInfos[bone.index];
+      if (!info) return;
+      const position = restPositions[bone.index].clone().add(bone.positionOffset);
+      const quaternion = restQuaternions[bone.index]
+        .clone()
+        .multiply(bone.quaternionOffset)
+        .normalize();
+      clipTracks.push(
+        new THREE.VectorKeyframeTrack(
+          `.bones[${info.name}].position`,
+          [0],
+          position.toArray(),
+        ),
+        new THREE.QuaternionKeyframeTrack(
+          `.bones[${info.name}].quaternion`,
+          [0],
+          quaternion.toArray(),
+        ),
+      );
+    });
+    resolved.morphs.forEach((morph) => {
+      clipTracks.push(new THREE.NumberKeyframeTrack(
+        `.morphTargetInfluences[${morph.index}]`,
+        [0],
+        [morph.weight],
+      ));
+    });
+    importedClip = clipTracks.length
+      ? new THREE.AnimationClip("MELY Pose", 0, clipTracks)
+      : null;
+    importedPose = clonePoseDocument(document);
+    syncMorphSplitTargets();
+    return resolved;
+  };
 
   const captureRuntimeBase = () => {
     skeletonBones.forEach((bone, index) => {
@@ -268,6 +390,33 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
         quaternion: canonicalizeQuaternion(new THREE.Quaternion(...offset.quaternion)),
       });
     });
+  };
+
+  const manualOffsetDocument = (): MelyPoseDocument => ({
+    generator: "MELY",
+    version: "1.0",
+    bones: serialize().flatMap((offset) => {
+      const info = boneInfos[offset.index];
+      return info ? [{
+        name: info.name,
+        pos: [...offset.position],
+        rot: [...offset.quaternion],
+      }] : [];
+    }),
+  });
+
+  const applyManualOffsetDocument = (document: MelyPoseDocument) => {
+    const resolved = resolveMelyPose(document, poseBindings);
+    replaceOffsets(resolved.bones.map((bone) => ({
+      index: bone.index,
+      position: bone.positionOffset.toArray() as VectorTuple,
+      quaternion: bone.quaternionOffset.toArray() as QuaternionTuple,
+    })));
+    undoStack.length = 0;
+    redoStack.length = 0;
+    editStart = null;
+    applyOffsets();
+    return resolved;
   };
 
   const pushHistory = (snapshot: SerializedOffset[]) => {
@@ -464,62 +613,8 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
     },
     exportMelyPose: () => captureMelyPose(poseBindings, morphBindings()),
     importMelyPose: (document) => {
-      const currentMorphBindings = morphBindings();
-      const resolved = resolveMelyPose(document, poseBindings, currentMorphBindings);
-      skeletonBones.forEach((_bone, index) => {
-        basePositions[index].copy(restPositions[index]);
-        baseQuaternions[index].copy(restQuaternions[index]);
-      });
-      resolved.bones.forEach((bone) => {
-        basePositions[bone.index].add(bone.positionOffset);
-        baseQuaternions[bone.index].multiply(bone.quaternionOffset).normalize();
-      });
-      morphInfluences.fill(0);
-      resolved.morphs.forEach((morph) => {
-        morphInfluences[morph.index] = morph.weight;
-      });
-      const boneTracks = Object.fromEntries(resolved.bones.flatMap((bone) => {
-        const name = boneInfos[bone.index]?.name;
-        if (!name) return [];
-        return [[name, createStaticBoneTrack(
-          bone.positionOffset,
-          restQuaternions[bone.index],
-          bone.quaternionOffset,
-        )]];
-      })) as Record<string, VmdBoneTrack>;
-      const morphNames = new Map(currentMorphBindings.map((binding) => [
-        binding.index,
-        binding.name || binding.englishName,
-      ]));
-      const morphTracks = Object.fromEntries(resolved.morphs.flatMap((morph) => {
-        const name = morphNames.get(morph.index);
-        return name ? [[name, createStaticMorphTrack(morph.weight)]] : [];
-      })) as Record<string, VmdMorphTrack>;
-      importedAnimation = Object.keys(boneTracks).length || Object.keys(morphTracks).length
-        ? {
-            kind: "vmd",
-            bytes: new Uint8Array(),
-            metadata: {
-              modelName: "MELY Pose",
-              counts: {
-                bones: Object.keys(boneTracks).length,
-                morphs: Object.keys(morphTracks).length,
-                cameras: 0,
-                lights: 0,
-                selfShadows: 0,
-                properties: 0,
-              },
-              maxFrame: 0,
-            },
-            boneTracks,
-            morphTracks,
-            cameraFrames: [],
-            lightFrames: [],
-            selfShadowFrames: [],
-            propertyFrames: [],
-          }
-        : null;
-      syncMorphSplitTargets();
+      const resolved = applyImportedPose(document);
+      if (!resolved) throw new Error("Imported pose resolution unexpectedly returned no result.");
       offsets.clear();
       undoStack.length = 0;
       redoStack.length = 0;
@@ -533,7 +628,26 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
         missingMorphNames: resolved.missingMorphNames,
       };
     },
+    exportTransferState: () => ({
+      importedPose: importedPose ? clonePoseDocument(importedPose) : null,
+      manualOffsets: manualOffsetDocument(),
+    }),
+    importTransferState: (state) => {
+      const baseResult = applyImportedPose(state.importedPose);
+      const manualResult = applyManualOffsetDocument(state.manualOffsets);
+      runtimeBaseDirty = false;
+      return {
+        appliedBoneCount: (baseResult?.appliedBoneCount ?? 0) + manualResult.appliedBoneCount,
+        missingBoneNames: [
+          ...(baseResult?.missingBoneNames ?? []),
+          ...manualResult.missingBoneNames,
+        ],
+        appliedMorphCount: baseResult?.appliedMorphCount ?? 0,
+        missingMorphNames: baseResult?.missingMorphNames ?? [],
+      };
+    },
     importedPoseAnimation: () => importedAnimation,
+    importedPoseClip: () => importedClip,
     state: () => ({
       editCount: offsets.size,
       canUndo: undoStack.length > 0,

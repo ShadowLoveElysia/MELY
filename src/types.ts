@@ -145,6 +145,8 @@ export interface MeshMaterialSnapshot {
   englishName: string;
   baseColor: [number, number, number, number];
   textureFactor: [number, number, number, number];
+  textureAdditiveFactor?: [number, number, number, number];
+  hasTexture?: boolean;
   textureIndex: number;
   textureMatrix: [number, number, number, number, number, number, number, number, number];
   wrapS: number;

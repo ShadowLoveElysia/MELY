@@ -1,6 +1,7 @@
 import { Unzip, UnzipInflate, type UnzipFile } from "fflate";
 import { AppError, appError } from "./appError";
 import type { LoadedMmdModel } from "./mmdModel";
+import { normalizeMelyBoneName } from "./melyPose";
 
 const MAX_ARCHIVE_FILES = 5000;
 const MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024;
@@ -338,26 +339,19 @@ export const selectMmdMotionTrackCandidates = (
   expression: sortMotionTrackCandidates(candidates, "expression")[0],
 });
 
-const motionTargetNames = (model: Pick<LoadedMmdModel, "bones" | "mesh"> | undefined) => {
+const motionTargetNames = (model: Pick<LoadedMmdModel, "bones" | "morphNames"> | undefined) => {
   const bones = new Set<string>();
-  const morphs = new Set(Object.keys(model?.mesh.morphTargetDictionary ?? {}));
+  const morphs = new Set<string>();
+  (model?.morphNames ?? []).forEach((name) => {
+    const normalized = normalizeMelyBoneName(name);
+    if (normalized) morphs.add(normalized);
+  });
   model?.bones.forEach((bone) => {
-    if (bone.name) bones.add(bone.name);
-    if (bone.englishName) bones.add(bone.englishName);
-  });
-  model?.mesh.skeleton.bones.forEach((bone) => {
-    if (bone.name) bones.add(bone.name);
-  });
-  const runtimeMorphs = model?.mesh.userData.mmdMorphs;
-  if (Array.isArray(runtimeMorphs)) {
-    runtimeMorphs.forEach((morph) => {
-      if (!morph || typeof morph !== "object") return;
-      const name = (morph as { name?: unknown }).name;
-      const englishName = (morph as { englishName?: unknown }).englishName;
-      if (typeof name === "string" && name) morphs.add(name);
-      if (typeof englishName === "string" && englishName) morphs.add(englishName);
+    [bone.name, bone.englishName].forEach((name) => {
+      const normalized = normalizeMelyBoneName(name);
+      if (normalized) bones.add(normalized);
     });
-  }
+  });
   return {
     bones,
     morphs,
@@ -366,7 +360,7 @@ const motionTargetNames = (model: Pick<LoadedMmdModel, "bones" | "mesh"> | undef
 
 export const choosePrimaryMmdMotion = async (
   files: readonly File[],
-  model?: Pick<LoadedMmdModel, "bones" | "mesh">,
+  model?: Pick<LoadedMmdModel, "bones" | "morphNames">,
 ) => {
   const motions = files.filter(isMmdMotionFile);
   if (!motions.length) return undefined;
@@ -376,7 +370,7 @@ export const choosePrimaryMmdMotion = async (
 
 export const inspectMmdMotionCandidates = async (
   files: readonly File[],
-  model?: Pick<LoadedMmdModel, "bones" | "mesh">,
+  model?: Pick<LoadedMmdModel, "bones" | "morphNames">,
 ): Promise<MmdMotionCandidate[]> => {
   const motions = files.filter(isMmdMotionFile);
   if (!motions.length) return [];
@@ -393,8 +387,10 @@ export const inspectMmdMotionCandidates = async (
         path: normalizeAssetPath(file.webkitRelativePath || file.name),
         boneTrackCount: boneNames.length,
         morphTrackCount: morphNames.length,
-        matchedBoneTrackCount: boneNames.filter((name) => target.bones.has(name)).length,
-        matchedMorphTrackCount: morphNames.filter((name) => target.morphs.has(name)).length,
+        matchedBoneTrackCount: boneNames
+          .filter((name) => target.bones.has(normalizeMelyBoneName(name))).length,
+        matchedMorphTrackCount: morphNames
+          .filter((name) => target.morphs.has(normalizeMelyBoneName(name))).length,
         maxFrame: animation.metadata.maxFrame,
       });
     } catch {
@@ -406,7 +402,7 @@ export const inspectMmdMotionCandidates = async (
 
 export const chooseMmdMotionTracks = async (
   files: readonly File[],
-  model?: Pick<LoadedMmdModel, "bones" | "mesh">,
+  model?: Pick<LoadedMmdModel, "bones" | "morphNames">,
 ) => {
   const motions = files.filter(isMmdMotionFile);
   if (!motions.length) return {};

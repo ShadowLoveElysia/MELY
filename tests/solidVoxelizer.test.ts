@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { generateSolidVoxels, triangleIntersectsBox } from "../src/core/solidVoxelizer";
+import {
+  applyMmdTextureColor,
+  generateSolidVoxels,
+  triangleIntersectsBox,
+} from "../src/core/solidVoxelizer";
 import type { MmdMeshSnapshot, SolidOptions } from "../src/types";
 
 const options: SolidOptions = {
@@ -319,6 +323,49 @@ test("UV texture sampling produces distinct Minecraft colors", () => {
   assert.ok(ids.has("minecraft:red_concrete") || ids.has("minecraft:red_wool"));
   assert.ok(ids.has("minecraft:blue_concrete") || ids.has("minecraft:blue_wool") || ids.has("minecraft:lapis_block"));
   assert.ok(result.palette.length >= 2);
+});
+
+test("texture sampling reproduces Moeru multiplicative and additive morph colors", () => {
+  assert.deepEqual(
+    applyMmdTextureColor(
+      [0.5, 0.5, 0.5],
+      [0.8, 0.9, 1],
+      [1, 1, 1, 1],
+      [0.1, 0.05, 0, 0.5],
+    ),
+    [93, 110, 128],
+  );
+});
+
+test("untextured materials ignore texture morph factors", () => {
+  const baseline = cubeSnapshot();
+  baseline.materials![0].baseColor = [0.8, 0.2, 0.1, 0.42];
+  const morphed = cubeSnapshot();
+  morphed.materials![0] = {
+    ...baseline.materials![0],
+    textureFactor: [0, 0, 0, 1],
+    textureAdditiveFactor: [1, 0, 1, 1],
+  };
+  const generationOptions = {
+    ...options,
+    alphaThreshold: 0.4,
+    skinProtection: false,
+  };
+  const baselineResult = generateSolidVoxels(baseline, generationOptions);
+  const morphedResult = generateSolidVoxels(morphed, generationOptions);
+  assert.deepEqual(morphedResult.palette, baselineResult.palette);
+  assert.deepEqual([...morphedResult.blockIndices], [...baselineResult.blockIndices]);
+  assert.equal(morphedResult.stats.blockCount, baselineResult.stats.blockCount);
+  assert.equal(morphedResult.stats.alphaRejected, baselineResult.stats.alphaRejected);
+});
+
+test("missing captures for declared textures fail instead of silently whitening materials", () => {
+  const snapshot = cubeSnapshot();
+  snapshot.materials![0].hasTexture = true;
+  assert.throws(
+    () => generateSolidVoxels(snapshot, { ...options, skinProtection: false }),
+    /error\.snapshot\.textureCaptureFailed/,
+  );
 });
 
 test("skin protection restricts matching to clean skin-safe blocks", () => {

@@ -5,8 +5,9 @@ import {
   createMmdFaceFrameSnapshot,
   createMmdMeshSnapshot,
   releaseMmdMeshSnapshot,
+  type ThreeMmdSnapshotSource,
 } from "../src/core/mmdSnapshot";
-import { computeVisibleMmdBounds, type LoadedMmdModel } from "../src/core/mmdModel";
+import { computeVisibleMmdBounds } from "../src/core/mmdModel";
 
 const vectorFromTuple = (tuple: readonly [number, number, number]) =>
   new THREE.Vector3(tuple[0], tuple[1], tuple[2]);
@@ -79,7 +80,7 @@ const createDeformRig = (options: DeformRigOptions) => {
   return {
     bones,
     mesh,
-    model: { root, mesh } as unknown as LoadedMmdModel,
+    model: { root, mesh } satisfies ThreeMmdSnapshotSource,
   };
 };
 
@@ -114,7 +115,7 @@ const createFaceRig = () => {
   return {
     root,
     head,
-    model: { root, mesh } as unknown as LoadedMmdModel,
+    model: { root, mesh } satisfies ThreeMmdSnapshotSource,
   };
 };
 
@@ -193,7 +194,7 @@ test("CPU snapshots preserve the current sparse morph-split expression", async (
 
   const root = new THREE.Group();
   root.add(mesh, split);
-  const model = { root, mesh } as unknown as LoadedMmdModel;
+  const model = { root, mesh } satisfies ThreeMmdSnapshotSource;
   const snapshot = await createMmdMeshSnapshot(model, { includeTextures: false });
   assert.ok(Math.abs(snapshot.positions[0] - 0.75) < 1e-6);
   assert.equal(snapshot.indices.length, 3);
@@ -368,7 +369,7 @@ test("hidden material geometry is removed from snapshots and visible bounds", as
   root.add(mesh);
   root.updateMatrixWorld(true);
 
-  const snapshotModel = { root, mesh } as unknown as LoadedMmdModel;
+  const snapshotModel = { root, mesh } satisfies ThreeMmdSnapshotSource;
   const snapshot = await createMmdMeshSnapshot(snapshotModel, { includeTextures: true });
   assert.deepEqual([...snapshot.positions], [0, 0, 0, 1, 0, 0, 0, 1, 0]);
   assert.deepEqual([...snapshot.indices], [0, 1, 2]);
@@ -413,9 +414,55 @@ test("material snapshots do not treat ambient light as emissive", async () => {
   root.add(mesh);
 
   const snapshot = await createMmdMeshSnapshot(
-    { root, mesh } as unknown as LoadedMmdModel,
+    { root, mesh } satisfies ThreeMmdSnapshotSource,
     { includeTextures: true },
   );
   assert.equal(snapshot.materials?.[0].emissive, false);
   assert.equal(snapshot.materials?.[1].emissive, true);
+});
+
+test("Moeru material snapshots use live morph color and texture factors", async () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute([
+    0, 0, 0,
+    1, 0, 0,
+    0, 1, 0,
+  ], 3));
+  geometry.setIndex([0, 1, 2]);
+
+  const material = new THREE.MeshPhongMaterial({ opacity: 0.45 });
+  material.color.setRGB(0.2, 0.4, 0.6, THREE.SRGBColorSpace);
+  Object.assign(material, {
+    isMMDMaterial: true,
+    ambient: new THREE.Color().setRGB(0.1, 0.2, 0.3, THREE.SRGBColorSpace),
+    textureMultiplicativeColor: new THREE.Vector4(0.5, 0.6, 0.7, 0.8),
+    textureAdditiveColor: new THREE.Vector4(0.05, 0.04, 0.03, 0.2),
+  });
+  material.userData.mmdMaterial = {
+    name: "morphed",
+    diffuse: [0.9, 0.9, 0.9, 1],
+    ambient: [0.9, 0.9, 0.9],
+  };
+
+  const mesh = new THREE.SkinnedMesh(geometry, material);
+  const bone = new THREE.Bone();
+  mesh.add(bone);
+  mesh.bind(new THREE.Skeleton([bone]));
+  const root = new THREE.Group();
+  root.add(mesh);
+
+  const snapshot = await createMmdMeshSnapshot(
+    { root, mesh } satisfies ThreeMmdSnapshotSource,
+    { includeTextures: true },
+  );
+  const captured = snapshot.materials?.[0];
+  assert.ok(captured);
+  [0.2, 0.4, 0.6, 0.45].forEach((expected, index) => {
+    assert.ok(Math.abs(captured.baseColor[index] - expected) < 1e-5);
+  });
+  [0.1, 0.2, 0.3].forEach((expected, index) => {
+    assert.ok(Math.abs(captured.ambient[index] - expected) < 1e-5);
+  });
+  assert.deepEqual(captured.textureFactor, [0.5, 0.6, 0.7, 0.8]);
+  assert.deepEqual(captured.textureAdditiveFactor, [0.05, 0.04, 0.03, 0.2]);
 });

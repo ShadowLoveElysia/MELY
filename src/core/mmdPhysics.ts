@@ -120,9 +120,12 @@ export const createSwitchableMmdPhysicsBackend = (): SwitchableMmdPhysicsBackend
     },
     step: (context: MmdPhysicsStepContext): MmdPhysicsStepResult => {
       if (!active || !backend || disposed) return { simulated: false };
-      return backend.step(fixedStepOverride === null
-        ? context
-        : { ...context, deltaSeconds: fixedStepOverride });
+      if (fixedStepOverride === null) return backend.step(context);
+      return backend.step({
+        ...context,
+        deltaSeconds: fixedStepOverride,
+        seeking: fixedStepOverride > 0 ? false : context.seeking,
+      });
     },
     reset: (context?: MmdPhysicsResetContext) => {
       if (!disposed) backend?.reset?.(context);
