@@ -4,7 +4,7 @@ import type {
   ProjectionDocument,
   ProjectionView,
 } from "../types";
-import { iterateProjectionViewBlocks } from "./projectionDocument";
+import { iterateProjectionBlocks, iterateProjectionViewBlocks } from "./projectionDocument";
 
 type Point = [number, number, number];
 
@@ -100,10 +100,35 @@ export const sha256Hex = (bytes: Uint8Array) => {
   return hash.map((value) => value.toString(16).padStart(8, "0")).join("");
 };
 
-const canonicalState = (state: ProjectionBlockState) => JSON.stringify([
+const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+
+const canonicalProperties = (state: ProjectionBlockState) =>
+  Object.entries(state.properties ?? {}).sort(([left], [right]) => compareText(left, right));
+
+const canonicalViewState = (state: ProjectionBlockState) => JSON.stringify([
   state.blockId,
-  Object.entries(state.properties ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+  canonicalProperties(state),
 ]);
+
+const canonicalDocumentState = (state: ProjectionBlockState) => JSON.stringify([
+  state.blockId,
+  canonicalProperties(state),
+  state.color ?? null,
+  state.emissive ?? null,
+]);
+
+const canonicalMetadata = (document: ProjectionDocument) => Object.entries(document.metadata ?? {})
+  .sort(([left], [right]) => compareText(left, right))
+  .map(([key, value]) => {
+    if (
+      typeof value !== "string"
+      && typeof value !== "boolean"
+      && (typeof value !== "number" || !Number.isFinite(value))
+    ) {
+      throw new TypeError(`Projection metadata ${key} must contain a finite scalar value`);
+    }
+    return [key, Object.is(value, -0) ? 0 : value];
+  });
 
 const compareBlocks = (left: ProjectionBlock, right: ProjectionBlock) =>
   left.position[1] - right.position[1]
@@ -116,7 +141,7 @@ export const createProjectionViewContentHash = (
 ) => {
   const origin = view.occupiedBounds.min;
   const blocks = [...iterateProjectionViewBlocks(document, view)].sort(compareBlocks);
-  const states = document.palette.map(canonicalState);
+  const states = document.palette.map(canonicalViewState);
   const lines = [JSON.stringify([
     "MELYProjectionPart",
     1,
@@ -134,5 +159,40 @@ export const createProjectionViewContentHash = (
     lines.push(JSON.stringify([relative[0], relative[1], relative[2], state]));
   }
 
+  return `sha256:${sha256Hex(new TextEncoder().encode(lines.join("\n")))}`;
+};
+
+/** 第三关确认绑定文档的全部导出语义，同时忽略 chunk 与调色板的内部排列。 */
+export const createProjectionDocumentContentHash = (document: ProjectionDocument) => {
+  const states = document.palette.map(canonicalDocumentState);
+  const blocks = [...iterateProjectionBlocks(document)].sort(compareBlocks);
+  const bounds = document.bounds
+    ? [document.bounds.min, document.bounds.max, document.bounds.dimensions]
+    : null;
+  const lines = [JSON.stringify([
+    "MELYProjectionDocument",
+    1,
+    document.format,
+    document.version,
+    document.edition,
+    document.minecraftVersion,
+    canonicalMetadata(document),
+    [...states].sort(),
+    document.blockCount,
+    bounds,
+  ])];
+
+  for (const block of blocks) {
+    const state = states[block.paletteIndex];
+    if (state === undefined) {
+      throw new RangeError(`Unknown projection palette index: ${block.paletteIndex}`);
+    }
+    lines.push(JSON.stringify([
+      block.position[0],
+      block.position[1],
+      block.position[2],
+      state,
+    ]));
+  }
   return `sha256:${sha256Hex(new TextEncoder().encode(lines.join("\n")))}`;
 };

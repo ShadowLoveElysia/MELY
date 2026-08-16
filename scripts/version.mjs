@@ -4,8 +4,10 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const versionPath = resolve(projectRoot, "src/version/version.json");
+const tauriConfigPath = resolve(projectRoot, "src-tauri/tauri.conf.json");
 const cargoManifestPath = resolve(projectRoot, "src-tauri/Cargo.toml");
 const cargoLockPath = resolve(projectRoot, "src-tauri/Cargo.lock");
+const tauriVersionSource = "../src/version/version.json";
 const semverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 const readVersion = async () => {
@@ -27,6 +29,18 @@ const readVersion = async () => {
     throw new Error("src/version/version.json 必须只包含符合 SemVer 的 version 字段");
   }
   return manifest.version;
+};
+
+const validateTauriVersionSource = async () => {
+  let config;
+  try {
+    config = JSON.parse(await readFile(tauriConfigPath, "utf8"));
+  } catch (error) {
+    throw new Error(`无法读取 ${tauriConfigPath}`, { cause: error });
+  }
+  if (config?.version !== tauriVersionSource) {
+    throw new Error(`src-tauri/tauri.conf.json 的 version 必须引用 ${tauriVersionSource}`);
+  }
 };
 
 const replaceCargoPackageVersion = (source, version, path) => {
@@ -57,6 +71,7 @@ const replaceCargoLockVersion = (source, version) => {
 
 const synchronize = async (checkOnly) => {
   const version = await readVersion();
+  await validateTauriVersionSource();
   const targets = [
     {
       path: cargoManifestPath,

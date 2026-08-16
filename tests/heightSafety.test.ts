@@ -2,12 +2,26 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   clampTargetHeight,
+  clearExtremeExportConfirmation,
+  COMPATIBILITY_DEFAULT_DIMENSION,
+  confirmExtremeEnvironment,
+  confirmExtremeExport,
+  confirmExtremeUnlock,
   createHeightSafetyState,
+  createExtremeExportFingerprint,
+  createExtremeHeightConfigurationFingerprint,
+  createExtremeHeightConfirmationState,
   DEFAULT_TARGET_HEIGHT,
   evaluateProjectionHeightRisk,
   estimateScaledBlockCount,
+  EXPERIMENTAL_WORLD_HEIGHT,
   EXTENDED_WORLD_HEIGHT,
+  invalidateExtremeConfirmations,
   lockExtendedHeight,
+  preflightGenerationHeight,
+  preflightProjectionHeight,
+  type ExtremeHeightFingerprintInput,
+  type HeightSafetyProfile,
   VANILLA_WORLD_HEIGHT,
 } from "../src/core/heightSafety";
 
@@ -26,6 +40,12 @@ test("only a height above 384 requires the destructive export confirmation", () 
   assert.equal(boundary.requiresExportConfirmation, false);
   assert.equal(extended.risk, "extended");
   assert.equal(extended.requiresExportConfirmation, true);
+});
+
+test("height risk uses the selected profile default height instead of a global 384", () => {
+  assert.equal(evaluateProjectionHeightRisk(256, null, 256).risk, "safe");
+  assert.equal(evaluateProjectionHeightRisk(257, null, 256).risk, "extended");
+  assert.equal(evaluateProjectionHeightRisk(384, null, 256).risk, "extended");
 });
 
 test("actual projection span cannot bypass the extended-height export confirmation", () => {
@@ -73,4 +93,337 @@ test("block estimates distinguish shell-like and filled scaling", () => {
   assert.equal(estimateScaledBlockCount(10_000, 100, 200, true), 40_000);
   assert.equal(estimateScaledBlockCount(10_000, 100, 200, false), 80_000);
   assert.equal(estimateScaledBlockCount(0, 100, 200, true), 0);
+});
+
+const syntheticProfile = (
+  overrides: Partial<HeightSafetyProfile> = {},
+): HeightSafetyProfile => ({
+  id: "test-version",
+  releaseStatus: "verified",
+  heightEra: "modern_datapack",
+  defaultDimension: { minY: -64, height: 384 },
+  heightCapability: "third_party_extended",
+  maximumVerifiedHeight: EXPERIMENTAL_WORLD_HEIGHT,
+  verification: { fixture: "synthetic" },
+  exporters: {
+    litematic: {},
+    spongeSchematic: {},
+    legacySchematic: null,
+  },
+  ...overrides,
+});
+
+const extremeFingerprintInput = (): ExtremeHeightFingerprintInput => ({
+  projectId: "project-a",
+  resultId: "result-a",
+  generationMode: "hologram",
+  generationParameters: { sampleSpacing: 2, interiorDensity: 25 },
+  versionId: "test-version",
+  profileFingerprint: "profile:v1",
+  targetHeight: 4064,
+  actualHeight: 4064,
+  bounds: {
+    min: [0, 0, 0],
+    max: [10, 4063, 10],
+    dimensions: [11, 4064, 11],
+  },
+  targetDimension: { id: "overworld", minY: -2032, height: 4064 },
+  placementBottomY: -2032,
+  edition: "java",
+  exportFormat: "litematic",
+  resourceEstimate: { blocks: 120_000 },
+});
+
+test("generation height preflight enforces modes without requiring verification evidence", () => {
+  const profile = syntheticProfile();
+  assert.equal(preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "default",
+    targetHeight: 384,
+    profile,
+  }).allowed, true);
+  assert.equal(preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "extended_2032",
+    targetHeight: 2032,
+    profile,
+  }).errorCode, "HEIGHT_DATAPACK_ACK_REQUIRED");
+  assert.equal(preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "extended_2032",
+    targetHeight: 2032,
+    datapackAcknowledged: true,
+    profile,
+  }).allowed, true);
+  assert.equal(preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "extended_2032",
+    targetHeight: 2033,
+    datapackAcknowledged: true,
+    profile,
+  }).errorCode, "HEIGHT_EXTREME_CONFIRMATION_REQUIRED");
+  assert.equal(preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "experimental_4064",
+    targetHeight: 4065,
+    datapackAcknowledged: true,
+    profile,
+  }).errorCode, "HEIGHT_EXCEEDS_4064");
+  assert.equal(preflightGenerationHeight({
+    versionId: "unknown",
+    heightMode: "default",
+    targetHeight: 256,
+    profile: null,
+  }).errorCode, "JAVA_VERSION_PROFILE_UNKNOWN");
+});
+
+test("legacy profiles may attempt community extended heights after explicit acknowledgement", () => {
+  const profile = syntheticProfile({
+    id: "1.16.5-test",
+    heightEra: "legacy_fixed",
+    defaultDimension: { minY: 0, height: 256 },
+    heightCapability: "default_only",
+    maximumVerifiedHeight: 256,
+  });
+  assert.equal(preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "default",
+    targetHeight: 256,
+    profile,
+  }).allowed, true);
+  const extended = preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "extended_2032",
+    targetHeight: 257,
+    datapackAcknowledged: true,
+    profile,
+  });
+  assert.equal(extended.allowed, true);
+  assert.deepEqual(extended.warnings, ["HEIGHT_EXTENSION_UNTESTED_FOR_VERSION"]);
+});
+
+test("registered untested profiles use best-effort height compatibility", () => {
+  const profile = syntheticProfile({
+    id: "26.3-test",
+    releaseStatus: "provisional",
+    defaultDimension: null,
+    heightEra: "unknown",
+    heightCapability: "default_only",
+    maximumVerifiedHeight: null,
+    verification: null,
+  });
+  const defaultResult = preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "default",
+    targetHeight: 320,
+    profile,
+  });
+  assert.equal(defaultResult.allowed, true);
+  assert.deepEqual(defaultResult.dimension, COMPATIBILITY_DEFAULT_DIMENSION);
+  assert.deepEqual(defaultResult.warnings, [
+    "JAVA_VERSION_BEST_EFFORT",
+    "HEIGHT_DEFAULT_DIMENSION_FALLBACK",
+  ]);
+
+  const extendedResult = preflightProjectionHeight({
+    versionId: profile.id,
+    heightMode: "extended_2032",
+    targetHeight: 2032,
+    datapackAcknowledged: true,
+    profile,
+    bounds: { min: [0, 0, 0], max: [0, 2031, 0], dimensions: [1, 2032, 1] },
+    targetDimension: { minY: -1024, height: 2032 },
+    placementBottomY: -1024,
+  });
+  assert.equal(extendedResult.allowed, true);
+  assert.deepEqual(extendedResult.warnings, [
+    "JAVA_VERSION_BEST_EFFORT",
+    "HEIGHT_DEFAULT_DIMENSION_FALLBACK",
+    "HEIGHT_EXTENSION_UNTESTED_FOR_VERSION",
+  ]);
+
+  const configurationFingerprint = "sha256:untested-extreme";
+  const confirmations = confirmExtremeEnvironment(
+    confirmExtremeUnlock(
+      createExtremeHeightConfirmationState(),
+      configurationFingerprint,
+      "unlock",
+      1,
+    ),
+    configurationFingerprint,
+    "environment",
+    2,
+  );
+  const extremeResult = preflightProjectionHeight({
+    versionId: profile.id,
+    heightMode: "experimental_4064",
+    targetHeight: 4064,
+    datapackAcknowledged: true,
+    profile,
+    bounds: { min: [0, 0, 0], max: [0, 4063, 0], dimensions: [1, 4064, 1] },
+    targetDimension: { minY: -2032, height: 4064 },
+    placementBottomY: -2032,
+    confirmations,
+    configurationFingerprint,
+    requireExtremeExportConfirmation: false,
+  });
+  assert.equal(extremeResult.allowed, true);
+  assert.ok(extremeResult.warnings.includes("HEIGHT_EXTENSION_UNTESTED_FOR_VERSION"));
+});
+
+test("malformed modes and target heights remain hard failures", () => {
+  const profile = syntheticProfile();
+  assert.equal(preflightGenerationHeight({
+    versionId: profile.id,
+    heightMode: "unsupported" as never,
+    targetHeight: 320,
+    profile,
+  }).errorCode, "HEIGHT_MODE_INVALID");
+  for (const targetHeight of [0, -1, 1.5, Number.NaN]) {
+    assert.equal(preflightGenerationHeight({
+      versionId: profile.id,
+      heightMode: "default",
+      targetHeight,
+      profile,
+    }).errorCode, "HEIGHT_TARGET_INVALID");
+  }
+});
+
+test("4064 confirmations are sequential and bound to configuration and export fingerprints", () => {
+  const input = extremeFingerprintInput();
+  const configurationFingerprint = createExtremeHeightConfigurationFingerprint(input);
+  const exportFingerprint = createExtremeExportFingerprint(input);
+  const unlocked = confirmExtremeUnlock(
+    createExtremeHeightConfirmationState(),
+    configurationFingerprint,
+    "unlock",
+    1,
+  );
+  const environment = confirmExtremeEnvironment(
+    unlocked,
+    configurationFingerprint,
+    "environment",
+    2,
+  );
+  const confirmed = confirmExtremeExport(
+    environment,
+    configurationFingerprint,
+    exportFingerprint,
+    "导出 4064",
+    4064,
+    "export",
+    3,
+  );
+  const profile = syntheticProfile();
+  assert.equal(preflightProjectionHeight({
+    versionId: profile.id,
+    heightMode: "experimental_4064",
+    targetHeight: 4064,
+    datapackAcknowledged: true,
+    profile,
+    bounds: input.bounds,
+    placementBottomY: -2032,
+    targetDimension: input.targetDimension,
+    confirmations: confirmed,
+    configurationFingerprint,
+    exportFingerprint,
+  }).allowed, true);
+  assert.equal(preflightProjectionHeight({
+    versionId: profile.id,
+    heightMode: "experimental_4064",
+    targetHeight: 4064,
+    datapackAcknowledged: true,
+    profile,
+    bounds: input.bounds,
+    placementBottomY: -2032,
+    targetDimension: input.targetDimension,
+    confirmations: environment,
+    configurationFingerprint,
+    requireExtremeExportConfirmation: false,
+  }).allowed, true);
+  assert.equal(preflightProjectionHeight({
+    versionId: profile.id,
+    heightMode: "experimental_4064",
+    targetHeight: 4064,
+    datapackAcknowledged: true,
+    profile,
+    bounds: input.bounds,
+    placementBottomY: -2032,
+    targetDimension: input.targetDimension,
+    confirmations: environment,
+    configurationFingerprint,
+  }).errorCode, "HEIGHT_EXTREME_CONFIRMATION_REQUIRED");
+  assert.equal(clearExtremeExportConfirmation(confirmed).export, null);
+  assert.deepEqual(
+    invalidateExtremeConfirmations(confirmed, "changed"),
+    createExtremeHeightConfirmationState(),
+  );
+});
+
+test("placement checks use inclusive -2032..2031 bounds", () => {
+  const profile = syntheticProfile();
+  const input = extremeFingerprintInput();
+  const configurationFingerprint = createExtremeHeightConfigurationFingerprint(input);
+  const environment = confirmExtremeEnvironment(
+    confirmExtremeUnlock(createExtremeHeightConfirmationState(), configurationFingerprint, "unlock", 1),
+    configurationFingerprint,
+    "environment",
+    2,
+  );
+  const exportFingerprint = createExtremeExportFingerprint(input);
+  const confirmed = confirmExtremeExport(
+    environment,
+    configurationFingerprint,
+    exportFingerprint,
+    "导出 4064",
+    4064,
+    "export",
+    3,
+  );
+  const common = {
+    versionId: profile.id,
+    heightMode: "experimental_4064" as const,
+    targetHeight: 4064,
+    datapackAcknowledged: true,
+    profile,
+    bounds: input.bounds,
+    targetDimension: { minY: -2032, height: 4064 },
+    confirmations: confirmed,
+    configurationFingerprint,
+    exportFingerprint,
+  };
+  assert.equal(preflightProjectionHeight({ ...common, placementBottomY: -2032 }).allowed, true);
+  assert.equal(
+    preflightProjectionHeight({ ...common, placementBottomY: -2031 }).errorCode,
+    "PLACEMENT_OUTSIDE_DIMENSION_RANGE",
+  );
+});
+
+test("extended exports require an explicit third-party dimension declaration", () => {
+  const profile = syntheticProfile({ maximumVerifiedHeight: EXTENDED_WORLD_HEIGHT });
+  const common = {
+    versionId: profile.id,
+    heightMode: "extended_2032" as const,
+    targetHeight: 2032,
+    datapackAcknowledged: true,
+    profile,
+    bounds: {
+      min: [0, 0, 0] as const,
+      max: [0, 2031, 0] as const,
+      dimensions: [1, 2032, 1] as const,
+    },
+    placementBottomY: -1024,
+  };
+  assert.equal(
+    preflightProjectionHeight(common).errorCode,
+    "TARGET_DIMENSION_DECLARATION_REQUIRED",
+  );
+  assert.equal(preflightProjectionHeight({
+    ...common,
+    targetDimension: { minY: -1024, height: 2032 },
+  }).allowed, true);
+  assert.equal(preflightProjectionHeight({
+    ...common,
+    targetDimension: { minY: -2032, height: 4065 },
+  }).errorCode, "TARGET_DIMENSION_DECLARATION_REQUIRED");
 });

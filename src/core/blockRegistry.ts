@@ -1,4 +1,9 @@
-import { DEFAULT_BEDROCK_VERSION, DEFAULT_MINECRAFT_VERSION } from "./minecraftVersions";
+import {
+  DEFAULT_BEDROCK_VERSION,
+  DEFAULT_MINECRAFT_VERSION,
+  getJavaCompatibilityProfile,
+  getJavaVersionProfile,
+} from "./minecraftVersions";
 
 export type MinecraftEdition = "java" | "bedrock";
 export type BlockUse = "structure" | "lighting" | "glass" | "decoration" | "support";
@@ -21,6 +26,15 @@ export interface VersionedBlockDefinition {
   rare: boolean;
   noisy: boolean;
   use: BlockUse;
+}
+
+export interface JavaBlockCapability {
+  readonly versionId: string;
+  readonly blockId: string;
+  readonly available: boolean;
+  readonly serializable: boolean;
+  readonly resolvedId: string | null;
+  readonly reason: "available" | "profile_unknown" | "profile_unverified" | "block_unavailable" | "mapping_unavailable";
 }
 
 interface BlockDefinitionOptions {
@@ -294,6 +308,83 @@ export const getBlockDefinition = (blockId: string): VersionedBlockDefinition =>
   return REGISTRY.get(canonicalId) ?? block(canonicalId);
 };
 
+const profileBlockAvailability = (canonicalId: string, versionId: string): boolean | null => {
+  const profile = getJavaVersionProfile(versionId);
+  if (!profile) return null;
+  if (canonicalId === "minecraft:end_rod") return profile.blocks.endRod;
+  if (canonicalId === "minecraft:white_stained_glass_pane") {
+    return profile.blocks.whiteStainedGlassPane;
+  }
+  return true;
+};
+
+/** 先核对目标版本的已知方块事实，再用兼容 Profile 尝试序列化。 */
+export const getJavaBlockCapability = (
+  blockId: string,
+  versionId = DEFAULT_MINECRAFT_VERSION.id,
+): JavaBlockCapability => {
+  const canonicalId = normalizeId(blockId);
+  const profile = getJavaVersionProfile(versionId);
+  if (!profile) {
+    return {
+      versionId,
+      blockId: canonicalId,
+      available: false,
+      serializable: false,
+      resolvedId: null,
+      reason: "profile_unknown",
+    };
+  }
+  if (profileBlockAvailability(canonicalId, versionId) === false) {
+    const compatibility = getJavaCompatibilityProfile(versionId);
+    const resolvedId = compatibility
+      ? REGISTRY.get(canonicalId)?.java[compatibility.serializerProfile.id] ?? null
+      : null;
+    return {
+      versionId,
+      blockId: canonicalId,
+      available: false,
+      // 已知不存在只表示目标客户端可能拒绝，不禁止社区继续尝试产物。
+      serializable: resolvedId !== null,
+      resolvedId,
+      reason: "block_unavailable",
+    };
+  }
+  const compatibility = getJavaCompatibilityProfile(versionId);
+  if (!compatibility) {
+    return {
+      versionId,
+      blockId: canonicalId,
+      available: true,
+      serializable: false,
+      resolvedId: null,
+      reason: "profile_unverified",
+    };
+  }
+  const definition = REGISTRY.get(canonicalId);
+  const resolvedId = definition?.java[compatibility.serializerProfile.id] ?? null;
+  return resolvedId
+    ? {
+        versionId,
+        blockId: canonicalId,
+        available: true,
+        serializable: true,
+        resolvedId,
+        reason: "available",
+      }
+    : {
+        versionId,
+        blockId: canonicalId,
+        available: true,
+        serializable: false,
+        resolvedId: null,
+        reason: "mapping_unavailable",
+      };
+};
+
+export const isJavaBlockAvailable = (blockId: string, versionId: string) =>
+  getJavaBlockCapability(blockId, versionId).available;
+
 export const resolveBedrockBlockMapping = (
   blockId: string,
   version = BEDROCK_1_20_VERSION,
@@ -325,7 +416,11 @@ export const resolveBlockId = (
   if (edition === "bedrock") {
     return resolveVersion(definition.bedrock, version).blockId;
   }
-  return resolveVersion(definition.java, version);
+  const capability = getJavaBlockCapability(canonicalId, version);
+  if (!capability.serializable || !capability.resolvedId) {
+    throw new RangeError(`No block mapping is registered for ${version}`);
+  }
+  return capability.resolvedId;
 };
 
 export const registeredBlocks = () => [...REGISTRY.values()];

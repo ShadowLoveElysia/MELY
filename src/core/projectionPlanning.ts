@@ -25,6 +25,14 @@ export interface ProjectionEngineeringPlan {
   parts: ProjectionPartGuide[];
   totalBlocks: number;
   dimensions: [number, number, number];
+  placement: {
+    modelHeight: number;
+    recommendedBottomY: number;
+    highestOccupiedY: number;
+    targetDimensionMinY: number | null;
+    targetDimensionMaxY: number | null;
+    disclaimer: string;
+  };
 }
 
 const partName = (index: readonly number[]) =>
@@ -65,9 +73,18 @@ export const createProjectionEngineeringPlan = (
       parts: [],
       totalBlocks: 0,
       dimensions: [0, 0, 0],
+      placement: {
+        modelHeight: 0,
+        recommendedBottomY: 0,
+        highestOccupiedY: -1,
+        targetDimensionMinY: null,
+        targetDimensionMaxY: null,
+        disclaimer: "",
+      },
     };
   }
   const views = splitProjectionViews(document, options.splitSize ?? 32);
+  const javaHeightMetadata = document.edition === "java";
   const parts = views.map((view): ProjectionPartGuide => {
     const name = partName(view.index);
     const origin = [...view.bounds.min] as [number, number, number];
@@ -85,6 +102,22 @@ export const createProjectionEngineeringPlan = (
     parts,
     totalBlocks: document.blockCount,
     dimensions: [...document.bounds.dimensions],
+    placement: {
+      modelHeight: document.bounds.dimensions[1],
+      recommendedBottomY: document.bounds.min[1],
+      highestOccupiedY: document.bounds.max[1],
+      targetDimensionMinY: javaHeightMetadata
+        && typeof document.metadata?.targetDimensionMinY === "number"
+        ? document.metadata.targetDimensionMinY
+        : null,
+      targetDimensionMaxY: javaHeightMetadata
+        && typeof document.metadata?.targetDimensionMaxY === "number"
+        ? document.metadata.targetDimensionMaxY
+        : null,
+      disclaimer: javaHeightMetadata && typeof document.metadata?.heightDisclaimer === "string"
+        ? document.metadata.heightDisclaimer
+        : "",
+    },
   };
 };
 
@@ -103,6 +136,7 @@ export const serializeEngineeringPlanText = (
     t("export.guide.readmeTitle"),
     t("export.guide.blockCount", { count: number.format(plan.totalBlocks) }),
     t("export.guide.dimensions", { dimensions: plan.dimensions.join(" x ") }),
+    `Placement Y: ${plan.placement.recommendedBottomY}..${plan.placement.highestOccupiedY}`,
     t("export.guide.largeChests", { count: number.format(plan.materialPlan.totalLargeChests) }),
     t("export.guide.shulkerBoxes", { count: number.format(plan.materialPlan.totalShulkerBoxes) }),
     "",

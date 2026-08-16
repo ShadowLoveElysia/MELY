@@ -252,32 +252,22 @@ function Get-Sha256Line {
 
 Set-Location -LiteralPath $projectRoot
 
-$versionJsonPath = Join-Path $projectRoot "src\version\version.json"
-$tauriConfigPath = Join-Path $projectRoot "src-tauri\tauri.conf.json"
-$cargoTomlPath = Join-Path $projectRoot "src-tauri\Cargo.toml"
-$versionManifest = Get-Content -LiteralPath $versionJsonPath -Raw | ConvertFrom-Json
-$tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
-$cargoToml = Get-Content -LiteralPath $cargoTomlPath -Raw
-$cargoVersionMatch = [Regex]::Match($cargoToml, '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"')
-
-if (-not $cargoVersionMatch.Success) {
-  throw "Could not read the package version from src-tauri/Cargo.toml."
-}
-
-$version = [string]$versionManifest.version
-$tauriVersion = [string]$tauriConfig.version
-$cargoVersion = $cargoVersionMatch.Groups[1].Value
-if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
-  throw "Invalid semantic version in src/version/version.json: $version"
-}
-if ($tauriVersion -ne "../src/version/version.json" -or $version -ne $cargoVersion) {
-  throw "Version configuration mismatch: version.json=$version, tauri.conf.json=$tauriVersion, Cargo.toml=$cargoVersion"
-}
-
 $node = Resolve-Tool "node.exe" @(
   "$env:ProgramFiles\nodejs\node.exe",
   "$env:LOCALAPPDATA\Programs\nodejs\node.exe"
 )
+$versionScript = Join-Path $projectRoot "scripts\version.mjs"
+if (-not (Test-Path -LiteralPath $versionScript)) {
+  throw "Version synchronization script was not found: $versionScript"
+}
+
+# version.json 是唯一可编辑版本源；构建入口负责刷新所有 Cargo 派生字段。
+Invoke-Native $node @($versionScript, "sync")
+Invoke-Native $node @($versionScript, "check")
+$versionManifest = Get-Content -LiteralPath (Join-Path $projectRoot "src\version\version.json") -Raw |
+  ConvertFrom-Json
+$version = [string]$versionManifest.version
+
 $npm = Resolve-Tool "npm.cmd" @(
   "$env:ProgramFiles\nodejs\npm.cmd",
   "$env:LOCALAPPDATA\Programs\nodejs\npm.cmd"
@@ -380,7 +370,7 @@ if (-not (Test-Path -LiteralPath $typescriptCli) -or -not (Test-Path -LiteralPat
   throw "TypeScript or Vite dependencies are missing. Run npm ci or omit -SkipInstall."
 }
 
-Invoke-Native $node @("scripts/version.mjs", "check")
+Invoke-Native $node @($versionScript, "check")
 Invoke-Native $node @($typescriptCli, "-b")
 if (-not $SkipTests) {
   $testsRoot = Join-Path $projectRoot "tests"

@@ -12,6 +12,7 @@ import type {
   SolidVoxelResult,
 } from "../types";
 import { DEFAULT_BEDROCK_VERSION, DEFAULT_MINECRAFT_VERSION } from "./minecraftVersions";
+import { assertHologramBlockIsolation } from "./hologramIsolation";
 
 export const PROJECTION_DOCUMENT_VERSION = 1 as const;
 export const PROJECTION_CHUNK_SIZE = 32;
@@ -120,6 +121,28 @@ const stateKey = (state: ProjectionBlockState) => {
   return `${state.blockId}[${properties}]|${color}|${state.emissive ?? ""}`;
 };
 
+const JAVA_ONLY_PROJECTION_METADATA_KEYS = new Set([
+  "javaVersion",
+  "javaVersionId",
+  "versionId",
+  "releaseStatus",
+  "verification",
+  "profileFingerprint",
+  "targetHeight",
+  "heightMode",
+  "datapackAcknowledged",
+  "placementBottomY",
+  "targetDimension",
+  "targetDimensionId",
+  "targetDimensionMinY",
+  "targetDimensionMaxY",
+  "heightDisclaimer",
+  "confirmations",
+  "extremeConfirmations",
+  "configurationFingerprint",
+  "exportFingerprint",
+]);
+
 export const createProjectionDocument = (
   blocks: Iterable<ProjectionBlock>,
   palette: readonly ProjectionBlockState[],
@@ -224,10 +247,12 @@ export const createProjectionDocumentFromHologram = (
     }
     blocks[index] = { position: roundedPosition(result.positions, index), paletteIndex };
   }
-  return createProjectionDocument(blocks, palette, {
+  const document = createProjectionDocument(blocks, palette, {
     ...options,
     metadata: { source: "hologram", ...options.metadata },
   });
+  assertProjectionDocumentHologramIsolation(document, "ProjectionDocument");
+  return document;
 };
 
 export const createProjectionDocumentFromSolid = (
@@ -261,6 +286,28 @@ export const createProjectionDocumentFromResult = (
 
 export const projectionResultToDocument = createProjectionDocumentFromResult;
 
+/**
+ * Bedrock 导出只派生几何与通用工程信息，不继承 Java 世界高度授权。
+ */
+export const deriveBedrockProjectionDocument = (
+  document: ProjectionDocument,
+): ProjectionDocument => {
+  const metadataEntries = Object.entries(document.metadata ?? {}).filter(
+    ([key]) => !JAVA_ONLY_PROJECTION_METADATA_KEYS.has(key),
+  );
+  return createProjectionDocument(
+    iterateProjectionBlocks(document),
+    document.palette,
+    {
+      edition: "bedrock",
+      minecraftVersion: DEFAULT_BEDROCK_VERSION.id,
+      ...(metadataEntries.length > 0
+        ? { metadata: Object.fromEntries(metadataEntries) }
+        : {}),
+    },
+  );
+};
+
 export function* iterateProjectionBlocks(document: ProjectionDocument): Generator<ProjectionBlock> {
   for (const chunk of document.chunks) {
     if (chunk.positions.length !== chunk.paletteIndices.length) {
@@ -279,6 +326,62 @@ export function* iterateProjectionBlocks(document: ProjectionDocument): Generato
     }
   }
 }
+
+/** 最终导出前重算文档事实，拒绝伪造的 blockCount、bounds、调色板索引和重复坐标。 */
+export const assertProjectionDocumentIntegrity = (
+  document: ProjectionDocument,
+  context = "ProjectionDocument",
+) => {
+  const min: Point = [Infinity, Infinity, Infinity];
+  const max: Point = [-Infinity, -Infinity, -Infinity];
+  const occupied = new Set<string>();
+  let blockCount = 0;
+  for (const block of iterateProjectionBlocks(document)) {
+    if (!Number.isInteger(block.paletteIndex) || !document.palette[block.paletteIndex]) {
+      throw new RangeError(`${context} contains unknown palette index ${block.paletteIndex}`);
+    }
+    block.position.forEach((value, axis) => {
+      assertCoordinate(value, "xyz"[axis]);
+      min[axis] = Math.min(min[axis], value);
+      max[axis] = Math.max(max[axis], value);
+    });
+    const key = block.position.join(",");
+    if (occupied.has(key)) throw new Error(`${context} contains duplicate block at ${key}`);
+    occupied.add(key);
+    blockCount += 1;
+  }
+  if (blockCount !== document.blockCount) {
+    throw new Error(`${context} blockCount ${document.blockCount} does not match actual ${blockCount}`);
+  }
+  if (blockCount === 0) {
+    if (document.bounds !== null) throw new Error(`${context} empty document must not declare bounds`);
+    return;
+  }
+  if (!document.bounds) throw new Error(`${context} non-empty document must declare bounds`);
+  const actual = boundsFromExtents(min, max);
+  for (let axis = 0; axis < 3; axis += 1) {
+    if (!Number.isSafeInteger(actual.dimensions[axis]) || actual.dimensions[axis] <= 0) {
+      throw new RangeError(`${context} bounds exceed safe integer range`);
+    }
+    if (
+      document.bounds.min[axis] !== actual.min[axis]
+      || document.bounds.max[axis] !== actual.max[axis]
+      || document.bounds.dimensions[axis] !== actual.dimensions[axis]
+    ) {
+      throw new Error(`${context} declared bounds do not match actual block coordinates`);
+    }
+  }
+};
+
+/**
+ * 只要文档包含隔离材质就必须验证，不能信任可省略或伪造的 source 元数据。
+ */
+export const assertProjectionDocumentHologramIsolation = (
+  document: ProjectionDocument,
+  context = "Hologram projection",
+) => {
+  assertHologramBlockIsolation(iterateProjectionBlocks(document), document.palette, context);
+};
 
 export function* iterateProjectionSlice(
   document: ProjectionDocument,

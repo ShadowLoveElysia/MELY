@@ -15,11 +15,19 @@ test("Windows launcher prefers packaged EXE and retains explicit Web fallback", 
 
 test("Windows npm scripts invoke JavaScript entry points without relying on bin shims", async () => {
   const packageJson = JSON.parse(await readProjectFile("package.json"));
+  const synchronizeVersion = "npm run version:sync && npm run version:check";
+  assert.equal(packageJson.scripts["prestart:desktop"], synchronizeVersion);
+  assert.equal(packageJson.scripts["predev:desktop"], synchronizeVersion);
+  assert.equal(packageJson.scripts["prebuild:desktop"], synchronizeVersion);
+  assert.equal(packageJson.scripts.pretauri, synchronizeVersion);
   assert.equal(packageJson.scripts["start:desktop"], "node node_modules/@tauri-apps/cli/tauri.js dev");
   assert.equal(packageJson.scripts["dev:desktop"], "node node_modules/@tauri-apps/cli/tauri.js dev");
   assert.equal(packageJson.scripts["build:desktop"], "node node_modules/@tauri-apps/cli/tauri.js build");
   assert.equal(packageJson.scripts.typecheck, "node node_modules/typescript/bin/tsc -b");
-  assert.match(packageJson.scripts["build:web"], /^npm run version:check && npm run typecheck && node node_modules\/vite\/bin\/vite\.js build /);
+  assert.match(packageJson.scripts["build:web"], /^npm run typecheck && node node_modules\/vite\/bin\/vite\.js build /);
+  assert.doesNotMatch(packageJson.scripts["build:web"], /version:(?:sync|check)/);
+  assert.match(packageJson.scripts.test, /version:check/);
+  assert.doesNotMatch(packageJson.scripts.test, /version:sync/);
   assert.match(packageJson.scripts["dev:web"], /^node node_modules\/vite\/bin\/vite\.js /);
   assert.match(packageJson.scripts["preview:web"], /^node node_modules\/vite\/bin\/vite\.js preview /);
 });
@@ -33,8 +41,16 @@ test("Windows release builds reuse local dependencies without weakening CI insta
   assert.match(builder, /node_modules\\esbuild\\install\.js/);
   assert.match(builder, /node_modules\\tsx\\node_modules\\esbuild\\install\.js/);
   assert.match(builder, /Reusing installed dependencies for the local build/);
-  assert.match(builder, /Invoke-Native \$node @\("scripts\/version\.mjs", "check"\)/);
+  assert.match(builder, /Invoke-Native \$node @\(\$versionScript, "sync"\)/);
+  assert.match(builder, /Invoke-Native \$node @\(\$versionScript, "check"\)/);
+  assert.match(validation, /node\.exe" "scripts\\version\.mjs" sync/);
   assert.match(validation, /node\.exe" "scripts\\version\.mjs" check/);
+  assert.doesNotMatch(builder, /Version configuration mismatch/);
+  assert.ok(
+    builder.indexOf('Invoke-Native $node @($versionScript, "sync")')
+      < builder.indexOf("$versionManifest = Get-Content"),
+    "The release builder must synchronize derived versions before reading the artifact version.",
+  );
 });
 
 test("Tauri desktop shell uses v2 configuration and bundled Web assets", async () => {

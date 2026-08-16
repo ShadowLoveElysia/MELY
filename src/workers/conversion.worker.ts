@@ -3,6 +3,8 @@
 import { generateHologram, generateMeshHologram } from "../core/hologram";
 import { generateSolidVoxels } from "../core/solidVoxelizer";
 import { errorDescriptor } from "../core/appError";
+import { assertWorkerResources } from "../core/workerResourcePreflight";
+import { assertWorkerGenerationHeight, assertWorkerResultHeight } from "../core/workerHeightPreflight";
 import type { MmdMeshSnapshot, WorkerCommand, WorkerEvent, WorkerStage } from "../types";
 
 const send = (event: WorkerEvent, transfer: Transferable[] = []) => {
@@ -27,6 +29,8 @@ self.onmessage = (message: MessageEvent<WorkerCommand>) => {
   const sourceMesh = command.source.kind === "mesh" ? command.source.mesh : undefined;
 
   try {
+    assertWorkerGenerationHeight(command);
+    assertWorkerResources(command);
     const progress = (stage: WorkerStage, value: number) => {
       send({ type: "PROGRESS", jobId: command.jobId, stage, progress: value });
     };
@@ -34,13 +38,24 @@ self.onmessage = (message: MessageEvent<WorkerCommand>) => {
     if (command.type === "GENERATE_SOLID") {
       result = generateSolidVoxels(command.source.mesh, command.options, progress);
     } else if (command.source.kind === "mesh") {
-      result = generateMeshHologram(command.source.mesh, command.options, progress);
+      if (
+        !command.generationSeed
+        || command.generationSeed.minecraftVersion !== command.versionId
+      ) {
+        throw new RangeError("WORKER_GENERATION_SEED_INVALID");
+      }
+      result = generateMeshHologram(command.source.mesh, {
+        ...command.options,
+        contentHash: command.generationSeed.contentHash,
+        minecraftVersion: command.generationSeed.minecraftVersion,
+      }, progress);
     } else {
       progress("tracing", 0.18);
       progress("sampling", 0.55);
       result = generateHologram(command.options);
       progress("isolation", 0.82);
     }
+    assertWorkerResultHeight(command, result);
     send({ type: "PROGRESS", jobId: command.jobId, stage: "complete", progress: 1 });
     send(
       { type: "RESULT", jobId: command.jobId, result },

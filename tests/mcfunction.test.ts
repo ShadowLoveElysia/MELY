@@ -13,8 +13,16 @@ import {
   type McfunctionFile,
 } from "../src/core/mcfunction";
 import { AppError } from "../src/core/appError";
-import { createProjectionDocument } from "../src/core/projectionDocument";
+import {
+  createProjectionDocument,
+  deriveBedrockProjectionDocument,
+} from "../src/core/projectionDocument";
 import type { ProjectionBlockState } from "../src/types";
+
+const createBedrockDocument = (
+  blocks: Parameters<typeof createProjectionDocument>[0],
+  palette: Parameters<typeof createProjectionDocument>[1],
+) => createProjectionDocument(blocks, palette, { edition: "bedrock" });
 
 const fixedOptions = {
   namespace: "mely_test",
@@ -23,7 +31,7 @@ const fixedOptions = {
 } as const;
 
 test("mcfunction pack merges continuous lines and preserves isolated blocks", () => {
-  const document = createProjectionDocument([
+  const document = createBedrockDocument([
     { position: [100, 5, -20], paletteIndex: 0 },
     { position: [101, 5, -20], paletteIndex: 0 },
     { position: [102, 5, -20], paletteIndex: 0 },
@@ -49,8 +57,41 @@ test("mcfunction pack merges continuous lines and preserves isolated blocks", ()
   assert.deepEqual(exported.manifest.header.min_engine_version, [1, 20, 10]);
 });
 
+test("mcfunction rejects forged bounds before command generation", () => {
+  const document = createBedrockDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [10, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }]);
+  document.bounds = { min: [0, 0, 0], max: [0, 0, 0], dimensions: [1, 1, 1] };
+  assert.throws(() => createMcfunctionBehaviorPack(document, fixedOptions), /declared bounds/);
+});
+
+test("mcfunction ignores untested Java target and extreme-height metadata", () => {
+  const javaDocument = createProjectionDocument([
+    { position: [0, -2_032, 0], paletteIndex: 0 },
+    { position: [0, 2_031, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], {
+    edition: "java",
+    minecraftVersion: "26.3",
+    metadata: {
+      releaseStatus: "provisional",
+      heightMode: "experimental_4064",
+      targetHeight: 4_064,
+      heightDisclaimer: "Not yet tested",
+    },
+  });
+  const exported = createMcfunctionBehaviorPack(
+    deriveBedrockProjectionDocument(javaDocument),
+    fixedOptions,
+  );
+
+  assert.equal(exported.summary.blockCount, 2);
+  assert.equal(exported.summary.commandCount, 2);
+  assert.deepEqual(exported.manifest.header.min_engine_version, [1, 20, 10]);
+});
+
 test("streamed mcfunction ZIP is a complete Bedrock 1.20.10 behavior pack", async () => {
-  const document = createProjectionDocument([
+  const document = createBedrockDocument([
     { position: [0, 0, 0], paletteIndex: 0 },
     { position: [32, 0, 0], paletteIndex: 0 },
   ], [{ blockId: "minecraft:white_concrete" }]);
@@ -74,7 +115,7 @@ test("streamed mcfunction ZIP is a complete Bedrock 1.20.10 behavior pack", asyn
 });
 
 test("streamed mcfunction ZIP rejects output beyond the caller budget", async () => {
-  const document = createProjectionDocument([
+  const document = createBedrockDocument([
     { position: [0, 0, 0], paletteIndex: 0 },
   ], [{ blockId: "minecraft:white_concrete" }]);
   const chunks: Uint8Array[] = [];
@@ -97,7 +138,7 @@ test("streamed mcfunction ZIP rejects output beyond the caller budget", async ()
 });
 
 test("streamed mcfunction ZIP awaits an asynchronous sink without reordering chunks", async () => {
-  const document = createProjectionDocument(
+  const document = createBedrockDocument(
     Array.from({ length: 12 }, (_, index) => ({
       position: [index * 32, index % 3, 0] as [number, number, number],
       paletteIndex: 0,
@@ -127,7 +168,7 @@ test("streamed mcfunction ZIP awaits an asynchronous sink without reordering chu
 });
 
 test("mcfunction files obey configurable command and line limits", () => {
-  const document = createProjectionDocument(
+  const document = createBedrockDocument(
     Array.from({ length: 7 }, (_, index) => ({
       position: [index * 2, 0, index % 2],
       paletteIndex: 0,
@@ -162,7 +203,7 @@ test("mcfunction commands share Bedrock family and attachment mappings", () => {
     { blockId: "minecraft:vine", properties: { east: "true", north: "true", up: "true" } },
     { blockId: "minecraft:glow_lichen", properties: { down: "true", west: "true" } },
   ];
-  const document = createProjectionDocument(
+  const document = createBedrockDocument(
     palette.map((_, index) => ({ position: [index * 2, 0, 0], paletteIndex: index })),
     palette,
   );
@@ -212,7 +253,7 @@ const collectAsyncGenerator = async (
 };
 
 test("streaming callback matches the synchronous compatibility export", async () => {
-  const document = createProjectionDocument([
+  const document = createBedrockDocument([
     { position: [-33, 0, 0], paletteIndex: 0 },
     { position: [0, 0, 0], paletteIndex: 0 },
     { position: [1, 0, 0], paletteIndex: 0 },
@@ -249,7 +290,7 @@ test("streaming callback matches the synchronous compatibility export", async ()
 });
 
 test("async generator emits deterministic chunk and dispatcher order", async () => {
-  const document = createProjectionDocument(
+  const document = createBedrockDocument(
     Array.from({ length: 5 }, (_, index) => ({
       position: [index * 32, 0, 0] as [number, number, number],
       paletteIndex: 0,
@@ -284,7 +325,7 @@ test("async generator emits deterministic chunk and dispatcher order", async () 
 });
 
 test("streaming export validates chunk buffers before delivering files", async () => {
-  const document = createProjectionDocument([
+  const document = createBedrockDocument([
     { position: [0, 0, 0], paletteIndex: 0 },
   ], [{ blockId: "minecraft:white_concrete" }]);
   document.chunks[0].paletteIndices = new Uint16Array(0);
@@ -300,7 +341,7 @@ test("streaming export validates chunk buffers before delivering files", async (
 });
 
 test("iterator expands later chunks only after earlier leaf files are consumed", () => {
-  const document = createProjectionDocument([
+  const document = createBedrockDocument([
     { position: [0, 0, 0], paletteIndex: 0 },
     { position: [32, 0, 0], paletteIndex: 0 },
   ], [{ blockId: "minecraft:white_concrete" }]);

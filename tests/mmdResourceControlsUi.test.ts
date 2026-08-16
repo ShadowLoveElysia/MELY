@@ -124,7 +124,10 @@ test("sidebar resizing persists its width while numeric readouts remain visible"
   assert.match(app, /localStorage\.setItem\(SIDEBAR_WIDTH_STORAGE_KEY, String\(sidebarWidth\)\)/);
   assert.match(sidebar, /className="sidebar-resize-handle"/);
   assert.match(sidebar, /role="separator"/);
+  assert.match(sidebar, /event\.key === "End"/);
   assert.match(styles, /flex: 0 0 var\(--sidebar-width, 372px\)/);
+  assert.match(styles, /--sidebar-text-xs: calc\(0\.75rem \* var\(--sidebar-ui-scale, 1\)\)/);
+  assert.match(styles, /\.sidebar :is\([\s\S]*\.model-part__name small[\s\S]*font-size: var\(--sidebar-text-xs\)/);
   assert.match(styles, /\.model-stat-grid[\s\S]*repeat\(auto-fit, minmax\(64px, 1fr\)\)/);
   assert.match(styles, /\.model-stat-grid strong[\s\S]*overflow-wrap: anywhere[\s\S]*white-space: normal/);
   assert.match(styles, /\.viewport-motion__scrubber output[\s\S]*min-width: max-content[\s\S]*white-space: nowrap/);

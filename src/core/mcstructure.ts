@@ -9,7 +9,11 @@ import {
   type MinecraftBlockStateValue,
 } from "./blockRegistry";
 import { DEFAULT_BEDROCK_VERSION } from "./minecraftVersions";
-import { iterateProjectionBlocks } from "./projectionDocument";
+import {
+  assertProjectionDocumentHologramIsolation,
+  assertProjectionDocumentIntegrity,
+  iterateProjectionBlocks,
+} from "./projectionDocument";
 
 export type BedrockBlockStateValue = MinecraftBlockStateValue;
 
@@ -19,7 +23,6 @@ export interface ResolvedBedrockBlockState {
 }
 
 export interface McstructureExportOptions {
-  blockVersion?: number;
   maxVolume?: number;
 }
 
@@ -262,6 +265,13 @@ export const createMcstructure = (
   document: ProjectionDocument,
   options: McstructureExportOptions = {},
 ): McstructureExport => {
+  if (document.edition !== "bedrock" || document.minecraftVersion !== DEFAULT_BEDROCK_VERSION.id) {
+    throw new RangeError(
+      `Bedrock structure export requires a Bedrock ${DEFAULT_BEDROCK_VERSION.id} projection document`,
+    );
+  }
+  assertProjectionDocumentIntegrity(document, "Bedrock structure export");
+  assertProjectionDocumentHologramIsolation(document, "Bedrock structure export");
   if (!document.bounds || document.blockCount === 0) {
     throw new RangeError("Cannot export an empty Bedrock structure");
   }
@@ -303,7 +313,7 @@ export const createMcstructure = (
   }
   blocks.sort((left, right) => left.linearIndex - right.linearIndex);
 
-  const blockVersion = options.blockVersion ?? BEDROCK_BLOCK_VERSION;
+  const blockVersion = BEDROCK_BLOCK_VERSION;
   const writer = new LittleEndianNbtWriter(volume * 8 + palette.length * 128 + 4096);
   writer.header(TAG_COMPOUND, "");
   writer.namedInt("format_version", 1);

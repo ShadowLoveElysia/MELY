@@ -8,8 +8,16 @@ import type {
   ProjectionView,
   SolidOptions,
 } from "../types";
-import { DEFAULT_MINECRAFT_VERSION } from "./minecraftVersions";
 import { appError } from "./appError";
+import { resolveBlockId } from "./blockRegistry";
+import {
+  assertJavaProjectionExportSafety,
+  type JavaProjectionExportSafetyInput,
+} from "./exportPreflight";
+import type {
+  JavaCompatibilityLevel,
+  JavaCompatibilityWarningCode,
+} from "./minecraftVersions";
 import {
   createProjectionDocumentFromResult,
   iterateProjectionViewBlocks,
@@ -27,6 +35,7 @@ export interface ExportOptions {
   description?: string;
   timestamp?: number;
   regionMaxSize?: number | [number, number, number];
+  safety?: JavaProjectionExportSafetyInput;
 }
 
 export interface LitematicExportSummary {
@@ -38,8 +47,14 @@ export interface LitematicExportSummary {
   bitsPerBlock: number;
   longCount: number;
   dimensions: [number, number, number];
+  /** 用户选择的目标版本；不代表文件实际写入了该版本的 DataVersion。 */
   minecraftVersion: string;
+  serializerMinecraftVersion: string;
   dataVersion: number;
+  formatVersion: number;
+  subVersion: number;
+  compatibilityLevel: JavaCompatibilityLevel;
+  compatibilityWarningCode: JavaCompatibilityWarningCode | null;
   regionCount: number;
 }
 
@@ -109,7 +124,7 @@ export const unpackBlockState = (
 const litematicPalette = (document: ProjectionDocument): BlockState[] => [
   { Name: "minecraft:air" },
   ...document.palette.map((state) => ({
-    Name: state.blockId,
+    Name: resolveBlockId(state.blockId, "java", document.minecraftVersion),
     ...(state.properties ? { Properties: { ...state.properties } } : {}),
   })),
 ];
@@ -151,12 +166,27 @@ export const createLitematicFromDocument = (
   if (document.edition !== "java") {
     throw new RangeError("Litematica export requires a Java Edition projection document");
   }
-
-  const version = DEFAULT_MINECRAFT_VERSION;
+  const {
+    requestedProfile,
+    serializerProfile,
+    compatibility,
+  } = assertJavaProjectionExportSafety(
+    document,
+    "litematic",
+    exportOptions.safety,
+  );
+  const adapter = serializerProfile.exporters.litematic;
+  if (!adapter) {
+    throw new RangeError(
+      `Litematica export has no compatible serializer for Minecraft Java ${requestedProfile.id}`,
+    );
+  }
   const timestamp = BigInt(exportOptions.timestamp ?? Date.now());
   const name = sanitizeName(exportOptions.name ?? "MELY_Projection");
   const author = exportOptions.author?.trim() || "MELY";
-  const description = exportOptions.description?.trim() || `MELY | Minecraft ${version.id}`;
+  const description = exportOptions.description?.trim() || (compatibility.level === "best_effort"
+    ? `MELY | Target Minecraft ${requestedProfile.id} is untested; serialized with Java ${serializerProfile.id}`
+    : `MELY | Minecraft ${requestedProfile.id}`);
   const views = splitProjectionViews(document, exportOptions.regionMaxSize ?? 32);
   const palette = litematicPalette(document);
   let totalVolume = 0;
@@ -190,15 +220,20 @@ export const createLitematicFromDocument = (
   const [sizeX, sizeY, sizeZ] = document.bounds.dimensions;
 
   const root = {
-    Version: new Int(version.litematicVersion),
-    SubVersion: new Int(version.litematicSubVersion),
-    MinecraftDataVersion: new Int(version.dataVersion),
+    Version: new Int(adapter.formatVersion),
+    SubVersion: new Int(adapter.subVersion ?? 0),
+    // DataVersion 必须描述真实编码基线，不能伪装成尚未验证的目标版本。
+    MinecraftDataVersion: new Int(serializerProfile.dataVersion),
     Metadata: {
       EnclosingSize: { x: new Int(sizeX), y: new Int(sizeY), z: new Int(sizeZ) },
       Author: author,
       Description: description,
       Name: name,
       Software: "MELY_0.3.0",
+      TargetMinecraftVersion: requestedProfile.id,
+      SerializerMinecraftVersion: serializerProfile.id,
+      CompatibilityLevel: compatibility.level,
+      CompatibilityWarning: compatibility.warningCode ?? "",
       RegionCount: new Int(views.length),
       TimeCreated: timestamp,
       TimeModified: timestamp,
@@ -224,8 +259,13 @@ export const createLitematicFromDocument = (
       bitsPerBlock: maximumBitsPerBlock,
       longCount,
       dimensions: [...document.bounds.dimensions],
-      minecraftVersion: version.id,
-      dataVersion: version.dataVersion,
+      minecraftVersion: requestedProfile.id,
+      serializerMinecraftVersion: serializerProfile.id,
+      dataVersion: serializerProfile.dataVersion,
+      formatVersion: adapter.formatVersion,
+      subVersion: adapter.subVersion ?? 0,
+      compatibilityLevel: compatibility.level,
+      compatibilityWarningCode: compatibility.warningCode,
       regionCount: views.length,
     },
   };
@@ -233,9 +273,11 @@ export const createLitematicFromDocument = (
 
 export const createLitematic = (
   result: ProjectionResult,
-  _generationOptions: HologramOptions | SolidOptions,
+  generationOptions: HologramOptions | SolidOptions,
   exportOptions: ExportOptions = {},
-) => createLitematicFromDocument(createProjectionDocumentFromResult(result), {
+) => createLitematicFromDocument(createProjectionDocumentFromResult(result, {
+  metadata: { targetHeight: generationOptions.targetHeight },
+}), {
   ...exportOptions,
   name: exportOptions.name ?? (result.kind === "solid" ? "MELY_Solid" : "MELY_Hologram"),
 });

@@ -76,3 +76,27 @@ test("Sponge schematic rejects empty and oversized dense bounds", () => {
   ], [{ blockId: "minecraft:stone" }]);
   assert.throws(() => createSchematic(sparse, { maxVolume: 1000 }), /exceeds limit/i);
 });
+
+test("Sponge serializer uses compatibility metadata for untested registered versions", async () => {
+  const untested = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:stone" }], { minecraftVersion: "26.3" });
+  const exported = createSchematic(untested);
+  const parsed = nbt.parseUncompressed(Buffer.from(gunzipSync(exported.bytes)), "big");
+  const root = nbt.simplify(parsed) as any;
+  assert.equal(root.Version, 3);
+  assert.equal(root.DataVersion, 3465);
+});
+
+test("Sponge serializer permits explicit best-effort DataVersion overrides", async () => {
+  const verified = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:stone" }]);
+  const exported = createSchematic(verified, { dataVersion: 9999 });
+  const parsed = nbt.parseUncompressed(Buffer.from(gunzipSync(exported.bytes)), "big");
+  assert.equal((nbt.simplify(parsed) as any).DataVersion, 9999);
+  assert.throws(
+    () => createSchematic(verified, { dataVersion: -1 }),
+    /non-negative 32-bit integer/,
+  );
+});

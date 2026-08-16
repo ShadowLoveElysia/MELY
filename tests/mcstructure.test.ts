@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { test } from "node:test";
 import * as nbt from "prismarine-nbt";
-import { createProjectionDocument } from "../src/core/projectionDocument";
+import {
+  createProjectionDocument,
+  deriveBedrockProjectionDocument,
+} from "../src/core/projectionDocument";
 import {
   BEDROCK_BLOCK_VERSION,
   createMcstructure,
@@ -12,7 +15,7 @@ import {
 test("Bedrock mcstructure is little-endian NBT with two block index layers", () => {
   const document = createProjectionDocument([
     { position: [-1, 5, 8], paletteIndex: 0 },
-    { position: [0, 5, 8], paletteIndex: 1 },
+    { position: [1, 5, 8], paletteIndex: 1 },
     { position: [-1, 6, 9], paletteIndex: 0 },
   ], [
     { blockId: "minecraft:end_rod", properties: { facing: "up" }, emissive: true },
@@ -27,11 +30,11 @@ test("Bedrock mcstructure is little-endian NBT with two block index layers", () 
   const parsed = nbt.parseUncompressed(Buffer.from(exported.bytes), "little");
   const root = nbt.simplify(parsed) as any;
   assert.equal(root.format_version, 1);
-  assert.deepEqual(root.size, [2, 2, 2]);
+  assert.deepEqual(root.size, [3, 2, 2]);
   assert.deepEqual(root.structure_world_origin, [-1, 5, 8]);
   assert.equal(root.structure.block_indices.length, 2);
-  assert.deepEqual(root.structure.block_indices[0], [0, -1, -1, 0, 1, -1, -1, -1]);
-  assert.deepEqual(root.structure.block_indices[1], new Array(8).fill(-1));
+  assert.deepEqual(root.structure.block_indices[0], [0, -1, -1, 0, -1, -1, -1, -1, 1, -1, -1, -1]);
+  assert.deepEqual(root.structure.block_indices[1], new Array(12).fill(-1));
   assert.deepEqual(root.structure.entities, []);
 
   const palette = root.structure.palette.default.block_palette;
@@ -43,6 +46,35 @@ test("Bedrock mcstructure is little-endian NBT with two block index layers", () 
   assert.deepEqual(palette[1].states, { color: "white" });
   assert.ok(palette.every((entry: any) => entry.version === BEDROCK_BLOCK_VERSION));
   assert.deepEqual(root.structure.palette.default.block_position_data, {});
+});
+
+test("Bedrock mcstructure rejects forged bounds before dense serialization", () => {
+  const document = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [10, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], { edition: "bedrock" });
+  document.bounds = { min: [0, 0, 0], max: [0, 0, 0], dimensions: [1, 1, 1] };
+  assert.throws(() => createMcstructure(document), /declared bounds/);
+});
+
+test("Bedrock mcstructure ignores untested Java target and extreme-height metadata", () => {
+  const javaDocument = createProjectionDocument([
+    { position: [0, -2_032, 0], paletteIndex: 0 },
+    { position: [0, 2_031, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], {
+    edition: "java",
+    minecraftVersion: "26.3",
+    metadata: {
+      releaseStatus: "provisional",
+      heightMode: "experimental_4064",
+      targetHeight: 4_064,
+      heightDisclaimer: "Not yet tested",
+    },
+  });
+  const exported = createMcstructure(deriveBedrockProjectionDocument(javaDocument));
+
+  assert.deepEqual(exported.summary.dimensions, [1, 4_064, 1]);
+  assert.equal(exported.summary.blockCount, 2);
 });
 
 test("Bedrock state resolver converts Java facing and removes pane connections", () => {

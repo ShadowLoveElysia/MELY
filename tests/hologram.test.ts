@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { generateMeshHologram } from "../src/core/hologram";
+import { generateHologram, generateMeshHologram } from "../src/core/hologram";
+import { assertSixWayIsolated } from "../src/core/hologramIsolation";
 import type { HologramMeshSnapshot, HologramOptions } from "../src/types";
 
 const cubeIndices = Uint32Array.from([
@@ -29,12 +30,94 @@ const createCube = (scale = 1, offset: [number, number, number] = [0, 0, 0]): Ho
   };
 };
 
+const createSubdividedCube = (segments: number): HologramMeshSnapshot => {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const appendFace = (
+    origin: [number, number, number],
+    axisU: [number, number, number],
+    axisV: [number, number, number],
+    reverse: boolean,
+  ) => {
+    const offset = positions.length / 3;
+    for (let v = 0; v <= segments; v += 1) {
+      for (let u = 0; u <= segments; u += 1) {
+        positions.push(
+          origin[0] + axisU[0] * u / segments + axisV[0] * v / segments,
+          origin[1] + axisU[1] * u / segments + axisV[1] * v / segments,
+          origin[2] + axisU[2] * u / segments + axisV[2] * v / segments,
+        );
+      }
+    }
+    for (let v = 0; v < segments; v += 1) {
+      for (let u = 0; u < segments; u += 1) {
+        const a = offset + v * (segments + 1) + u;
+        const b = a + 1;
+        const d = a + segments + 1;
+        const c = d + 1;
+        indices.push(...(reverse ? [a, c, b, a, d, c] : [a, b, c, a, c, d]));
+      }
+    }
+  };
+
+  appendFace([-1, 0, -1], [2, 0, 0], [0, 2, 0], true);
+  appendFace([-1, 0, 1], [0, 2, 0], [2, 0, 0], true);
+  appendFace([-1, 0, -1], [0, 0, 2], [2, 0, 0], true);
+  appendFace([-1, 2, -1], [2, 0, 0], [0, 0, 2], true);
+  appendFace([-1, 0, -1], [0, 2, 0], [0, 0, 2], true);
+  appendFace([1, 0, -1], [0, 0, 2], [0, 2, 0], true);
+
+  return {
+    positions: Float32Array.from(positions),
+    indices: Uint32Array.from(indices),
+    triangleMaterials: new Uint16Array(indices.length / 3),
+  };
+};
+
+const createTriangleSoupCube = (flipTriangle = false): HologramMeshSnapshot => {
+  const source = createCube();
+  const positions: number[] = [];
+  const indices: number[] = [];
+  for (let triangle = 0; triangle < source.indices.length / 3; triangle += 1) {
+    const vertices = [0, 1, 2].map((corner) => source.indices[triangle * 3 + corner]);
+    if (flipTriangle && triangle === 0) vertices.reverse();
+    for (const vertex of vertices) {
+      positions.push(
+        source.positions[vertex * 3],
+        source.positions[vertex * 3 + 1],
+        source.positions[vertex * 3 + 2],
+      );
+      indices.push(indices.length);
+    }
+  }
+  return {
+    positions: Float32Array.from(positions),
+    indices: Uint32Array.from(indices),
+    triangleMaterials: new Uint16Array(indices.length / 3),
+  };
+};
+
+const createIntersectingClosedShells = (): HologramMeshSnapshot => {
+  const left = createCube(1, [-0.6, 0, 0]);
+  const right = createCube(1, [0.6, 0, 0]);
+  const vertexOffset = left.positions.length / 3;
+  return {
+    positions: Float32Array.from([...left.positions, ...right.positions]),
+    indices: Uint32Array.from([
+      ...left.indices,
+      ...Array.from(right.indices, (index) => index + vertexOffset),
+    ]),
+    triangleMaterials: new Uint16Array(
+      (left.indices.length + right.indices.length) / 3,
+    ),
+  };
+};
+
 const options: HologramOptions = {
   targetHeight: 32,
   sampleSpacing: 2,
   material: "mixed",
   directionMode: "vertical",
-  isolatePanes: true,
   preserveFace: true,
   glow: 70,
 };
@@ -46,6 +129,25 @@ const positionKeys = (positions: Float32Array) => {
   }
   return keys;
 };
+
+const positionsFromResult = (positions: Float32Array) => {
+  const result: Array<[number, number, number]> = [];
+  for (let index = 0; index < positions.length; index += 3) {
+    result.push([positions[index], positions[index + 1], positions[index + 2]]);
+  }
+  return result;
+};
+
+const createOpenPlane = (): HologramMeshSnapshot => ({
+  positions: Float32Array.from([
+    -1, 0, -1,
+    1, 0, -1,
+    1, 2, 1,
+    -1, 2, 1,
+  ]),
+  indices: Uint32Array.from([0, 2, 1, 0, 3, 2]),
+  triangleMaterials: new Uint16Array(2),
+});
 
 const createFaceAndHairSnapshot = (): HologramMeshSnapshot => {
   const quads = [
@@ -194,4 +296,170 @@ test("2032-block holograms remain sparse and vertically bounded", () => {
   assert.ok(result.stats.blockCount < 320_000);
   assert.ok(result.positions.byteLength < 4 * 1024 * 1024);
   assert.ok(result.facings.every((facing) => facing === 2));
+});
+
+test("2032-block interior sampling stays sparse and below the final block budget", () => {
+  const result = generateMeshHologram(createCube(), {
+    ...options,
+    targetHeight: 2_032,
+    sampleSpacing: 3,
+    material: "mixed",
+    interiorDensity: 100,
+  });
+
+  assert.equal(result.stats.interiorMode, "closed-volume");
+  assert.ok(result.stats.interiorSamplingStride > 1);
+  assert.ok(result.stats.interiorCandidateCount > 0);
+  assert.ok(result.stats.blockCount <= 320_000);
+  assertSixWayIsolated(positionsFromResult(result.positions));
+});
+
+test("high-triangle closed meshes use bounded deterministic scanline sampling", () => {
+  const mesh = createSubdividedCube(24);
+  const startedAt = performance.now();
+  const first = generateMeshHologram(mesh, {
+    ...options,
+    targetHeight: 384,
+    sampleSpacing: 5,
+    interiorDensity: 100,
+    contentHash: "subdivided-cube-fixture",
+  });
+  const elapsed = performance.now() - startedAt;
+  const second = generateMeshHologram(mesh, {
+    ...options,
+    targetHeight: 384,
+    sampleSpacing: 5,
+    interiorDensity: 100,
+    contentHash: "subdivided-cube-fixture",
+  });
+
+  assert.equal(mesh.indices.length / 3, 6_912);
+  assert.equal(first.stats.interiorMode, "closed-volume");
+  assert.ok(first.stats.interiorCandidateCount > 0);
+  assert.ok(elapsed < 5_000, `topology and scanline sampling took ${elapsed.toFixed(1)} ms`);
+  assert.deepEqual([...second.positions], [...first.positions]);
+  assertSixWayIsolated(positionsFromResult(first.positions));
+});
+
+test("interior density defaults to zero and keeps legacy outline output", () => {
+  const implicit = generateMeshHologram(createCube(), options);
+  const explicit = generateMeshHologram(createCube(), { ...options, interiorDensity: 0 });
+
+  assert.deepEqual(positionKeys(implicit.positions), positionKeys(explicit.positions));
+  assert.equal(implicit.stats.interiorDensity, 0);
+  assert.equal(implicit.stats.interiorMode, "disabled");
+  assert.equal(implicit.stats.interiorBlockCount, 0);
+});
+
+test("closed meshes select deterministic monotonic interior candidates", () => {
+  const densities = [0, 1, 25, 50, 75, 100];
+  const results = densities.map((interiorDensity) => generateMeshHologram(createCube(), {
+    ...options,
+    targetHeight: 24,
+    sampleSpacing: 4,
+    material: "mixed",
+    interiorDensity,
+    contentHash: "closed-cube-fixture",
+    minecraftVersion: "1.20.1",
+  }));
+
+  for (let index = 1; index < results.length; index += 1) {
+    assert.equal(results[index].stats.interiorMode, "closed-volume");
+    assert.ok(
+      results[index].stats.interiorSelectedCount >= results[index - 1].stats.interiorSelectedCount,
+    );
+    assert.equal(
+      results[index].stats.interiorCandidateCount,
+      results[1].stats.interiorCandidateCount,
+    );
+    const previous = new Set(positionKeys(results[index - 1].positions));
+    const current = new Set(positionKeys(results[index].positions));
+    for (const position of previous) {
+      assert.ok(current.has(position), `density ${densities[index]} removed ${position}`);
+    }
+  }
+  assert.ok(results.at(-1)!.stats.interiorCandidateCount > 0);
+  assert.ok(
+    results.at(-1)!.stats.interiorSelectedCount
+      <= results.at(-1)!.stats.interiorCandidateCount,
+  );
+
+  const repeated = generateMeshHologram(createCube(), {
+    ...options,
+    targetHeight: 24,
+    sampleSpacing: 4,
+    interiorDensity: 50,
+    contentHash: "closed-cube-fixture",
+    minecraftVersion: "1.20.1",
+  });
+  assert.deepEqual([...repeated.positions], [...results[3].positions]);
+  assert.deepEqual([...repeated.materials], [...results[3].materials]);
+});
+
+test("triangle-soup winding is checked by geometric edge direction", () => {
+  const closed = generateMeshHologram(createTriangleSoupCube(), {
+    ...options,
+    interiorDensity: 100,
+  });
+  const flipped = generateMeshHologram(createTriangleSoupCube(true), {
+    ...options,
+    interiorDensity: 100,
+  });
+
+  assert.equal(closed.stats.interiorMode, "closed-volume");
+  assert.equal(flipped.stats.interiorMode, "shell-fallback");
+  assert.ok(flipped.stats.interiorWarnings.some((warning) => (
+    warning.endsWith(".inconsistent-winding")
+  )));
+});
+
+test("intersecting closed shells conservatively fall back without flagging adjacent cube faces", () => {
+  const valid = generateMeshHologram(createCube(), {
+    ...options,
+    interiorDensity: 100,
+  });
+  const intersecting = generateMeshHologram(createIntersectingClosedShells(), {
+    ...options,
+    interiorDensity: 100,
+  });
+
+  assert.equal(valid.stats.interiorMode, "closed-volume");
+  assert.equal(intersecting.stats.interiorMode, "shell-fallback");
+  assert.ok(intersecting.stats.interiorWarnings.some((warning) => (
+    warning.endsWith(".self-intersecting")
+  )));
+});
+
+test("open meshes fall back to a shell and expose a warning", () => {
+  const result = generateMeshHologram(createOpenPlane(), {
+    ...options,
+    targetHeight: 24,
+    interiorDensity: 100,
+  });
+
+  assert.equal(result.stats.interiorMode, "shell-fallback");
+  assert.ok(result.stats.interiorCandidateCount > 0);
+  assert.ok(result.stats.interiorWarnings.some((warning) => warning.endsWith(".open")));
+});
+
+test("all generated hologram materials obey the X/Y/Z six-way invariant", () => {
+  for (const material of ["end_rod", "white_pane", "mixed"] as const) {
+    const result = generateMeshHologram(createCube(), {
+      ...options,
+      material,
+      interiorDensity: 100,
+    });
+    assert.doesNotThrow(() => assertSixWayIsolated(positionsFromResult(result.positions)));
+  }
+
+  assert.throws(
+    () => assertSixWayIsolated([[0, 0, 0], [0, 1, 0]]),
+    /six-way isolation/,
+  );
+});
+
+test("demo generation reports unavailable interior sampling without a mesh", () => {
+  const result = generateHologram({ ...options, interiorDensity: 50 });
+  assert.equal(result.stats.interiorMode, "unavailable");
+  assert.deepEqual(result.stats.interiorWarnings, ["hologram.interior.unavailable.noMesh"]);
 });

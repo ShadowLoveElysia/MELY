@@ -4,8 +4,11 @@ import type {
   ProjectionBlockState,
   ProjectionDocument,
 } from "../types";
-import { DEFAULT_MINECRAFT_VERSION } from "./minecraftVersions";
 import { resolveBlockId } from "./blockRegistry";
+import {
+  assertJavaProjectionExportSafety,
+  type JavaProjectionExportSafetyInput,
+} from "./exportPreflight";
 import { iterateProjectionBlocks } from "./projectionDocument";
 
 export interface SchematicExportOptions {
@@ -14,6 +17,7 @@ export interface SchematicExportOptions {
   description?: string;
   dataVersion?: number;
   maxVolume?: number;
+  safety?: JavaProjectionExportSafetyInput;
 }
 
 export interface SchematicExport {
@@ -98,6 +102,14 @@ export const createSchematic = (
   if (!document.bounds || document.blockCount === 0) {
     throw new RangeError("Cannot export an empty Sponge schematic");
   }
+  const { profile: version } = assertJavaProjectionExportSafety(
+    document,
+    "schematic",
+    options.safety,
+  );
+  if (!version.exporters.spongeSchematic || version.dataVersion === null) {
+    throw new RangeError(`Sponge schematic export is unavailable for Minecraft Java ${version.id}`);
+  }
   const dimensions = [...document.bounds.dimensions] as [number, number, number];
   dimensions.forEach((dimension) => {
     if (!Number.isSafeInteger(dimension) || dimension <= 0 || dimension > 0x7fff) {
@@ -146,9 +158,16 @@ export const createSchematic = (
   const palette = Object.fromEntries(
     states.map((state, index) => [state, new Int(index)]),
   ) as TagObject;
-  const dataVersion = options.dataVersion ?? DEFAULT_MINECRAFT_VERSION.dataVersion;
+  if (
+    options.dataVersion !== undefined
+    && (!Number.isSafeInteger(options.dataVersion) || options.dataVersion < 0 || options.dataVersion > 0x7fff_ffff)
+  ) {
+    throw new RangeError("Sponge schematic DataVersion must be a non-negative 32-bit integer");
+  }
+  // 默认写入明确的兼容 Profile 元数据；仍允许社区显式覆盖进行兼容性尝试。
+  const dataVersion = options.dataVersion ?? version.dataVersion;
   const root = {
-    Version: new Int(3),
+    Version: new Int(version.exporters.spongeSchematic.formatVersion),
     DataVersion: new Int(dataVersion),
     Metadata: {
       Name: sanitizeText(options.name, "MELY Projection"),

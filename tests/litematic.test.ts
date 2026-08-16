@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Buffer } from "node:buffer";
 import * as nbt from "prismarine-nbt";
-import { createLitematic, packBlockStates, unpackBlockState } from "../src/core/litematic";
+import {
+  createLitematic,
+  createLitematicFromDocument,
+  packBlockStates,
+  unpackBlockState,
+} from "../src/core/litematic";
+import { createProjectionDocument } from "../src/core/projectionDocument";
 import type { HologramOptions, HologramResult } from "../src/types";
 import type { SolidOptions, SolidVoxelResult } from "../src/types";
 
@@ -11,7 +17,6 @@ const options: HologramOptions = {
   sampleSpacing: 2,
   material: "mixed",
   directionMode: "vertical",
-  isolatePanes: true,
   preserveFace: true,
   glow: 70,
 };
@@ -55,12 +60,12 @@ test("continuous palette indices survive 64-bit boundaries", () => {
 test("generated file is a valid Minecraft 1.20.1 Litematica v6 schematic", async () => {
   const positions = new Float32Array([
     0, 0, 0,
-    1, 0, 0,
     2, 0, 0,
-    3, 0, 0,
     4, 0, 0,
-    5, 0, 0,
     6, 0, 0,
+    8, 0, 0,
+    10, 0, 0,
+    12, 0, 0,
   ]);
   const result: HologramResult = {
     positions,
@@ -71,11 +76,11 @@ test("generated file is a valid Minecraft 1.20.1 Litematica v6 schematic", async
       endRodCount: 6,
       paneCount: 1,
       removedConflicts: 0,
-      dimensions: [7, 1, 1],
+      dimensions: [13, 1, 1],
     },
     bounds: {
       min: [0, 0, 0],
-      max: [6, 0, 0],
+      max: [12, 0, 0],
     },
   };
 
@@ -94,12 +99,12 @@ test("generated file is a valid Minecraft 1.20.1 Litematica v6 schematic", async
   assert.equal(root.Version, 6);
   assert.equal(root.SubVersion, 1);
   assert.equal(root.MinecraftDataVersion, 3465);
-  assert.deepEqual(root.Metadata.EnclosingSize, { x: 7, y: 1, z: 1 });
+  assert.deepEqual(root.Metadata.EnclosingSize, { x: 13, y: 1, z: 1 });
   assert.equal(root.Metadata.TotalBlocks, 7);
-  assert.equal(root.Metadata.TotalVolume, 7);
+  assert.equal(root.Metadata.TotalVolume, 13);
   assert.equal(root.Metadata.RegionCount, 1);
   assert.deepEqual(region.Position, { x: 0, y: 0, z: 0 });
-  assert.deepEqual(region.Size, { x: 7, y: 1, z: 1 });
+  assert.deepEqual(region.Size, { x: 13, y: 1, z: 1 });
 
   const palette = region.BlockStatePalette as Array<{
     Name: string;
@@ -124,7 +129,7 @@ test("generated file is a valid Minecraft 1.20.1 Litematica v6 schematic", async
 
   const bitsPerBlock = Math.max(2, Math.ceil(Math.log2(palette.length)));
   const blockStates = region.BlockStates as [number, number][];
-  const decoded = Array.from({ length: 7 }, (_, index) =>
+  const decoded = Array.from({ length: 13 }, (_, index) =>
     unpackIndependent(blockStates, index, bitsPerBlock),
   );
   assert.equal(decoded.filter((index) => index !== 0).length, 7);
@@ -137,7 +142,7 @@ test("generated file is a valid Minecraft 1.20.1 Litematica v6 schematic", async
   }
 });
 
-test("white panes remain independent even when an older option disables isolation", async () => {
+test("coordinate isolation cannot be bypassed by direct serialization", () => {
   const result: HologramResult = {
     positions: Float32Array.from([0, 0, 0, 1, 0, 0]),
     facings: Uint8Array.from([2, 2]),
@@ -151,19 +156,97 @@ test("white panes remain independent even when an older option disables isolatio
     },
     bounds: { min: [0, 0, 0], max: [1, 0, 0] },
   };
-  const exported = createLitematic(result, { ...options, isolatePanes: false }, { timestamp: 1 });
+  assert.throws(
+    () => createLitematic(result, options, { timestamp: 1 }),
+    /six-way isolation/,
+  );
+});
+
+test("registered untested versions use an explicit Litematica compatibility serializer", async () => {
+  const untested = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], { minecraftVersion: "1.20.2" });
+  const exported = createLitematicFromDocument(untested, { timestamp: 1 });
   const { parsed } = await nbt.parse(Buffer.from(exported.bytes), "big");
   const root = nbt.simplify(parsed) as any;
-  const pane = root.Regions.Hologram.BlockStatePalette.find(
-    (state: any) => state.Name === "minecraft:white_stained_glass_pane",
+
+  assert.equal(root.Version, 6);
+  assert.equal(root.SubVersion, 1);
+  assert.equal(root.MinecraftDataVersion, 3465);
+  assert.equal(root.Metadata.TargetMinecraftVersion, "1.20.2");
+  assert.equal(root.Metadata.SerializerMinecraftVersion, "1.20.1");
+  assert.equal(root.Metadata.CompatibilityLevel, "best_effort");
+  assert.equal(root.Metadata.CompatibilityWarning, "JAVA_VERSION_BEST_EFFORT");
+  assert.match(root.Metadata.Description, /Target Minecraft 1\.20\.2 is untested/);
+  assert.equal(exported.summary.minecraftVersion, "1.20.2");
+  assert.equal(exported.summary.serializerMinecraftVersion, "1.20.1");
+  assert.equal(exported.summary.dataVersion, 3465);
+  assert.equal(exported.summary.formatVersion, 6);
+  assert.equal(exported.summary.subVersion, 1);
+  assert.equal(exported.summary.compatibilityLevel, "best_effort");
+  assert.equal(exported.summary.compatibilityWarningCode, "JAVA_VERSION_BEST_EFFORT");
+});
+
+test("direct Litematica serialization still rejects injected adjacency", () => {
+
+  const adjacent = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [1, 0, 0], paletteIndex: 1 },
+  ], [
+    { blockId: "minecraft:end_rod" },
+    { blockId: "minecraft:white_stained_glass_pane" },
+  ]);
+  assert.throws(
+    () => createLitematicFromDocument(adjacent),
+    /six-way isolation/,
   );
-  assert.deepEqual(pane.Properties, {
-    east: "false",
-    north: "false",
-    south: "false",
-    waterlogged: "false",
-    west: "false",
-  });
+});
+
+test("direct Litematica serialization rejects block ids absent from the compatibility registry", () => {
+  const unknownBlock = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:future_custom_block" }]);
+
+  assert.throws(
+    () => createLitematicFromDocument(unknownBlock),
+    /JAVA_BLOCK_UNSUPPORTED.*future_custom_block/,
+  );
+});
+
+test("direct Litematica serialization rejects unknown version ids and damaged documents", () => {
+  const unknownVersion = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], { minecraftVersion: "future-unknown" });
+  assert.throws(
+    () => createLitematicFromDocument(unknownVersion),
+    /JAVA_VERSION_PROFILE_UNKNOWN/,
+  );
+
+  const source = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }]);
+  const damaged = {
+    ...source,
+    blockCount: 2,
+  };
+  assert.throws(
+    () => createLitematicFromDocument(damaged),
+    /blockCount.*does not match actual/,
+  );
+});
+
+test("Litematica palette writes the Profile registry's canonical Java block id", async () => {
+  const aliasDocument = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "white_concrete" }]);
+
+  const exported = createLitematicFromDocument(aliasDocument, { timestamp: 1 });
+  const { parsed } = await nbt.parse(Buffer.from(exported.bytes), "big");
+  const root = nbt.simplify(parsed) as any;
+  assert.deepEqual(root.Regions.Hologram.BlockStatePalette, [
+    { Name: "minecraft:air" },
+    { Name: "minecraft:white_concrete" },
+  ]);
 });
 
 test("solid projection writes its Minecraft block palette and indices", async () => {
@@ -221,7 +304,7 @@ test("solid projection writes its Minecraft block palette and indices", async ()
   assert.deepEqual(decoded, [1, 2, 1, 0]);
 });
 
-test("sparse tall projections export as bounded multi-region Litematica data", async () => {
+test("sparse tall projections require an explicit dimension and then allow generation", async () => {
   const result: SolidVoxelResult = {
     kind: "solid",
     positions: Float32Array.from([
@@ -243,7 +326,7 @@ test("sparse tall projections export as bounded multi-region Litematica data", a
     },
     bounds: { min: [0, 0, 0], max: [31, 2_031, 31] },
   };
-  const exported = createLitematic(result, {
+  const generationOptions: SolidOptions = {
     targetHeight: 2_032,
     alphaThreshold: 0.3,
     thicknessCompensation: 0.08,
@@ -259,21 +342,27 @@ test("sparse tall projections export as bounded multi-region Litematica data", a
     skinMaterialIndices: [],
     excludeGravity: true,
     excludeRare: true,
-  }, { timestamp: 1, regionMaxSize: 32 });
+  };
+  assert.throws(
+    () => createLitematic(result, generationOptions, { timestamp: 1, regionMaxSize: 32 }),
+    /explicit target dimension range/,
+  );
+  const exported = createLitematic(result, generationOptions, {
+    timestamp: 1,
+    regionMaxSize: 32,
+    safety: {
+      heightMode: "extended_2032",
+      targetHeight: 2_032,
+      datapackAcknowledged: true,
+      placementBottomY: -1_016,
+      targetDimension: { minY: -1_016, height: 2_032 },
+    },
+  });
   const { parsed } = await nbt.parse(Buffer.from(exported.bytes), "big");
   const root = nbt.simplify(parsed) as any;
   assert.equal(root.Metadata.RegionCount, 2);
   assert.equal(root.Metadata.TotalBlocks, 3);
-  assert.equal(root.Metadata.TotalVolume, 32 ** 3 + 32 * 16 * 32);
   assert.deepEqual(root.Metadata.EnclosingSize, { x: 32, y: 2_032, z: 32 });
   assert.equal(exported.summary.regionCount, 2);
-  assert.ok(exported.summary.volume < 32 * 2_032 * 32);
-  assert.deepEqual(Object.values(root.Regions).map((region: any) => region.Size), [
-    { x: 32, y: 32, z: 32 },
-    { x: 32, y: 16, z: 32 },
-  ]);
-  assert.deepEqual(Object.values(root.Regions).map((region: any) => region.Position), [
-    { x: 0, y: 0, z: 0 },
-    { x: 0, y: 2_016, z: 0 },
-  ]);
+  assert.equal(exported.summary.dataVersion, 3465);
 });

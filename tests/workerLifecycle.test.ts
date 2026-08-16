@@ -32,10 +32,13 @@ const command = (jobId: string): WorkerCommand => ({
     sampleSpacing: 2,
     material: "mixed",
     directionMode: "vertical",
-    isolatePanes: true,
     preserveFace: true,
     glow: 72,
   },
+  generationSeed: { contentHash: "fixture", minecraftVersion: "1.20.1" },
+  versionId: "1.20.1",
+  targetDimension: { minY: -64, height: 384 },
+  placementBottomY: -64,
   source: { kind: "demo" },
 });
 

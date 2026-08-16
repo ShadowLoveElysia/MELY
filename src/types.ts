@@ -1,4 +1,9 @@
 import type { AppErrorCode } from "./core/appError";
+import type {
+  ExtremeHeightConfirmationState,
+  HeightDimension,
+  HeightMode,
+} from "./core/heightSafety";
 
 export type HologramMaterial = "end_rod" | "white_pane" | "mixed";
 export type DirectionMode = "vertical";
@@ -106,9 +111,10 @@ export type MmdMotionTracks = Record<MmdMotionTrackKind, MmdMotionTrackInfo | nu
 export interface HologramOptions {
   targetHeight: number;
   sampleSpacing: number;
+  /** 0..100，独立于轮廓采样间距的内部候选覆盖比例。 */
+  interiorDensity?: number;
   material: HologramMaterial;
   directionMode: DirectionMode;
-  isolatePanes: boolean;
   preserveFace: boolean;
   glow: number;
 }
@@ -119,6 +125,13 @@ export interface HologramStats {
   paneCount: number;
   removedConflicts: number;
   dimensions: [number, number, number];
+  interiorDensity?: number;
+  interiorMode?: "disabled" | "closed-volume" | "shell-fallback" | "unavailable";
+  interiorCandidateCount?: number;
+  interiorSelectedCount?: number;
+  interiorBlockCount?: number;
+  interiorSamplingStride?: number;
+  interiorWarnings?: string[];
 }
 
 export interface HologramResult {
@@ -297,12 +310,30 @@ export type WorkerCommand =
       type: "GENERATE_HOLOGRAM";
       jobId: string;
       options: HologramOptions;
+      versionId?: string;
+      heightMode?: HeightMode;
+      datapackAcknowledged?: boolean;
+      targetDimension?: HeightDimension;
+      placementBottomY?: number;
+      confirmations?: ExtremeHeightConfirmationState;
+      configurationFingerprint?: string;
+      generationSeed?: {
+        contentHash: string;
+        minecraftVersion: string;
+      };
       source: HologramSource;
     }
   | {
       type: "GENERATE_SOLID";
       jobId: string;
       options: SolidOptions;
+      versionId?: string;
+      heightMode?: HeightMode;
+      datapackAcknowledged?: boolean;
+      targetDimension?: HeightDimension;
+      placementBottomY?: number;
+      confirmations?: ExtremeHeightConfirmationState;
+      configurationFingerprint?: string;
       source: { kind: "mesh"; mesh: MmdMeshSnapshot };
     };
 

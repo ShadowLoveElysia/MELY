@@ -13,6 +13,7 @@ import {
 } from "../i18n";
 import {
   createProjectionDocument,
+  deriveBedrockProjectionDocument,
   iterateProjectionViewBlocks,
   splitProjectionViews,
 } from "./projectionDocument";
@@ -27,6 +28,14 @@ import {
   createLitematicFromDocument,
   type ExportOptions as LitematicExportOptions,
 } from "./litematic";
+import {
+  assertJavaProjectionExportSafety,
+  type JavaProjectionExportSafetyInput,
+} from "./exportPreflight";
+import type {
+  JavaCompatibilityLevel,
+  JavaCompatibilityWarningCode,
+} from "./minecraftVersions";
 import { AppError, appError } from "./appError";
 import {
   createMaterialPlan,
@@ -61,6 +70,7 @@ export interface ExportBundleOptions {
   maxOutputBytes?: number;
   maxWorkingBytes?: number;
   onProgress?: (progress: ExportBundleProgress) => void;
+  safety?: JavaProjectionExportSafetyInput;
 }
 
 export type ExportBundlePhase = "preparing" | "overall" | "parts" | "behaviorPack" | "metadata" | "complete";
@@ -130,10 +140,27 @@ export interface ExportBundle {
       bounds: ProjectionDocument["bounds"];
       blockCount: number;
       palette: ProjectionBlockState[];
+      height: {
+        mode: string;
+        targetHeight: number;
+        actualHeight: number;
+        recommendedBottomY: number;
+        highestOccupiedY: number;
+        targetDimensionMinY: number | null;
+        targetDimensionMaxY: number | null;
+        thirdPartyDatapackDisclaimer: string;
+      };
     };
     anchor: Point;
     litematic: {
       overall: string;
+      targetMinecraftVersion: string;
+      serializerMinecraftVersion: string;
+      dataVersion: number;
+      formatVersion: number;
+      subVersion: number;
+      compatibilityLevel: JavaCompatibilityLevel;
+      compatibilityWarningCode: JavaCompatibilityWarningCode | null;
     };
     guides: {
       locale: LocaleCode;
@@ -177,6 +204,24 @@ interface ExportBundlePlan {
   includeSchematic: boolean;
   includeMcstructure: boolean;
   includeMcfunction: boolean;
+  litematic: {
+    targetMinecraftVersion: string;
+    serializerMinecraftVersion: string;
+    dataVersion: number;
+    formatVersion: number;
+    subVersion: number;
+    compatibilityLevel: JavaCompatibilityLevel;
+    compatibilityWarningCode: JavaCompatibilityWarningCode | null;
+  };
+  height: {
+    mode: string;
+    targetHeight: number;
+    actualHeight: number;
+    placementBottomY: number;
+    placementTopY: number;
+    targetDimensionMinY: number | null;
+    targetDimensionMaxY: number | null;
+  };
 }
 
 const GUIDE_FILES = {
@@ -259,6 +304,15 @@ const bundleReadmeText = (
     t("export.guide.summaryTitle"),
     t("export.guide.blockCount", { count: number.format(document.blockCount) }),
     t("export.guide.dimensions", { dimensions: dimensions.join(" x ") }),
+    `Minecraft Java: ${document.minecraftVersion}`,
+    ...(plan.litematic.compatibilityWarningCode
+      ? [
+          `Compatibility warning: ${plan.litematic.compatibilityWarningCode}.`,
+          `Target Java ${plan.litematic.targetMinecraftVersion} is untested; files use Java ${plan.litematic.serializerMinecraftVersion} serializer metadata (DataVersion ${plan.litematic.dataVersion}). Community validation is required.`,
+        ]
+      : []),
+    `Placement Y: ${plan.height.placementBottomY}..${plan.height.placementTopY}`,
+    typeof document.metadata?.heightDisclaimer === "string" ? document.metadata.heightDisclaimer : "",
     t("export.guide.largeChests", { count: number.format(materials.totalLargeChests) }),
     t("export.guide.shulkerBoxes", { count: number.format(materials.totalShulkerBoxes) }),
     "",
@@ -377,6 +431,7 @@ const createBundleGuideFiles = (
 const createBundlePlan = (
   document: ProjectionDocument,
   options: ExportBundleOptions,
+  safety: ReturnType<typeof assertJavaProjectionExportSafety>,
 ): ExportBundlePlan => {
   if (!document.bounds || document.blockCount === 0) {
     throw new RangeError("Cannot bundle an empty projection");
@@ -388,6 +443,12 @@ const createBundlePlan = (
   const includeMcstructure = options.includeMcstructure ?? false;
   const includeMcfunction = options.includeMcfunction ?? false;
   const views = splitProjectionViews(document, options.partSize ?? [32, 32, 32]);
+  const targetDimension = safety.input.targetDimension
+    ?? safety.compatibility.effectiveDefaultDimension;
+  const litematicAdapter = safety.serializerProfile.exporters.litematic;
+  if (!litematicAdapter) {
+    throw new RangeError("Litematica export has no compatible serializer");
+  }
   const parts = views.map((view, index): ExportBundlePart => {
     const id = `part_${index.toString().padStart(4, "0")}`;
     const root = `parts/${id}/${slug}_${id}`;
@@ -418,7 +479,40 @@ const createBundlePlan = (
     includeSchematic,
     includeMcstructure,
     includeMcfunction,
+    litematic: {
+      targetMinecraftVersion: safety.requestedProfile.id,
+      serializerMinecraftVersion: safety.serializerProfile.id,
+      dataVersion: safety.serializerProfile.dataVersion,
+      formatVersion: litematicAdapter.formatVersion,
+      subVersion: litematicAdapter.subVersion ?? 0,
+      compatibilityLevel: safety.compatibility.level,
+      compatibilityWarningCode: safety.compatibility.warningCode,
+    },
+    height: {
+      mode: safety.preflight.mode,
+      targetHeight: safety.preflight.targetHeight,
+      actualHeight: safety.preflight.actualHeight,
+      placementBottomY: safety.preflight.placementMinY,
+      placementTopY: safety.preflight.placementMaxY,
+      targetDimensionMinY: targetDimension?.minY ?? null,
+      targetDimensionMaxY: targetDimension
+        ? targetDimension.minY + targetDimension.height - 1
+        : null,
+    },
   };
+};
+
+const assertBundleExportSafety = (
+  document: ProjectionDocument,
+  options: ExportBundleOptions,
+) => {
+  const result = assertJavaProjectionExportSafety(document, "bundle", options.safety);
+  if (options.includeSchematic && !result.serializerProfile.exporters.spongeSchematic) {
+    throw new RangeError(
+      `EXPORT_FORMAT_UNSUPPORTED_FOR_VERSION: Sponge schematic export has no compatible serializer for Minecraft Java ${result.requestedProfile.id}`,
+    );
+  }
+  return result;
 };
 
 const buildManifest = (
@@ -438,9 +532,24 @@ const buildManifest = (
     bounds: document.bounds,
     blockCount: document.blockCount,
     palette: document.palette,
+    height: {
+      mode: plan.height.mode,
+      targetHeight: plan.height.targetHeight,
+      actualHeight: plan.height.actualHeight,
+      recommendedBottomY: plan.height.placementBottomY,
+      highestOccupiedY: plan.height.placementTopY,
+      targetDimensionMinY: plan.height.targetDimensionMinY,
+      targetDimensionMaxY: plan.height.targetDimensionMaxY,
+      thirdPartyDatapackDisclaimer: typeof document.metadata?.heightDisclaimer === "string"
+        ? document.metadata.heightDisclaimer
+        : "",
+    },
   },
   anchor: plan.anchor,
-  litematic: { overall: plan.overallLitematic },
+  litematic: {
+    overall: plan.overallLitematic,
+    ...plan.litematic,
+  },
   guides: {
     locale: guideLocale,
     readme: GUIDE_FILES.readme,
@@ -598,8 +707,9 @@ export const createExportBundleStream = async (
   sink: ExportBundleChunkSink,
   options: ExportBundleOptions = {},
 ): Promise<StreamedExportBundle> => {
+  const safety = assertBundleExportSafety(document, options);
   assertBundleResources(document, options);
-  const plan = createBundlePlan(document, options);
+  const plan = createBundlePlan(document, options, safety);
   const guideLocale = options.guideLocale ?? DEFAULT_LOCALE;
   let latestBytes = 0;
   let completedFiles = 0;
@@ -672,6 +782,7 @@ export const createExportBundleStream = async (
         ...options.litematic,
         name: options.litematic?.name ?? plan.name,
         regionMaxSize: 32,
+        safety: options.safety,
       }).bytes, false);
     await yieldToEventLoop();
 
@@ -687,12 +798,14 @@ export const createExportBundleStream = async (
           ...options.litematic,
           name: `${options.litematic?.name ?? plan.name} ${descriptor.id}`,
           regionMaxSize: 32,
+          safety: options.safety,
         }).bytes, false);
       if (descriptor.files.schematic) {
         await addFile("parts", partProgress, index, descriptor.files.schematic, () =>
           createSchematic(part, {
             ...options.schematic,
             name: `${plan.name} ${descriptor.id}`,
+            safety: options.safety,
           }).bytes, false);
       }
       if (descriptor.files.mcstructure) {
@@ -701,7 +814,7 @@ export const createExportBundleStream = async (
           partProgress,
           index,
           descriptor.files.mcstructure,
-          () => createMcstructure(part, options.mcstructure).bytes,
+          () => createMcstructure(deriveBedrockProjectionDocument(part), options.mcstructure).bytes,
           true,
         );
       }
@@ -714,7 +827,7 @@ export const createExportBundleStream = async (
     if (plan.includeMcfunction) {
       const root = "behavior_pack";
       let streamedFiles = 0;
-      const functions = await streamMcfunctionBehaviorPack(document, {
+      const functions = await streamMcfunctionBehaviorPack(deriveBedrockProjectionDocument(document), {
         ...options.mcfunction,
         packName: options.mcfunction?.packName ?? plan.name,
       }, async (file) => {
@@ -801,6 +914,7 @@ export const createExportBundle = (
   document: ProjectionDocument,
   options: ExportBundleOptions = {},
 ): ExportBundle => {
+  const safety = assertBundleExportSafety(document, options);
   assertBundleResources(document, {
     ...options,
     maxWorkingBytes: options.maxWorkingBytes ?? SYNC_BUNDLE_WORKING_BUDGET_BYTES,
@@ -808,13 +922,14 @@ export const createExportBundle = (
   if (!document.bounds || document.blockCount === 0) {
     throw new RangeError("Cannot bundle an empty projection");
   }
-  const plan = createBundlePlan(document, options);
+  const plan = createBundlePlan(document, options, safety);
   const guideLocale = options.guideLocale ?? DEFAULT_LOCALE;
   const archive = createZipCollector({ maxOutputBytes: options.maxOutputBytes });
   archive.add(plan.overallLitematic, createLitematicFromDocument(document, {
     ...options.litematic,
     name: options.litematic?.name ?? plan.name,
     regionMaxSize: 32,
+    safety: options.safety,
   }).bytes, false);
   plan.views.forEach((view, index) => {
     const part = partDocument(document, view);
@@ -824,17 +939,19 @@ export const createExportBundle = (
       ...options.litematic,
       name: `${options.litematic?.name ?? plan.name} ${descriptor.id}`,
       regionMaxSize: 32,
+      safety: options.safety,
     }).bytes, false);
     if (descriptor.files.schematic) {
       archive.add(descriptor.files.schematic, createSchematic(part, {
         ...options.schematic,
         name: `${plan.name} ${descriptor.id}`,
+        safety: options.safety,
       }).bytes, false);
     }
     if (descriptor.files.mcstructure) {
       archive.add(
         descriptor.files.mcstructure,
-        createMcstructure(part, options.mcstructure).bytes,
+        createMcstructure(deriveBedrockProjectionDocument(part), options.mcstructure).bytes,
         true,
       );
     }
@@ -842,7 +959,7 @@ export const createExportBundle = (
 
   let behaviorPack: ExportBundle["manifest"]["behaviorPack"];
   if (plan.includeMcfunction) {
-    const iterator = iterateMcfunctionBehaviorPackFiles(document, {
+    const iterator = iterateMcfunctionBehaviorPackFiles(deriveBedrockProjectionDocument(document), {
       ...options.mcfunction,
       packName: options.mcfunction?.packName ?? plan.name,
     });

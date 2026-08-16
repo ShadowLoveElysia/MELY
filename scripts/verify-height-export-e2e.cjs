@@ -293,7 +293,9 @@ const assertExport = (format, parsed, expectedDimensions) => {
 };
 
 const loadModel = async (page) => {
-  await page.goto(appUrl, { waitUntil: "networkidle" });
+  // Vite 的 HMR WebSocket 会持续保持连接，不能用 networkidle 判断应用已就绪。
+  await page.goto(appUrl, { waitUntil: "domcontentloaded", timeout: 120_000 });
+  await page.locator(".app-shell").waitFor({ state: "visible", timeout: 120_000 });
   await page.locator(".locale-control select").selectOption("en-US");
   await page.locator('input[type="file"][accept*=".pmx"]').setInputFiles(modelZip);
   await page.locator(".drop-zone--loading").waitFor({ state: "hidden", timeout: 120_000 }).catch(() => undefined);
@@ -337,14 +339,6 @@ const generateFixture = async (page, profile, targetHeight, actualHeight = targe
       `Export did not become available for ${profile} target ${targetHeight}, actual ${actualHeight}`,
     );
   });
-};
-
-const unlockExtendedHeight = async (page) => {
-  const unlock = page.locator(".height-unlock");
-  if (await unlock.getAttribute("aria-pressed") === "true") return;
-  await unlock.click();
-  const dialog = page.getByRole("dialog", { name: "Extended-height warning" });
-  await dialog.getByRole("button", { name: "Unlock height" }).click();
 };
 
 const openExportCenter = async (page) => {
@@ -429,58 +423,123 @@ const directExport = async (page, format, destination, report) => {
   return saveDownload(page, format, destination, () => formatButton(dialog, format).click(), report);
 };
 
-const gatedExport = async (page, format, destination, report) => {
-  const firstCenter = await openExportCenter(page);
-  await formatButton(firstCenter, format).click();
-  const firstGate = page.getByRole("dialog", {
-    name: "Safety confirmation: this is not a vanilla projection",
-  });
-  const firstConfirm = firstGate.getByRole("button", { name: "Confirm export" });
-  const firstCheckbox = firstGate.locator('input[type="checkbox"]');
-  const initialDisabled = await firstConfirm.isDisabled();
-  await firstGate.focus();
-  const downloadCountBeforeEnter = report.downloadCount;
-  await page.keyboard.press("Enter");
-  await page.waitForTimeout(250);
-  const enterDidNotDownload = report.downloadCount === downloadCountBeforeEnter;
-  const remainedOpenAfterEnter = await firstGate.isVisible();
-  await firstCheckbox.check();
-  const enabledAfterCheck = await firstConfirm.isEnabled();
-  await closeDialog(firstGate);
+const isBedrockFormat = (format) => (
+  format.id === "mcstructure" || format.id === "mcfunction"
+);
 
-  const secondCenter = await openExportCenter(page);
-  await formatButton(secondCenter, format).click();
-  const secondGate = page.getByRole("dialog", {
+const unlockExtendedHeight = async (page) => {
+  const unlock = page.locator('.height-unlock[aria-pressed]');
+  if (await unlock.isDisabled()) {
+    throw new Error("The 2,032-layer unlock is disabled");
+  }
+  await unlock.click();
+  const dialog = page.getByRole("dialog", { name: "Extended-height warning" });
+  await dialog.waitFor({ state: "visible" });
+  await dialog.getByRole("button", { name: "Unlock height", exact: true }).click();
+  await page.waitForFunction(() => (
+    document.querySelector('.height-unlock[aria-pressed]')?.getAttribute("aria-pressed") === "true"
+  ));
+
+  const declaration = page.locator(".dimension-declaration");
+  const inputs = declaration.locator('input[type="number"]');
+  await inputs.nth(0).fill("-1024");
+  await inputs.nth(1).fill("2032");
+  await inputs.nth(2).fill("-1024");
+  return {
+    unlockDisabled: false,
+    dialogReached: true,
+    declaration: await inputs.evaluateAll((elements) => elements.map((element) => Number(element.value))),
+  };
+};
+
+const reachExtremeHeight = async (page, report) => {
+  const button = page.getByRole("button", {
+    name: "Unlock experimental limit (4,064 layers)",
+    exact: true,
+  });
+  if (await button.isDisabled()) throw new Error("The 4,064-layer unlock is disabled");
+  await button.click();
+
+  const unlockDialog = page.getByRole("dialog", {
+    name: "Experimental 4,064 layers: unlock",
+  });
+  await unlockDialog.waitFor({ state: "visible" });
+  await unlockDialog.getByRole("button", {
+    name: "Continue to environment checks",
+    exact: true,
+  }).click();
+
+  const environmentDialog = page.getByRole("dialog", {
+    name: "Experimental 4,064 layers: environment checks",
+  });
+  await environmentDialog.waitFor({ state: "visible" });
+  const checks = environmentDialog.locator('input[type="checkbox"]');
+  if (await checks.count() !== 3) {
+    throw new Error(`Expected three 4,064-layer environment notices, found ${await checks.count()}`);
+  }
+  for (let index = 0; index < 3; index += 1) await checks.nth(index).check();
+  await environmentDialog.getByRole("button", {
+    name: "Confirm this environment",
+    exact: true,
+  }).click();
+  await environmentDialog.waitFor({ state: "hidden" });
+
+  const declaration = page.locator(".dimension-declaration").locator('input[type="number"]');
+  const targetHeight = Number(await targetHeightInput(page).inputValue());
+  const values = await declaration.evaluateAll((elements) => elements.map((element) => Number(element.value)));
+  if (targetHeight !== 4064 || !dimensionsEqual(values, [-2032, 4064, -2032])) {
+    throw new Error(`4,064-layer state did not activate: ${JSON.stringify({ targetHeight, values })}`);
+  }
+
+  await page.evaluate(() => {
+    window.__MELY_HEIGHT_FIXTURE_PROFILE = "narrow";
+    window.__MELY_HEIGHT_FIXTURE_ACTUAL_HEIGHT = 4064;
+  });
+  await page.getByRole("button", { name: "Generate hologram" }).click();
+  await page.locator(".export-button").waitFor({ state: "visible", timeout: 120_000 });
+  await page.waitForFunction(() => {
+    const control = document.querySelector(".export-button");
+    return control instanceof HTMLButtonElement && !control.disabled;
+  }, null, { timeout: 120_000 });
+  const exportCenter = await openExportCenter(page);
+  const litematic = formats.find(({ id }) => id === "litematic");
+  if (!litematic) throw new Error("Missing Litematica E2E descriptor");
+  const litematicButton = formatButton(exportCenter, litematic);
+  if (await litematicButton.isDisabled()) {
+    throw new Error(`4,064-layer Litematica attempt is unavailable: ${await litematicButton.innerText()}`);
+  }
+  await litematicButton.click();
+  const exportDialog = page.getByRole("dialog", {
     name: "Safety confirmation: this is not a vanilla projection",
   });
-  const secondCheckbox = secondGate.locator('input[type="checkbox"]');
-  const resetAfterClose = !await secondCheckbox.isChecked()
-    && await secondGate.getByRole("button", { name: "Confirm export" }).isDisabled();
-  await secondCheckbox.check();
+  await exportDialog.waitFor({ state: "visible" });
+  const confirm = exportDialog.getByRole("button", { name: "Confirm export", exact: true });
+  const confirmDisabledInitially = await confirm.isDisabled();
+  await exportDialog.locator('input[type="checkbox"]').check();
+  await exportDialog.locator('.extreme-export-phrase input[type="text"]').fill("导出 4064");
+  const confirmEnabledAfterAcknowledgement = await confirm.isEnabled();
+  if (!confirmDisabledInitially || !confirmEnabledAfterAcknowledgement) {
+    throw new Error("The 4,064-layer per-export confirmation did not become reachable");
+  }
+  const destination = path.join(outputDirectory, "height-4064-litematic.litematic");
   const parsed = await saveDownload(
     page,
-    format,
+    litematic,
     destination,
-    () => secondGate.getByRole("button", { name: "Confirm export" }).click(),
+    () => confirm.click(),
     report,
   );
-  await secondGate.waitFor({ state: "hidden" });
-  const thirdCenter = await openExportCenter(page);
-  await formatButton(thirdCenter, format).click();
-  const thirdGate = page.getByRole("dialog", {
-    name: "Safety confirmation: this is not a vanilla projection",
-  });
-  const resetAfterDownload = !await thirdGate.locator('input[type="checkbox"]').isChecked()
-    && await thirdGate.getByRole("button", { name: "Confirm export" }).isDisabled();
-  await closeDialog(thirdGate);
+  assertExport(litematic.id, parsed, fixtureProfiles.narrow(4064).dimensions);
   return {
-    initialDisabled,
-    enterDidNotDownload,
-    remainedOpenAfterEnter,
-    enabledAfterCheck,
-    resetAfterClose,
-    resetAfterDownload,
-    parsed,
+    unlockDialogReached: true,
+    environmentDialogReached: true,
+    environmentNoticeCount: 3,
+    exportDialogReached: true,
+    confirmDisabledInitially,
+    confirmEnabledAfterAcknowledgement,
+    targetHeight,
+    declaration: values,
+    confirmedExport: parsed,
   };
 };
 
@@ -535,57 +594,86 @@ const main = async () => {
       targetHeight: Number(await targetHeightInput(page).inputValue()),
       dimensions: boundaryDimensions,
       warningVisible: await page.locator(".height-warning").isVisible(),
-      exports: {},
+      availability: {},
+      bedrockDirectExports: {},
     };
+    const boundaryCenter = await openExportCenter(page);
     for (const format of selectedFormats) {
-      const destination = path.join(outputDirectory, `height-385-${format.id}.${format.extension}`);
-      const result = await gatedExport(page, format, destination, report);
-      assertExport(format.id, result.parsed, boundaryDimensions);
-      boundaryScenario.exports[format.id] = result;
-      if (format.id === "litematic") {
-        await page.screenshot({ path: path.join(outputDirectory, "height-385-after-export.png"), fullPage: true });
-      }
-    }
-    report.scenarios.boundary385 = boundaryScenario;
-
-    await unlockExtendedHeight(page);
-    await generateFixture(page, "narrow", 2032);
-    const narrowDimensions = fixtureProfiles.narrow(2032).dimensions;
-    const narrowScenario = { dimensions: narrowDimensions, exports: {} };
-    for (const format of selectedFormats) {
-      const destination = path.join(outputDirectory, `height-2032-narrow-${format.id}.${format.extension}`);
-      const result = await gatedExport(page, format, destination, report);
-      assertExport(format.id, result.parsed, narrowDimensions);
-      narrowScenario.exports[format.id] = result;
-    }
-    report.scenarios.narrow2032 = narrowScenario;
-
-    await generateFixture(page, "proportional", 2032);
-    const proportionalDimensions = fixtureProfiles.proportional(2032).dimensions;
-    const center = await openExportCenter(page);
-    const formatAvailability = {};
-    for (const format of selectedFormats) {
-      const button = formatButton(center, format);
-      formatAvailability[format.id] = {
+      const button = formatButton(boundaryCenter, format);
+      boundaryScenario.availability[format.id] = {
         disabled: await button.isDisabled(),
         text: (await button.innerText()).trim(),
       };
     }
-    await center.screenshot({ path: path.join(outputDirectory, "height-2032-proportional-preflight.png") });
-    await closeDialog(center);
-    const sparseExports = {};
-    for (const format of selectedFormats.filter(({ id }) => id === "litematic" || id === "bundle" || id === "mcfunction")) {
-      const destination = path.join(outputDirectory, `height-2032-proportional-${format.id}.${format.extension}`);
-      const result = await gatedExport(page, format, destination, report);
-      assertExport(format.id, result.parsed, proportionalDimensions);
-      sparseExports[format.id] = result;
+    await boundaryCenter.screenshot({
+      path: path.join(outputDirectory, "height-385-structural-preflight.png"),
+    });
+    await closeDialog(boundaryCenter);
+    for (const format of selectedFormats.filter(isBedrockFormat)) {
+      const destination = path.join(outputDirectory, `height-385-${format.id}.${format.extension}`);
+      const parsed = await directExport(page, format, destination, report);
+      assertExport(format.id, parsed, boundaryDimensions);
+      boundaryScenario.bedrockDirectExports[format.id] = parsed;
     }
-    report.scenarios.proportional2032 = {
-      dimensions: proportionalDimensions,
-      denseVolume: proportionalDimensions.reduce((product, value) => product * value, 1),
-      availability: formatAvailability,
-      sparseExports,
+    report.scenarios.boundary385 = boundaryScenario;
+
+    const versionSelect = page.locator(".field-row")
+      .filter({ hasText: "Target Java version" })
+      .locator("select");
+    await versionSelect.selectOption("1.20.2");
+    const versionWarning = page.locator('[role="status"]').filter({ hasText: "not fully tested" }).first();
+    await versionWarning.waitFor({ state: "visible" });
+    const extended2032 = {
+      version: await versionSelect.inputValue(),
+      versionWarning: (await versionWarning.innerText()).trim(),
+      ...await unlockExtendedHeight(page),
+      javaAvailability: {},
     };
+    await generateFixture(page, "narrow", 2032);
+    const extendedCenter = await openExportCenter(page);
+    for (const format of formats.filter(({ id }) => !isBedrockFormat({ id }))) {
+      const formatControl = formatButton(extendedCenter, format);
+      extended2032.javaAvailability[format.id] = {
+        disabled: await formatControl.isDisabled(),
+        text: (await formatControl.innerText()).trim(),
+      };
+    }
+    await extendedCenter.screenshot({
+      path: path.join(outputDirectory, "height-2032-best-effort-export-center.png"),
+    });
+    if (Object.values(extended2032.javaAvailability).some(({ disabled }) => disabled)) {
+      throw new Error(`2,032-layer Java export is not attemptable: ${JSON.stringify(extended2032)}`);
+    }
+    const extendedLitematic = selectedFormats.find(({ id }) => id === "litematic");
+    if (extendedLitematic) {
+      await formatButton(extendedCenter, extendedLitematic).click();
+      const confirmation = page.getByRole("dialog", {
+        name: "Safety confirmation: this is not a vanilla projection",
+      });
+      await confirmation.waitFor({ state: "visible" });
+      const confirm = confirmation.getByRole("button", { name: "Confirm export", exact: true });
+      const confirmDisabledInitially = await confirm.isDisabled();
+      await confirmation.locator('input[type="checkbox"]').check();
+      const confirmEnabledAfterAcknowledgement = await confirm.isEnabled();
+      const destination = path.join(outputDirectory, "height-2032-litematic.litematic");
+      const parsed = await saveDownload(
+        page,
+        extendedLitematic,
+        destination,
+        () => confirm.click(),
+        report,
+      );
+      assertExport(extendedLitematic.id, parsed, fixtureProfiles.narrow(2032).dimensions);
+      extended2032.confirmation = {
+        confirmDisabledInitially,
+        confirmEnabledAfterAcknowledgement,
+      };
+      extended2032.confirmedExport = parsed;
+    } else {
+      await closeDialog(extendedCenter);
+    }
+    report.scenarios.extended2032Reachable = extended2032;
+    report.scenarios.extreme4064Reachable = await reachExtremeHeight(page, report);
 
     report.finalOverflow = await overflowReport(page);
     if (report.consoleErrors.length || report.pageErrors.length) {
@@ -597,39 +685,19 @@ const main = async () => {
     if (report.finalOverflow.offenders.length || report.finalOverflow.documentWidth > report.finalOverflow.viewportWidth) {
       throw new Error(`Horizontal overflow detected: ${JSON.stringify(report.finalOverflow)}`);
     }
-    for (const formatId of ["schematic", "mcstructure"]) {
-      const availability = formatAvailability[formatId];
-      if (availability && !availability.disabled) {
-        throw new Error(`Dense format was not disabled: ${JSON.stringify({
-          formatId,
-          availability,
-        })}`);
-      }
-    }
     for (const format of selectedFormats) {
-      const assertions = boundaryScenario.exports[format.id];
+      const availability = boundaryScenario.availability[format.id];
       if (boundaryScenario.targetHeight !== 320
         || !boundaryScenario.warningVisible
-        || !assertions.initialDisabled
-        || !assertions.enterDidNotDownload
-        || !assertions.remainedOpenAfterEnter
-        || !assertions.enabledAfterCheck
-        || !assertions.resetAfterClose
-        || !assertions.resetAfterDownload) {
-        throw new Error(`Target-320 actual-span-385 safety gate failed for ${format.id}: ${JSON.stringify({
+        || (isBedrockFormat(format)
+          ? availability.disabled || !boundaryScenario.bedrockDirectExports[format.id]
+          : !availability.disabled)) {
+        throw new Error(`Target-320 actual-span-385 structural routing failed for ${format.id}: ${JSON.stringify({
           targetHeight: boundaryScenario.targetHeight,
           warningVisible: boundaryScenario.warningVisible,
-          assertions,
+          availability,
+          bedrockDirectExport: boundaryScenario.bedrockDirectExports[format.id] ?? null,
         })}`);
-      }
-    }
-    for (const format of selectedFormats) {
-      const assertions = narrowScenario.exports[format.id];
-      if (!assertions.initialDisabled
-        || !assertions.enterDidNotDownload
-        || !assertions.resetAfterClose
-        || !assertions.resetAfterDownload) {
-        throw new Error(`2032 safety gate failed for ${format.id}: ${JSON.stringify(assertions)}`);
       }
     }
   } finally {

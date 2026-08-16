@@ -1,21 +1,33 @@
 import { Check } from "lucide-react";
-import type { ChangeEvent, ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useId,
+  type ChangeEvent,
+  type ReactNode,
+} from "react";
+
+const FieldLabelContext = createContext<string | undefined>(undefined);
 
 interface FieldProps {
   label: string;
   hint?: string;
+  className?: string;
   children: ReactNode;
 }
 
-export function Field({ label, hint, children }: FieldProps) {
+export function Field({ label, hint, className, children }: FieldProps) {
+  const labelId = useId();
   return (
-    <label className="field-row">
-      <span>
+    <div className={className ? `field-row ${className}` : "field-row"}>
+      <span id={labelId}>
         <strong>{label}</strong>
         {hint ? <small>{hint}</small> : null}
       </span>
-      {children}
-    </label>
+      <FieldLabelContext.Provider value={labelId}>
+        <div className="field-row__control">{children}</div>
+      </FieldLabelContext.Provider>
+    </div>
   );
 }
 
@@ -30,6 +42,8 @@ interface SliderProps {
 }
 
 export function Slider({ value, min, max, step = 1, unit = "", editable = false, onChange }: SliderProps) {
+  const inputId = useId();
+  const fieldLabelId = useContext(FieldLabelContext);
   const percentage = ((value - min) / (max - min)) * 100;
   const commit = (nextValue: number) => {
     if (!Number.isFinite(nextValue)) return;
@@ -40,6 +54,7 @@ export function Slider({ value, min, max, step = 1, unit = "", editable = false,
     <div className="slider-control">
       <input
         type="range"
+        aria-labelledby={fieldLabelId}
         min={min}
         max={max}
         step={step}
@@ -48,8 +63,10 @@ export function Slider({ value, min, max, step = 1, unit = "", editable = false,
         onChange={(event) => commit(Number(event.target.value))}
       />
       {editable ? (
-        <label className="slider-number">
+        <label className="slider-number" htmlFor={inputId}>
           <input
+            id={inputId}
+            aria-labelledby={fieldLabelId}
             type="number"
             min={min}
             max={max}
@@ -76,8 +93,13 @@ interface SelectProps {
 }
 
 export function Select({ value, onChange, children }: SelectProps) {
+  const fieldLabelId = useContext(FieldLabelContext);
   return (
-    <select value={value} onChange={(event: ChangeEvent<HTMLSelectElement>) => onChange(event.target.value)}>
+    <select
+      aria-labelledby={fieldLabelId}
+      value={value}
+      onChange={(event: ChangeEvent<HTMLSelectElement>) => onChange(event.target.value)}
+    >
       {children}
     </select>
   );
@@ -91,12 +113,14 @@ interface ToggleProps {
 }
 
 export function Toggle({ checked, onChange, label, disabled = false }: ToggleProps) {
+  const fieldLabelId = useContext(FieldLabelContext);
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
       aria-label={label}
+      aria-labelledby={fieldLabelId}
       title={label}
       className={`toggle ${checked ? "toggle--checked" : ""}`}
       disabled={disabled}

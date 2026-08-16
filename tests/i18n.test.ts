@@ -228,7 +228,7 @@ test("new workflow translations preserve interpolation and component template co
   );
   assert.equal(
     translate("ja-JP", "heightUnlock.body", { vanilla: 384, maximum: 2032 }),
-    "384 ブロックを超える投影は、未改造のバニラ Minecraft ワールドに完全に読み込めません。最大 2032 ブロックまで解除しますか？",
+    "384 ブロックを超える投影は十分にテストされておらず、未改造のバニラワールドには完全に読み込めません。それでも最大 2032 ブロックまで解除して試せます。対応データパックとワールドコピーを使い、問題はコミュニティへ報告してください。",
   );
   assert.equal(
     translate("en-US", "exportCenter.unavailable.volume", { volume: "80,000,000", limit: "67,108,864" }),

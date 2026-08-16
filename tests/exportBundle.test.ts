@@ -70,6 +70,16 @@ test("export bundle contains explicitly enabled split formats and a behavior pac
 
   const manifest = JSON.parse(strFromU8(files["bundle.json"]));
   assert.equal(manifest.format, "MELYExportBundle");
+  assert.deepEqual(manifest.projection.height, {
+    mode: "default",
+    targetHeight: 1,
+    actualHeight: 1,
+    recommendedBottomY: -64,
+    highestOccupiedY: -64,
+    targetDimensionMinY: -64,
+    targetDimensionMaxY: 319,
+    thirdPartyDatapackDisclaimer: "",
+  });
   assert.deepEqual(manifest.anchor, [-4, 10, 20]);
   assert.equal(manifest.litematic.overall, "litematica/mely_bundle_test.litematic");
   assert.equal(manifest.parts.length, 2);
@@ -607,4 +617,62 @@ test("streaming bundle identifies the file that failed", async () => {
     { file: "litematica/failure_test.litematic", status: "started" },
     { file: "litematica/failure_test.litematic", status: "failed" },
   ]);
+});
+
+test("all bundle entry points allow registered untested Java versions with manifest warnings", async () => {
+  const untested = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], { minecraftVersion: "1.20.2" });
+  const syncBundle = createExportBundle(untested, { litematic: { timestamp: 1 } });
+  assert.deepEqual(syncBundle.manifest.litematic, {
+    overall: "litematica/mely_projection.litematic",
+    targetMinecraftVersion: "1.20.2",
+    serializerMinecraftVersion: "1.20.1",
+    dataVersion: 3465,
+    formatVersion: 6,
+    subVersion: 1,
+    compatibilityLevel: "best_effort",
+    compatibilityWarningCode: "JAVA_VERSION_BEST_EFFORT",
+  });
+  const syncFiles = unzipSync(syncBundle.bytes);
+  assert.match(strFromU8(syncFiles["README.txt"]), /JAVA_VERSION_BEST_EFFORT/);
+  assert.match(strFromU8(syncFiles["README.txt"]), /Community validation is required/);
+
+  const asyncBundle = await createExportBundleAsync(untested, { litematic: { timestamp: 1 } });
+  assert.equal(asyncBundle.manifest.litematic.compatibilityLevel, "best_effort");
+  const chunks: Uint8Array[] = [];
+  const streamed = await createExportBundleStream(
+    untested,
+    (chunk) => chunks.push(chunk.slice()),
+    { litematic: { timestamp: 1 } },
+  );
+  assert.equal(streamed.manifest.litematic.compatibilityWarningCode, "JAVA_VERSION_BEST_EFFORT");
+  assert.ok(chunks.length > 0);
+});
+
+test("all bundle entry points still fail before output for unsafe Java documents", () => {
+
+  const extendedWithoutDeclaration = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [0, 384, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], {
+    metadata: {
+      heightMode: "extended_2032",
+      targetHeight: 385,
+      datapackAcknowledged: true,
+    },
+  });
+  assert.throws(
+    () => createExportBundle(extendedWithoutDeclaration),
+    /explicit target dimension range/,
+  );
+
+  const adjacent = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [0, 1, 0], paletteIndex: 1 },
+  ], [
+    { blockId: "minecraft:end_rod" },
+    { blockId: "minecraft:white_stained_glass_pane" },
+  ]);
+  assert.throws(() => createExportBundle(adjacent), /six-way isolation/);
 });

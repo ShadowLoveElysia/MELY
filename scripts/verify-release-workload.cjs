@@ -19,6 +19,9 @@ const faceDetail = process.env.MELY_FACE_DETAIL || "off";
 const navigationWaitUntil = process.env.MELY_NAVIGATION_WAIT_UNTIL || "networkidle";
 const outputPrefix = process.env.MELY_OUTPUT_PREFIX || `release-${mode}-${targetHeight}-${exportFormat}`;
 const reportPath = process.env.MELY_REPORT_PATH || `${outputPrefix}.json`;
+const targetDimensionMinY = Number(process.env.MELY_TARGET_DIMENSION_MIN_Y);
+const targetDimensionHeight = Number(process.env.MELY_TARGET_DIMENSION_HEIGHT);
+const placementBottomY = Number(process.env.MELY_PLACEMENT_BOTTOM_Y);
 
 const validModes = new Set(["hologram", "solid"]);
 const exportExtensions = {
@@ -39,8 +42,34 @@ const exportLabels = {
 if (!modelZip) throw new Error("MELY_MODEL_ZIP is required");
 if (!validModes.has(mode)) throw new Error(`Unsupported MELY_WORKLOAD_MODE: ${mode}`);
 if (!(exportFormat in exportExtensions)) throw new Error(`Unsupported MELY_EXPORT_FORMAT: ${exportFormat}`);
-if (!Number.isInteger(targetHeight) || targetHeight < 32 || targetHeight > 2032) {
-  throw new Error("MELY_TARGET_HEIGHT must be an integer from 32 to 2032");
+if (!Number.isInteger(targetHeight) || targetHeight < 32 || targetHeight > 4064) {
+  throw new Error("MELY_TARGET_HEIGHT must be an integer from 32 to 4064");
+}
+if (targetHeight > 384) {
+  const declaration = {
+    MELY_TARGET_DIMENSION_MIN_Y: targetDimensionMinY,
+    MELY_TARGET_DIMENSION_HEIGHT: targetDimensionHeight,
+    MELY_PLACEMENT_BOTTOM_Y: placementBottomY,
+  };
+  if (!Object.values(declaration).every(Number.isSafeInteger) || targetDimensionHeight <= 0) {
+    throw new Error(
+      "Extended-height workloads require integer MELY_TARGET_DIMENSION_MIN_Y, "
+      + "MELY_TARGET_DIMENSION_HEIGHT > 0, and MELY_PLACEMENT_BOTTOM_Y",
+    );
+  }
+  const targetDimensionMaxY = targetDimensionMinY + targetDimensionHeight - 1;
+  const placementMaxY = placementBottomY + targetHeight - 1;
+  if (
+    !Number.isSafeInteger(targetDimensionMaxY)
+    || !Number.isSafeInteger(placementMaxY)
+    || placementBottomY < targetDimensionMinY
+    || placementMaxY > targetDimensionMaxY
+  ) {
+    throw new Error(
+      `Declared placement Y=${placementBottomY}..${placementMaxY} is outside `
+      + `the target dimension Y=${targetDimensionMinY}..${targetDimensionMaxY}`,
+    );
+  }
 }
 
 const processWorkingSet = async (processIds) => {
@@ -386,6 +415,11 @@ const run = async () => {
     mode,
     exportFormat,
     targetHeight,
+    targetDimension: targetHeight > 384 ? {
+      minY: targetDimensionMinY,
+      height: targetDimensionHeight,
+      placementBottomY,
+    } : undefined,
     navigationWaitUntil,
     faceDetail: mode === "solid" ? faceDetail : undefined,
     consoleErrors: [],
@@ -443,11 +477,53 @@ const run = async () => {
     report.modelName = await page.locator(".model-summary__header strong").innerText();
 
     if (targetHeight > 384) {
-      await page.locator(".height-unlock").click();
+      const heightUnlock = page.locator('.height-unlock[aria-pressed]');
+      if (await heightUnlock.isDisabled()) {
+        report.safety.unlockDisabled = true;
+        throw new Error("The extended-height unlock is disabled; best-effort height workflows must remain reachable");
+      }
+      await heightUnlock.click();
       const unlockDialog = page.getByRole("dialog").filter({ hasText: "Extended-height warning" });
       await unlockDialog.waitFor({ state: "visible" });
       report.safety.unlockDialog = true;
       await unlockDialog.getByRole("button", { name: "Unlock height", exact: true }).click();
+      if (targetHeight > 2032) {
+        const extremeUnlock = page.getByRole("button", {
+          name: "Unlock experimental limit (4,064 layers)",
+          exact: true,
+        });
+        if (!await extremeUnlock.isEnabled()) {
+          throw new Error("The 4,064-layer unlock is disabled");
+        }
+        await extremeUnlock.click();
+        const extremeDialog = page.getByRole("dialog", {
+          name: "Experimental 4,064 layers: unlock",
+        });
+        await extremeDialog.waitFor({ state: "visible" });
+        report.safety.extremeUnlockDialog = true;
+        await extremeDialog.getByRole("button", {
+          name: "Continue to environment checks",
+          exact: true,
+        }).click();
+        const environmentDialog = page.getByRole("dialog", {
+          name: "Experimental 4,064 layers: environment checks",
+        });
+        await environmentDialog.waitFor({ state: "visible" });
+        const notices = environmentDialog.locator('input[type="checkbox"]');
+        if (await notices.count() !== 3) {
+          throw new Error(`Expected three 4,064-layer environment notices, found ${await notices.count()}`);
+        }
+        for (let index = 0; index < 3; index += 1) await notices.nth(index).check();
+        await environmentDialog.getByRole("button", {
+          name: "Confirm this environment",
+          exact: true,
+        }).click();
+        report.safety.extremeEnvironmentDialog = true;
+      }
+      const declaration = page.locator(".dimension-declaration");
+      await declaration.locator('input[type="number"]').nth(0).fill(String(targetDimensionMinY));
+      await declaration.locator('input[type="number"]').nth(1).fill(String(targetDimensionHeight));
+      await declaration.locator('input[type="number"]').nth(2).fill(String(placementBottomY));
     }
     const heightInput = page.locator(".slider-number input").first();
     await heightInput.fill(String(targetHeight));
@@ -497,7 +573,10 @@ const run = async () => {
     });
 
     let startExport;
-    if (targetHeight > 384) {
+    const javaHeightGate = targetHeight > 384
+      && exportFormat !== "mcstructure"
+      && exportFormat !== "mcfunction";
+    if (javaHeightGate) {
       await formatButton.click();
       const safetyDialog = page.getByRole("dialog").filter({
         hasText: "Safety confirmation: this is not a vanilla projection",
@@ -506,6 +585,11 @@ const run = async () => {
       const confirm = safetyDialog.getByRole("button", { name: "Confirm export", exact: true });
       report.safety.confirmDisabledBeforeAcknowledge = await confirm.isDisabled();
       await safetyDialog.locator('input[type="checkbox"]').check();
+      if (targetHeight > 2032) {
+        await safetyDialog.locator('.extreme-export-phrase input[type="text"]')
+          .fill(`导出 ${targetHeight}`);
+        report.safety.extremePhraseEntered = true;
+      }
       report.safety.confirmEnabledAfterAcknowledge = await confirm.isEnabled();
       startExport = () => confirm.click();
     } else {
@@ -611,10 +695,15 @@ const run = async () => {
   }
   if (
     targetHeight > 384
+    && exportFormat !== "mcstructure"
+    && exportFormat !== "mcfunction"
     && (!report.safety.unlockDialog
       || !report.safety.persistentWarning
       || !report.safety.confirmDisabledBeforeAcknowledge
-      || !report.safety.confirmEnabledAfterAcknowledge)
+      || !report.safety.confirmEnabledAfterAcknowledge
+      || (targetHeight > 2032 && (!report.safety.extremeUnlockDialog
+        || !report.safety.extremeEnvironmentDialog
+        || !report.safety.extremePhraseEntered)))
   ) {
     throw new Error(`Extended-height safety checks failed: ${JSON.stringify(report.safety)}`);
   }

@@ -65,7 +65,12 @@ $env:MELY_PLAYWRIGHT_MODULE = $playwright
 $env:MELY_WORKLOAD_MODE = "hologram"
 $env:MELY_EXPORT_FORMAT = $ExportFormat
 $env:MELY_TARGET_HEIGHT = "2032"
+$env:MELY_TARGET_DIMENSION_MIN_Y = "-1024"
+$env:MELY_TARGET_DIMENSION_HEIGHT = "2032"
+$env:MELY_PLACEMENT_BOTTOM_Y = "-1024"
 $env:MELY_NAVIGATION_WAIT_UNTIL = "domcontentloaded"
+
+Write-Warning "The 2,032-layer workflow is not fully tested and may have compatibility issues or minor bugs. This runner intentionally attempts generation and export; report reproducible problems to the community."
 
 $vite = $null
 $auditExitCode = 1

@@ -6,12 +6,15 @@ import {
   createProjectionDocument,
   createProjectionDocumentFromHologram,
   createProjectionDocumentFromSolid,
+  deriveBedrockProjectionDocument,
+  assertProjectionDocumentHologramIsolation,
   iterateProjectionBlocks,
   iterateProjectionSlice,
   iterateProjectionViewBlocks,
   projectionDocumentTransferables,
   splitProjectionViews,
 } from "../src/core/projectionDocument";
+import { JAVA_VERSION_PROFILES } from "../src/core/minecraftVersions";
 import type {
   HologramResult,
   ProjectionBlock,
@@ -97,6 +100,110 @@ test("solid and hologram results convert without losing positions or block state
     "0,0,0:1",
     "32,0,-1:1",
   ]);
+});
+
+test("hologram document conversion and final assertion reject mixed six-way neighbours", () => {
+  const adjacent: HologramResult = {
+    positions: Float32Array.from([0, 0, 0, 1, 0, 0]),
+    facings: Uint8Array.from([2, 2]),
+    materials: Uint8Array.from([0, 1]),
+    stats: {
+      blockCount: 2,
+      endRodCount: 1,
+      paneCount: 1,
+      removedConflicts: 0,
+      dimensions: [2, 1, 1],
+    },
+    bounds: { min: [0, 0, 0], max: [1, 0, 0] },
+  };
+  assert.throws(
+    () => createProjectionDocumentFromHologram(adjacent),
+    /six-way isolation/,
+  );
+
+  const injected = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [0, 1, 0], paletteIndex: 1 },
+  ], [
+    { blockId: "minecraft:end_rod" },
+    { blockId: "minecraft:white_stained_glass_pane" },
+  ], { metadata: { source: "hologram" } });
+  assert.throws(() => assertProjectionDocumentHologramIsolation(injected), /six-way isolation/);
+});
+
+test("Bedrock derivation preserves projection data and removes Java-only height metadata", () => {
+  const javaDocument = createProjectionDocument([
+    { position: [-33, -64, 5], paletteIndex: 0 },
+    { position: [32, 319, -6], paletteIndex: 1 },
+  ], [
+    { blockId: "minecraft:white_concrete", color: [207, 213, 214] },
+    { blockId: "minecraft:end_rod", properties: { facing: "up" }, emissive: true },
+  ], {
+    edition: "java",
+    minecraftVersion: "1.20.1",
+    metadata: {
+      name: "Shared projection",
+      generator: "MELY",
+      generationMode: "solid",
+      targetHeight: 384,
+      heightMode: "extended_2032",
+      datapackAcknowledged: true,
+      placementBottomY: -2032,
+      targetDimensionMinY: -2032,
+      targetDimensionMaxY: 2031,
+      heightDisclaimer: "Java-only third-party data pack warning",
+      javaVersionId: "1.20.1",
+      releaseStatus: "unavailable",
+      profileFingerprint: "java-profile",
+      configurationFingerprint: "height-configuration",
+      exportFingerprint: "height-export",
+      confirmations: "Java-only confirmations",
+    },
+  });
+
+  const bedrockDocument = deriveBedrockProjectionDocument(javaDocument);
+
+  assert.equal(bedrockDocument.edition, "bedrock");
+  assert.equal(bedrockDocument.minecraftVersion, "1.20.10");
+  assert.deepEqual(sortedBlockKeys(bedrockDocument), sortedBlockKeys(javaDocument));
+  assert.deepEqual(bedrockDocument.palette, javaDocument.palette);
+  assert.deepEqual(bedrockDocument.chunks, javaDocument.chunks);
+  assert.deepEqual(bedrockDocument.bounds, javaDocument.bounds);
+  assert.equal(bedrockDocument.blockCount, javaDocument.blockCount);
+  assert.deepEqual(bedrockDocument.metadata, {
+    name: "Shared projection",
+    generator: "MELY",
+    generationMode: "solid",
+  });
+  assert.equal(javaDocument.metadata?.heightMode, "extended_2032");
+});
+
+test("every registered Java target derives the same independent Bedrock document", () => {
+  for (const profile of JAVA_VERSION_PROFILES) {
+    for (const height of [2_032, 4_064]) {
+      const source = createProjectionDocument([
+        { position: [0, 0, 0], paletteIndex: 0 },
+        { position: [0, height - 1, 0], paletteIndex: 0 },
+      ], [{ blockId: "minecraft:white_concrete" }], {
+        edition: "java",
+        minecraftVersion: profile.id,
+        metadata: {
+          name: "Community projection",
+          javaVersionId: profile.id,
+          releaseStatus: profile.releaseStatus,
+          targetHeight: height,
+          heightMode: height === 4_064 ? "experimental_4064" : "extended_2032",
+          heightDisclaimer: "Java-only warning",
+        },
+      });
+      const derived = deriveBedrockProjectionDocument(source);
+
+      assert.equal(derived.edition, "bedrock", profile.id);
+      assert.equal(derived.minecraftVersion, "1.20.10", profile.id);
+      assert.deepEqual(derived.bounds?.dimensions, [1, height, 1], profile.id);
+      assert.deepEqual(derived.metadata, { name: "Community projection" }, profile.id);
+    }
+  }
 });
 
 test("sparse giant coordinates create only occupied chunks", () => {

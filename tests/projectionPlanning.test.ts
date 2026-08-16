@@ -39,8 +39,39 @@ test("engineering plans include stable 32-cube placement coordinates", () => {
   assert.deepEqual(plan.parts.map((part) => part.origin), [[0, 0, 0], [32, 64, 0]]);
   assert.match(plan.parts[1].placement, /X=32, Y=64, Z=0/);
   assert.equal(plan.materialPlan.requirements[0].count, 3);
+  assert.deepEqual(plan.placement, {
+    modelHeight: 65,
+    recommendedBottomY: 0,
+    highestOccupiedY: 64,
+    targetDimensionMinY: null,
+    targetDimensionMaxY: null,
+    disclaimer: "",
+  });
   assert.equal(JSON.parse(serializeEngineeringPlanJson(plan)).generator, "MELY");
   assert.match(serializeEngineeringPlanText(plan), /Estimated large chests:/);
   assert.match(serializeEngineeringPlanText(plan, "zh-CN"), /工程建造指南/);
   assert.match(serializeEngineeringPlanText(plan, "ja-JP"), /素材リスト/);
+});
+
+test("Bedrock planning ignores injected Java height metadata", () => {
+  const document = createProjectionDocument([
+    { position: [0, -2_032, 0], paletteIndex: 0 },
+    { position: [0, 2_031, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }], {
+    edition: "bedrock",
+    metadata: {
+      targetDimensionMinY: -2_032,
+      targetDimensionMaxY: 2_031,
+      heightDisclaimer: "Java-only warning",
+    },
+  });
+
+  assert.deepEqual(createProjectionEngineeringPlan(document).placement, {
+    modelHeight: 4_064,
+    recommendedBottomY: -2_032,
+    highestOccupiedY: 2_031,
+    targetDimensionMinY: null,
+    targetDimensionMaxY: null,
+    disclaimer: "",
+  });
 });

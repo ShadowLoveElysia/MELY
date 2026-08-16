@@ -41,6 +41,11 @@ const createVersionFixture = async (sourceVersion: string, mirrorVersion: string
       `{${crlf}  "version": "${sourceVersion}"${crlf}}${crlf}`,
       "utf8",
     ),
+    writeFile(
+      join(root, "src-tauri", "tauri.conf.json"),
+      `{${crlf}  "version": "../src/version/version.json"${crlf}}${crlf}`,
+      "utf8",
+    ),
     writeFile(join(root, "src-tauri", "Cargo.toml"), cargoManifest(mirrorVersion), "utf8"),
     writeFile(join(root, "src-tauri", "Cargo.lock"), cargoLock(mirrorVersion), "utf8"),
   ]);
@@ -69,15 +74,47 @@ test("version check accepts synchronized Cargo mirrors with CRLF", async (contex
 });
 
 test("version sync preserves CRLF while updating Cargo mirrors", async (context) => {
-  const root = await createVersionFixture("0.2.0", "0.1.0");
+  const root = await createVersionFixture("1.0.0", "0.2.0");
   context.after(() => rm(root, { recursive: true, force: true }));
 
   const syncResult = runVersionCommand(root, "sync");
 
   assert.equal(syncResult.status, 0, syncResult.stderr);
-  assert.equal(await readFile(join(root, "src-tauri", "Cargo.toml"), "utf8"), cargoManifest("0.2.0"));
-  assert.equal(await readFile(join(root, "src-tauri", "Cargo.lock"), "utf8"), cargoLock("0.2.0"));
+  assert.equal(await readFile(join(root, "src-tauri", "Cargo.toml"), "utf8"), cargoManifest("1.0.0"));
+  assert.equal(await readFile(join(root, "src-tauri", "Cargo.lock"), "utf8"), cargoLock("1.0.0"));
 
   const checkResult = runVersionCommand(root, "check");
   assert.equal(checkResult.status, 0, checkResult.stderr);
+});
+
+test("version check reports every stale Cargo mirror without modifying it", async (context) => {
+  const root = await createVersionFixture("1.0.0", "0.2.0");
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const cargoManifestPath = join(root, "src-tauri", "Cargo.toml");
+  const cargoLockPath = join(root, "src-tauri", "Cargo.lock");
+  const manifestBefore = await readFile(cargoManifestPath, "utf8");
+  const lockBefore = await readFile(cargoLockPath, "utf8");
+
+  const result = runVersionCommand(root, "check");
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /src-tauri[\\/]Cargo\.toml/);
+  assert.match(result.stderr, /src-tauri[\\/]Cargo\.lock/);
+  assert.equal(await readFile(cargoManifestPath, "utf8"), manifestBefore);
+  assert.equal(await readFile(cargoLockPath, "utf8"), lockBefore);
+});
+
+test("version commands reject a Tauri config that no longer references the source manifest", async (context) => {
+  const root = await createVersionFixture("1.0.0", "1.0.0");
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    join(root, "src-tauri", "tauri.conf.json"),
+    `{${crlf}  "version": "0.2.0"${crlf}}${crlf}`,
+    "utf8",
+  );
+
+  const result = runVersionCommand(root, "sync");
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /tauri\.conf\.json.*version.*\.\.\/src\/version\/version\.json/);
 });

@@ -176,6 +176,8 @@ function Invoke-Build {
     '"C:\Windows\System32\where.exe" node.exe',
     '"C:\Windows\System32\where.exe" npm.cmd',
     '"C:\Windows\System32\where.exe" cargo.exe',
+    '"C:\Program Files\nodejs\node.exe" "scripts\version.mjs" sync',
+    'if errorlevel 1 exit /b %ERRORLEVEL%',
     '"C:\Program Files\nodejs\node.exe" "scripts\version.mjs" check',
     'if errorlevel 1 exit /b %ERRORLEVEL%',
     '"C:\Program Files\nodejs\node.exe" "node_modules\typescript\bin\tsc" -b',

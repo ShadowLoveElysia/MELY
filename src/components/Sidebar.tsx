@@ -28,6 +28,7 @@ import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, KeyboardEvent, PointerEvent } from "react";
 import { orderModelParts } from "../core/modelParts";
 import { useI18n } from "../i18n/I18nProvider";
+import type { TranslationKey } from "../i18n";
 import type {
   GenerationMode,
   HologramOptions,
@@ -41,6 +42,7 @@ import type {
   ProjectionStats,
   SolidOptions,
 } from "../types";
+import type { JavaVersionProfile } from "../core/minecraftVersions";
 import { Field, Select, Slider, Toggle } from "./Controls";
 import { Section } from "./Section";
 
@@ -70,15 +72,24 @@ interface SidebarProps {
   modelLoading: boolean;
   modelLoadStage: string;
   exporting: boolean;
+  javaVersionProfiles: readonly JavaVersionProfile[];
+  selectedJavaVersionId: string;
+  versionCompatibilityWarning?: string;
   heightMaximum: number;
   extendedHeightUnlocked: boolean;
+  experimentalHeightActive: boolean;
   extendedHeightActive: boolean;
+  targetDimensionMinY: number | null;
+  targetDimensionHeight: number | null;
+  placementBottomY: number | null;
   estimatedBlockCount: number | null;
   resourceEstimateLabel: string | null;
   progress: number;
   stage: string;
   progressDetail: string;
   sidebarWidth: number;
+  sidebarWidthMaximum: number;
+  sidebarUiScale: number;
   physicsAvailable: boolean;
   physicsEnabled: boolean;
   physicsLoading: boolean;
@@ -92,6 +103,7 @@ interface SidebarProps {
   onSidebarResizeStart: (event: PointerEvent<HTMLDivElement>) => void;
   onSidebarResizeStep: (delta: number) => void;
   onSidebarResizeReset: () => void;
+  onSidebarUiScaleChange: (scale: number) => void;
   onPoseEditingChange: (editing: boolean) => void;
   onBoneSelected: (index: number | null) => void;
   onPoseNudge: (axis: "x" | "y" | "z", direction: -1 | 1) => void;
@@ -103,7 +115,14 @@ interface SidebarProps {
   onPoseImport: (file: File) => void | Promise<void>;
   onGenerate: () => void;
   onExport: () => void;
+  onJavaVersionChange: (versionId: string) => void;
   onExtendedHeightToggle: () => void;
+  onExperimentalHeightUnlock: () => void;
+  onTargetDimensionChange: (patch: {
+    minY?: number | null;
+    height?: number | null;
+    placementBottomY?: number | null;
+  }) => void;
 }
 
 export function Sidebar({
@@ -125,15 +144,24 @@ export function Sidebar({
   modelLoading,
   modelLoadStage,
   exporting,
+  javaVersionProfiles,
+  selectedJavaVersionId,
+  versionCompatibilityWarning,
   heightMaximum,
   extendedHeightUnlocked,
+  experimentalHeightActive,
   extendedHeightActive,
+  targetDimensionMinY,
+  targetDimensionHeight,
+  placementBottomY,
   estimatedBlockCount,
   resourceEstimateLabel,
   progress,
   stage,
   progressDetail,
   sidebarWidth,
+  sidebarWidthMaximum,
+  sidebarUiScale,
   physicsAvailable,
   physicsEnabled,
   physicsLoading,
@@ -147,6 +175,7 @@ export function Sidebar({
   onSidebarResizeStart,
   onSidebarResizeStep,
   onSidebarResizeReset,
+  onSidebarUiScaleChange,
   onPoseEditingChange,
   onBoneSelected,
   onPoseNudge,
@@ -158,7 +187,10 @@ export function Sidebar({
   onPoseImport,
   onGenerate,
   onExport,
+  onJavaVersionChange,
   onExtendedHeightToggle,
+  onExperimentalHeightUnlock,
+  onTargetDimensionChange,
 }: SidebarProps) {
   const { t, number } = useI18n();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -189,7 +221,10 @@ export function Sidebar({
       onSidebarResizeStep(event.key === "ArrowLeft" ? -24 : 24);
     } else if (event.key === "Home") {
       event.preventDefault();
-      onSidebarResizeReset();
+      onSidebarResizeStep(300 - sidebarWidth);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      onSidebarResizeStep(sidebarWidthMaximum - sidebarWidth);
     }
   };
 
@@ -227,7 +262,10 @@ export function Sidebar({
     <aside
       className="sidebar"
       aria-label={t("sidebar.aria")}
-      style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+      style={{
+        "--sidebar-width": `${sidebarWidth}px`,
+        "--sidebar-ui-scale": sidebarUiScale,
+      } as CSSProperties}
     >
       <div
         className="sidebar-resize-handle"
@@ -236,7 +274,7 @@ export function Sidebar({
         aria-label={t("sidebar.resize")}
         aria-orientation="vertical"
         aria-valuemin={300}
-        aria-valuemax={840}
+        aria-valuemax={sidebarWidthMaximum}
         aria-valuenow={sidebarWidth}
         title={t("sidebar.resize")}
         onPointerDown={onSidebarResizeStart}
@@ -246,6 +284,18 @@ export function Sidebar({
         <GripVertical size={12} />
       </div>
       <div className="sidebar-scroll">
+        <div className="sidebar-display-controls">
+          <Field label={t("sidebar.uiScale")} hint={t("sidebar.uiScaleHint")}>
+            <select
+              value={sidebarUiScale}
+              onChange={(event) => onSidebarUiScaleChange(Number(event.currentTarget.value))}
+            >
+              {[1, 1.1, 1.25, 1.5].map((scale) => (
+                <option key={scale} value={scale}>{Math.round(scale * 100)}%</option>
+              ))}
+            </select>
+          </Field>
+        </div>
         <Section index="01" title={t("sidebar.section.assets")} subtitle={t("sidebar.section.assetsSubtitle")}>
           <div
             className={`drop-zone ${dragging ? "drop-zone--active" : ""} ${modelLoading ? "drop-zone--loading" : ""}`}
@@ -544,7 +594,26 @@ export function Sidebar({
         ) : null}
 
         <Section index={modelStats ? "03" : "02"} title={t("sidebar.section.scale")} subtitle={t("sidebar.scale.version")}>
-          <Field label={t("sidebar.scale.targetHeight")} hint={t("sidebar.scale.targetHeightHint")}>
+          <Field label={t("sidebar.scale.javaVersion")} hint={t("sidebar.scale.javaVersionHint")}>
+            <Select value={selectedJavaVersionId} onChange={onJavaVersionChange}>
+              {javaVersionProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.label} · {t(`sidebar.scale.versionStatus.${profile.releaseStatus}` as TranslationKey)}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          {versionCompatibilityWarning ? (
+            <div className="height-warning height-warning--compatibility" role="status">
+              <AlertTriangle size={16} aria-hidden="true" />
+              <span><small>{versionCompatibilityWarning}</small></span>
+            </div>
+          ) : null}
+          <Field
+            className="field-row--target-height"
+            label={t("sidebar.scale.targetHeight")}
+            hint={t("sidebar.scale.targetHeightHint")}
+          >
             <Slider
               value={options.targetHeight}
               min={32}
@@ -565,6 +634,63 @@ export function Sidebar({
               ? t("sidebar.scale.lockExtended")
               : t("sidebar.scale.unlockExtended", { maximum: number(2032) })}</span>
           </button>
+          {extendedHeightUnlocked ? (
+            <>
+              <div className="dimension-declaration" role="group" aria-label={t("sidebar.scale.targetDimension") }>
+                <p>{t("sidebar.scale.targetDimensionHint")}</p>
+                <label>
+                  <span>{t("sidebar.scale.targetDimensionMinY")}</span>
+                  <input
+                    type="number"
+                    step={1}
+                    value={targetDimensionMinY ?? ""}
+                    placeholder={t("sidebar.scale.targetDimensionMinY")}
+                    onChange={(event) => onTargetDimensionChange({
+                      minY: event.currentTarget.value === "" ? null : event.currentTarget.valueAsNumber,
+                    })}
+                  />
+                </label>
+                <label>
+                  <span>{t("sidebar.scale.targetDimensionHeight")}</span>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={targetDimensionHeight ?? ""}
+                    placeholder={t("sidebar.scale.targetDimensionHeight")}
+                    onChange={(event) => onTargetDimensionChange({
+                      height: event.currentTarget.value === "" ? null : event.currentTarget.valueAsNumber,
+                    })}
+                  />
+                </label>
+                <label>
+                  <span>{t("sidebar.scale.placementBottomY")}</span>
+                  <input
+                    type="number"
+                    step={1}
+                    value={placementBottomY ?? ""}
+                    placeholder={t("sidebar.scale.placementBottomY")}
+                    onChange={(event) => onTargetDimensionChange({
+                      placementBottomY: event.currentTarget.value === ""
+                        ? null
+                        : event.currentTarget.valueAsNumber,
+                    })}
+                  />
+                </label>
+              </div>
+              {!experimentalHeightActive ? (
+                <button
+                  type="button"
+                  className="height-unlock"
+                  title={t("sidebar.scale.experimental4064Hint")}
+                  onClick={onExperimentalHeightUnlock}
+                >
+                  <Lock size={15} />
+                  <span>{t("sidebar.scale.experimental4064")}</span>
+                </button>
+              ) : null}
+            </>
+          ) : null}
           <div className="dimension-strip">
             <span><Box size={14} /> {t("sidebar.scale.bounds")}</span>
             <strong>{stats ? `${stats.dimensions[0]} × ${stats.dimensions[1]} × ${stats.dimensions[2]}` : "-- × -- × --"}</strong>
@@ -626,6 +752,34 @@ export function Sidebar({
                   onChange={(sampleSpacing) => onOptionsChange({ sampleSpacing })}
                 />
               </Field>
+              <Field label={t("sidebar.hologram.interiorDensity")} hint={t("sidebar.hologram.interiorDensityHint")}>
+                <Slider
+                  value={options.interiorDensity ?? 0}
+                  min={0}
+                  max={100}
+                  unit="%"
+                  editable
+                  onChange={(interiorDensity) => onOptionsChange({ interiorDensity })}
+                />
+              </Field>
+              {stats && "interiorMode" in stats && stats.interiorMode && stats.interiorMode !== "disabled" ? (
+                <div
+                  className={stats.interiorMode === "shell-fallback" || stats.interiorMode === "unavailable"
+                    ? "interior-sampling-status interior-sampling-status--warning"
+                    : "interior-sampling-status"}
+                  role="status"
+                >
+                  {stats.interiorMode === "closed-volume"
+                    ? t("sidebar.hologram.interiorClosed", {
+                        count: number(stats.interiorBlockCount ?? 0),
+                      })
+                    : stats.interiorMode === "shell-fallback"
+                      ? t("sidebar.hologram.interiorShellFallback", {
+                          count: number(stats.interiorBlockCount ?? 0),
+                        })
+                      : t("sidebar.hologram.interiorUnavailable")}
+                </div>
+              ) : null}
               <Field label={t("sidebar.hologram.material")}>
                 <Select value={options.material} onChange={(material) => onOptionsChange({ material: material as HologramOptions["material"] })}>
                   <option value="mixed">{t("sidebar.hologram.mixed")}</option>
@@ -824,7 +978,7 @@ export function Sidebar({
         <Section index={modelStats ? "05" : "04"} title={t("sidebar.section.rules")} subtitle={t("sidebar.section.rulesSubtitle")} defaultOpen={false}>
           <div className="rule-row">
             <ShieldCheck size={16} />
-            <span><strong>{t("sidebar.rules.versionKeys")}</strong><small>{t("sidebar.rules.dataVersion", { version: number(3465) })}</small></span>
+            <span><strong>{t("sidebar.rules.versionKeys")}</strong><small>{t("sidebar.rules.profileDriven")}</small></span>
             <CircleCheck size={15} />
           </div>
           <div className="rule-row">

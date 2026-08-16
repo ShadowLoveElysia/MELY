@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  assertJavaProjectionExportSafety,
   DEFAULT_DENSE_EXPORT_VOLUME_LIMIT,
   preflightProjectionExport,
+  preflightProjectionHeightExport,
   type ExportPreflightFormat,
 } from "../src/core/exportPreflight";
 import { createProjectionDocument } from "../src/core/projectionDocument";
@@ -112,4 +114,112 @@ test("sparse formats remain available for bounds beyond safe dense arithmetic", 
   for (const format of ["litematic", "bundle", "mcfunction"] as const) {
     assert.equal(preflightProjectionExport(document, format).allowed, true, format);
   }
+});
+
+test("height-aware export preflight rejects only unknown Java versions", () => {
+  const document = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], palette, { minecraftVersion: "future-unknown" });
+  const result = preflightProjectionHeightExport(document, "litematic", {
+    heightMode: "default",
+    targetHeight: 1,
+    placementBottomY: 0,
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, "JAVA_VERSION_PROFILE_UNKNOWN");
+  assert.equal(result.heightErrorCode, "JAVA_VERSION_PROFILE_UNKNOWN");
+
+  const registered = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], palette, { minecraftVersion: "1.20.2" });
+  const bestEffort = preflightProjectionHeightExport(registered, "schematic", {
+    heightMode: "default",
+    targetHeight: 1,
+    placementBottomY: -64,
+  });
+  assert.equal(bestEffort.allowed, true);
+  assert.equal(bestEffort.reason, null);
+});
+
+test("height-aware export preflight checks actual span and placement Y", () => {
+  const document = sparseDocument([0, 383, 0]);
+  const accepted = preflightProjectionHeightExport(document, "litematic", {
+    heightMode: "default",
+    targetHeight: 320,
+    placementBottomY: -64,
+  });
+  assert.equal(accepted.allowed, true);
+  assert.equal(accepted.requiredHeight, 384);
+  assert.equal(accepted.placementMaxY, 319);
+
+  const rejected = preflightProjectionHeightExport(document, "litematic", {
+    heightMode: "default",
+    targetHeight: 320,
+    placementBottomY: -63,
+  });
+  assert.equal(rejected.allowed, false);
+  assert.equal(rejected.reason, "PLACEMENT_OUTSIDE_DIMENSION_RANGE");
+});
+
+test("Bedrock exports do not inherit Java height confirmation state", () => {
+  const document = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], palette, { edition: "bedrock" });
+  const result = preflightProjectionHeightExport(document, "mcstructure", {
+    heightMode: "experimental_4064",
+    targetHeight: 4064,
+    placementBottomY: 0,
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.heightErrorCode, null);
+});
+
+test("serializer safety recomputes bounds instead of trusting document declarations", () => {
+  const source = sparseDocument([0, 383, 0]);
+  const forged = {
+    ...source,
+    bounds: {
+      min: [0, 0, 0],
+      max: [0, 0, 0],
+      dimensions: [1, 1, 1],
+    },
+    blockCount: 1,
+  } as ProjectionDocument;
+  assert.throws(
+    () => assertJavaProjectionExportSafety(forged, "litematic"),
+    /blockCount|declared bounds/,
+  );
+});
+
+test("serializer safety rejects palette entries outside the target registry", () => {
+  const document = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:future_custom_block" }]);
+  assert.throws(
+    () => assertJavaProjectionExportSafety(document, "litematic"),
+    /JAVA_BLOCK_UNSUPPORTED/,
+  );
+});
+
+test("serializer safety cannot relabel a document or replace its default dimension", () => {
+  const unavailable = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], palette, { minecraftVersion: "1.20.2" });
+  assert.throws(
+    () => assertJavaProjectionExportSafety(unavailable, "litematic", { versionId: "1.20.1" }),
+    /does not match document version/,
+  );
+  assert.equal(
+    assertJavaProjectionExportSafety(unavailable, "litematic").compatibility.level,
+    "best_effort",
+  );
+
+  const verified = sparseDocument([0, 10, 0]);
+  assert.throws(
+    () => assertJavaProjectionExportSafety(verified, "litematic", {
+      targetDimension: { minY: 0, height: 384 },
+      placementBottomY: 0,
+    }),
+    /must use the profile default dimension/,
+  );
 });

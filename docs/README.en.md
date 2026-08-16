@@ -40,13 +40,13 @@ MELY currently targets the Minecraft Java Edition 1.20.1 block registry while al
 - Render animation in real time on the GPU, then generate CPU-skinned snapshots only when locking a frame or voxelizing.
 - Adjust model bones manually and import or export lightweight MELY Pose JSON files.
 - Generate solid-block voxels or Ethereal Hologram wireframes.
-- Represent sparse character contours with vertical end rods and isolated white glass panes.
+- Represent sparse character contours with vertical end rods and isolated white glass panes, with an independent interior projection density control.
 - Apply alpha thresholds, triangle-box intersection tests, thin-surface preservation, and current-pose sampling.
 - Use CIEDE2000 color matching, skin protection, facial-detail enhancement, material blacklists, and themed palettes.
 - Map emissive materials, preview at night, and adjust dithering intensity.
 - Produce material lists, shulker-box and chest plans, web-based layered building guides, and automatic project partitioning.
 - Export `.litematic`, `.schem`, `.mcstructure`, and `.mcfunction` behavior packs.
-- Support extended-height projects up to 2,032 blocks with multi-stage risk confirmation.
+- Provide opt-in unlocking, staged risk notices, and tryable generation/export flows for 2,032/4,064-layer heights.
 - Provide Simplified Chinese, English, and Japanese interfaces.
 
 ## System Requirements
@@ -194,7 +194,7 @@ The project provides two Windows release workflows:
 
 Recommended formal release procedure:
 
-1. Update `src/version/version.json`, then run `npm run version:sync` to refresh Cargo's derived version fields.
+1. Only update `src/version/version.json`. Desktop build and Windows release entry points automatically synchronize Cargo's derived version fields; run `npm run version:sync` only when you want to refresh them immediately.
 2. Commit the changes and create a tag for that commit. The tag name can follow any release naming scheme.
 3. Create and publish a formal GitHub Release from that tag.
 4. Wait for the **Windows Release Assets** workflow to finish uploading the assets.
@@ -217,13 +217,14 @@ Real-time VMD preview calculates bones, morphs, and IK by default. Expensive phy
 
 ## Height Compatibility
 
+- Exact profiles provide Java version metadata. Every listed version may be used for best-effort generation and export. Java 1.20.1 has repository format coverage; less-tested versions may fall back to a known serializer and can have compatibility issues or minor bugs. Repository NBT readback is not real-tool acceptance in Litematica or WorldEdit.
 - The default recommended character height is 320 blocks, leaving installation space within the vanilla world's vertical bounds.
-- A vanilla dimension is treated as having a total height of 384 blocks.
-- Extended-height mode must be explicitly unlocked above 384 blocks.
-- The maximum target is 2,032 blocks, but the destination world must have a corresponding height-extension data pack installed.
+- Default dimension bounds come from the selected exact profile; Java 1.20.1 uses `Y=-64..319` (384 layers).
+- Users can opt in to the 2,032-layer extension and try generation and export. The target world usually still needs a third-party data pack matching the exact version and dimension. Its default declaration is `min_y=-1024, height=2032` and can be edited to match the installed pack.
+- The 4,064-layer experimental state can be unlocked after 2,032 through unlock, environment-notice, and per-export confirmations. Its reference configuration is `min_y=-2032, height=4064` (placeable `Y=-2032..2031`); it is not “native 4096” support. This flow is not fully tested and may have compatibility issues or minor bugs.
 - Loading an over-height projection into a normal world may cause top clipping, game lag, mod crashes, or save corruption.
 
-MELY presents separate risk confirmations when unlocking the mode, configuring its parameters, and performing the final export, but these confirmations are not a substitute for backing up the destination world.
+MELY does not create, bundle, download, install, validate, or endorse third-party height data packs. Check the source, license, exact version, `pack_format`, `dimension_type`, `min_y`, and `height`, then test boundary placement, chunk reloads, and the actual paste tool in a world copy. These notices do not block generation or an export attempt; report compatibility problems to the community.
 
 ## Development Commands
 

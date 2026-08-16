@@ -38,18 +38,39 @@ import { Windows } from "./components/Windows";
 import { appError, errorDescriptor } from "./core/appError";
 import {
   preflightProjectionExport,
+  preflightProjectionHeightExport,
+  type HeightAwareExportPreflightResult,
   type ExportPreflightFormat,
   type ExportPreflightReason,
   type ExportPreflightResult,
 } from "./core/exportPreflight";
 import {
+  COMPATIBILITY_DEFAULT_DIMENSION,
   DEFAULT_TARGET_HEIGHT,
+  EXPERIMENTAL_WORLD_HEIGHT,
   EXTENDED_WORLD_HEIGHT,
-  VANILLA_WORLD_HEIGHT,
-  clampTargetHeight,
+  clearExtremeExportConfirmation,
+  confirmExtremeEnvironment,
+  confirmExtremeExport,
+  confirmExtremeUnlock,
+  createExtremeExportFingerprint,
+  createExtremeHeightConfigurationFingerprint,
+  createExtremeHeightConfirmationState,
+  createHeightProfileFingerprint,
   evaluateProjectionHeightRisk,
-  type HeightLimitMode,
+  extremeExportPhrase,
+  invalidateExtremeConfirmations,
+  preflightGenerationHeight,
+  type ExtremeHeightConfirmationState,
+  type ExtremeHeightFingerprintInput,
+  type HeightDimension,
+  type HeightMode,
 } from "./core/heightSafety";
+import {
+  DEFAULT_MINECRAFT_VERSION,
+  JAVA_VERSION_PROFILES,
+  getJavaVersionProfile,
+} from "./core/minecraftVersions";
 import type {
   MmdModelCandidate,
   MmdMotionCandidateTracks,
@@ -72,7 +93,11 @@ import {
   createMotionPlaybackStore,
   createMotionTimeStore,
 } from "./core/motionTimeStore";
-import { createProjectionDocumentFromResult } from "./core/projectionDocument";
+import {
+  createProjectionDocumentFromResult,
+  deriveBedrockProjectionDocument,
+} from "./core/projectionDocument";
+import { createProjectionDocumentContentHash, sha256Hex } from "./core/projectionContentHash";
 import { formatBinaryBytes, estimateVoxelizationResources } from "./core/resourceBudget";
 import type { ExportBundlePhase } from "./core/exportBundle";
 import {
@@ -134,9 +159,9 @@ const exportBundleStageKeys = {
 const initialOptions: HologramOptions = {
   targetHeight: DEFAULT_TARGET_HEIGHT,
   sampleSpacing: 2,
+  interiorDensity: 0,
   material: "mixed",
   directionMode: "vertical",
-  isolatePanes: true,
   preserveFace: true,
   glow: 72,
 };
@@ -169,6 +194,11 @@ const exportFormats = [
 
 type ExportFormat = (typeof exportFormats)[number];
 
+const isBedrockExportFormat = (
+  format: ExportFormat,
+): format is "mcstructure" | "mcfunction" =>
+  format === "mcstructure" || format === "mcfunction";
+
 const exportPreflightReasonKeys = {
   empty: "exportCenter.unavailable.empty",
   unsafeVolume: "exportCenter.unavailable.volume",
@@ -182,6 +212,18 @@ interface PendingExport {
   targetHeight: number;
   actualHeight: number;
   safetyHeight: number;
+  configurationFingerprint?: string;
+  exportFingerprint?: string;
+  safety: {
+    heightMode: HeightMode;
+    targetHeight: number;
+    placementBottomY: number;
+    targetDimension?: HeightDimension;
+    configurationFingerprint?: string;
+    confirmations: ExtremeHeightConfirmationState;
+  };
+  resultId: string;
+  experimental: boolean;
   bundleFormats?: {
     includeSchematic: boolean;
     includeMcstructure: boolean;
@@ -226,10 +268,12 @@ const emptyClearResourceSelection = (): Record<ClearResourceKind, boolean> => ({
 });
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "mely.sidebarWidth";
+const SIDEBAR_UI_SCALE_STORAGE_KEY = "mely.sidebarUiScale";
 const DEFAULT_SIDEBAR_WIDTH = 372;
 const MIN_SIDEBAR_WIDTH = 300;
 const MAX_SIDEBAR_WIDTH = 840;
 const MIN_VIEWPORT_WIDTH = 420;
+const SIDEBAR_UI_SCALES = [1, 1.1, 1.25, 1.5] as const;
 
 const clampSidebarWidth = (width: number, viewportWidth = window.innerWidth) => {
   const viewportMaximum = viewportWidth <= 720
@@ -266,6 +310,8 @@ interface MotionTrackRuntime {
     lastUiFrame: number;
   };
 }
+
+type ExtremeDialogStage = "unlock" | "environment" | null;
 
 interface ActiveMmdSource {
   files: File[];
@@ -373,6 +419,25 @@ const yieldToBrowser = () => new Promise<void>((resolve) => window.setTimeout(re
 
 const textureByteEstimate = (model: LoadedMmdModel | null) => {
   return model?.textureByteEstimate() ?? 0;
+};
+
+const sidebarWidthMaximum = (viewportWidth = window.innerWidth) => viewportWidth <= 720
+  ? MAX_SIDEBAR_WIDTH
+  : Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, viewportWidth - MIN_VIEWPORT_WIDTH));
+
+const normalizeSidebarUiScale = (scale: number) => SIDEBAR_UI_SCALES.reduce(
+  (closest, candidate) => Math.abs(candidate - scale) < Math.abs(closest - scale)
+    ? candidate
+    : closest,
+  SIDEBAR_UI_SCALES[0],
+);
+
+const initialSidebarUiScale = () => {
+  try {
+    return normalizeSidebarUiScale(Number(window.localStorage.getItem(SIDEBAR_UI_SCALE_STORAGE_KEY)));
+  } catch {
+    return SIDEBAR_UI_SCALES[0];
+  }
 };
 
 const buildSurvivalLabels = (
@@ -532,6 +597,7 @@ export default function App() {
   const projectionDocumentRef = useRef<{
     result: ProjectionResult;
     document: ProjectionDocument;
+    contentHash?: string;
   } | null>(null);
   const motionRuntimeRef = useRef<Record<MmdMotionTrackKind, MotionTrackRuntime> | null>(null);
   if (!motionRuntimeRef.current) {
@@ -583,6 +649,7 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(initialSidebarWidth);
+  const [sidebarUiScale, setSidebarUiScale] = useState(initialSidebarUiScale);
   const [physicsEnabled, setPhysicsEnabled] = useState(false);
   const [physicsLoading, setPhysicsLoading] = useState(false);
   const hiddenMaterialIndicesRef = useRef<number[]>([]);
@@ -592,12 +659,29 @@ export default function App() {
   const [showGrid, setShowGrid] = useState(true);
   const [showBounds, setShowBounds] = useState(true);
   const [nightMode, setNightMode] = useState(false);
-  const [heightMode, setHeightMode] = useState<HeightLimitMode>("vanilla");
+  const [heightMode, setHeightMode] = useState<HeightMode>("default");
+  const [javaVersionId, setJavaVersionId] = useState(DEFAULT_MINECRAFT_VERSION.id);
+  const [targetDimensionMinY, setTargetDimensionMinY] = useState<number | null>(null);
+  const [targetDimensionHeight, setTargetDimensionHeight] = useState<number | null>(null);
+  const [placementBottomY, setPlacementBottomY] = useState<number | null>(null);
   const [heightUnlockOpen, setHeightUnlockOpen] = useState(false);
+  const [extremeUnlockConfigurationFingerprint, setExtremeUnlockConfigurationFingerprint] = useState<string | null>(null);
+  const [extremeDialogStage, setExtremeDialogStage] = useState<ExtremeDialogStage>(null);
+  const [extremeEnvironmentChecks, setExtremeEnvironmentChecks] = useState({
+    datapack: false,
+    backup: false,
+    toolchain: false,
+  });
+  const [extremeConfirmations, setExtremeConfirmations] = useState<ExtremeHeightConfirmationState>(
+    createExtremeHeightConfirmationState,
+  );
+  const extremeConfirmationsRef = useRef(extremeConfirmations);
+  extremeConfirmationsRef.current = extremeConfirmations;
+  const [extremeExportPhraseInput, setExtremeExportPhraseInput] = useState("");
   const [clearResourcesOpen, setClearResourcesOpen] = useState(false);
   const [clearResourceSelection, setClearResourceSelection] = useState(emptyClearResourceSelection);
   const [exportCenterOpen, setExportCenterOpen] = useState(false);
-  const [exportPreflights, setExportPreflights] = useState<Partial<Record<ExportFormat, ExportPreflightResult>>>({});
+  const [exportPreflights, setExportPreflights] = useState<Partial<Record<ExportFormat, HeightAwareExportPreflightResult | ExportPreflightResult>>>({});
   const [bundleFormats, setBundleFormats] = useState({
     includeSchematic: false,
     includeMcstructure: false,
@@ -612,6 +696,16 @@ export default function App() {
   const [resetToken, setResetToken] = useState(0);
   const [focusFaceToken, setFocusFaceToken] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
+
+  const replaceExtremeConfirmations = useCallback((
+    next: ExtremeHeightConfirmationState | (
+      (current: ExtremeHeightConfirmationState) => ExtremeHeightConfirmationState
+    ),
+  ) => {
+    const resolved = typeof next === "function" ? next(extremeConfirmationsRef.current) : next;
+    extremeConfirmationsRef.current = resolved;
+    setExtremeConfirmations(resolved);
+  }, []);
 
   const acquireBackendOperation = useCallback(() => {
     if (backendOperationRef.current) return null;
@@ -661,7 +755,9 @@ export default function App() {
     setExportPreflights({});
     setPendingExport(null);
     setExtendedExportAcknowledged(false);
-  }, []);
+    setExtremeExportPhraseInput("");
+    replaceExtremeConfirmations((current) => clearExtremeExportConfirmation(current));
+  }, [replaceExtremeConfirmations]);
 
   useEffect(() => {
     const lifecycle = createConversionWorkerLifecycle({
@@ -907,9 +1003,12 @@ export default function App() {
   }, [motionRuntime]);
 
   const targetHeight = options.targetHeight;
+  const selectedProfile = getJavaVersionProfile(javaVersionId);
+  const selectedDefaultDimension = selectedProfile?.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION;
+  const selectedDefaultHeight = selectedDefaultDimension.height;
   const heightRisk = useMemo(
-    () => evaluateProjectionHeightRisk(targetHeight, result?.bounds),
-    [result?.bounds, targetHeight],
+    () => evaluateProjectionHeightRisk(targetHeight, result?.bounds, selectedDefaultHeight),
+    [result?.bounds, selectedDefaultHeight, targetHeight],
   );
   const extendedHeightActive = heightRisk.requiresExportConfirmation;
   const estimatedDimensions = useMemo(
@@ -934,7 +1033,81 @@ export default function App() {
         textureBytes: generationMode === "solid" ? textureByteEstimate(mmdModel) : 0,
         fillMode: generationMode === "solid" ? solidOptions.fillMode : "shell",
         estimatedBlocks: estimatedBlockCount,
-      }), [estimatedBlockCount, estimatedDimensions, generationMode, mmdModel, solidOptions.fillMode, targetHeight]);
+        ...(generationMode === "hologram" ? { interiorDensity: options.interiorDensity ?? 0 } : {}),
+      }), [estimatedBlockCount, estimatedDimensions, generationMode, mmdModel, options.interiorDensity, solidOptions.fillMode, targetHeight]);
+  const declaredTargetDimension = useMemo<HeightDimension | undefined>(() => (
+    Number.isSafeInteger(targetDimensionMinY)
+    && Number.isSafeInteger(targetDimensionHeight)
+    && (targetDimensionHeight ?? 0) > 0
+      ? { minY: targetDimensionMinY!, height: targetDimensionHeight! }
+      : undefined
+  ), [targetDimensionHeight, targetDimensionMinY]);
+  const placementForHeightPreflight = heightMode === "default"
+    ? selectedDefaultDimension.minY
+    : placementBottomY ?? Number.NaN;
+  const extremeFingerprintBase = useMemo<ExtremeHeightFingerprintInput | null>(() => {
+    if (
+      !selectedProfile
+      || (heightMode !== "experimental_4064" && extremeDialogStage === null)
+      || !declaredTargetDimension
+    ) return null;
+    return {
+      projectId: selectedModelPath || mmdModel?.stats.name || "unsaved-project",
+      resultId: null,
+      generationMode,
+      generationParameters: generationMode === "solid"
+        ? { ...solidOptions }
+        : { ...options },
+      versionId: javaVersionId,
+      profileFingerprint: createHeightProfileFingerprint(selectedProfile),
+      targetHeight,
+      // 解锁与环境关仅绑定生成配置；实际结果在第三关 export fingerprint 中加入。
+      actualHeight: targetHeight,
+      bounds: null,
+      targetDimension: { id: "user-declared", ...declaredTargetDimension },
+      placementBottomY: placementBottomY ?? Number.NaN,
+      edition: "java",
+      exportFormat: "pending",
+      resourceEstimate: resourceEstimate
+        ? {
+            estimatedBytes: resourceEstimate.estimatedBytes,
+            estimatedBlocks: resourceEstimate.estimatedBlocks,
+            estimatedCandidates: resourceEstimate.estimatedCandidates,
+          }
+        : {},
+    };
+  }, [declaredTargetDimension, extremeDialogStage, generationMode, heightMode, javaVersionId,
+    mmdModel?.stats.name, options, placementBottomY, resourceEstimate, selectedModelPath,
+    selectedProfile, solidOptions, targetHeight]);
+  const computedExtremeConfigurationFingerprint = useMemo(() => extremeFingerprintBase
+    ? createExtremeHeightConfigurationFingerprint(extremeFingerprintBase)
+    : null, [extremeFingerprintBase]);
+  const extremeConfigurationFingerprint = heightMode === "experimental_4064"
+    ? extremeUnlockConfigurationFingerprint
+    : computedExtremeConfigurationFingerprint;
+
+  useEffect(() => {
+    if (heightMode !== "experimental_4064") return;
+    if (!extremeConfigurationFingerprint) {
+      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+      return;
+    }
+    replaceExtremeConfirmations((current) => invalidateExtremeConfirmations(
+      current,
+      extremeConfigurationFingerprint,
+    ));
+  }, [extremeConfigurationFingerprint, heightMode]);
+
+  useEffect(() => {
+    if (heightMode !== "experimental_4064") return;
+    setHeightMode("extended_2032");
+    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+    setExtremeUnlockConfigurationFingerprint(null);
+    const normalizedHeight = Math.min(options.targetHeight, EXTENDED_WORLD_HEIGHT);
+    setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+    setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+  // 模型、姿态或材质可见性变化后必须重新走极限确认。
+  }, [partsRevision, poseRevision, selectedModelPath]);
   const survivalLabels = useMemo(
     () => buildSurvivalLabels(locale, t),
     [locale, t],
@@ -945,6 +1118,23 @@ export default function App() {
     nextHologramOptions: HologramOptions,
     nextSolidOptions: SolidOptions,
   ) => {
+    const versionProfile = getJavaVersionProfile(javaVersionId);
+    if (!versionProfile) {
+      setToast(t("toast.heightPreflightRejected", { reason: "JAVA_VERSION_PROFILE_UNKNOWN" }));
+      return;
+    }
+    const generationHeight = preflightGenerationHeight({
+      versionId: javaVersionId,
+      heightMode,
+      targetHeight: mode === "solid" ? nextSolidOptions.targetHeight : nextHologramOptions.targetHeight,
+      datapackAcknowledged: heightMode !== "default",
+      confirmations: extremeConfirmationsRef.current,
+      configurationFingerprint: extremeConfigurationFingerprint,
+    });
+    if (!generationHeight.allowed) {
+      setToast(t("toast.heightPreflightRejected", { reason: generationHeight.errorCode ?? "unknown" }));
+      return;
+    }
     const model = modelRef.current;
     const workerLifecycle = workerLifecycleRef.current;
     if (!workerLifecycle || !model) {
@@ -967,9 +1157,17 @@ export default function App() {
       textureBytes: mode === "solid" ? textureByteEstimate(model) : 0,
       fillMode: mode === "solid" ? nextSolidOptions.fillMode : "shell",
       estimatedBlocks,
+      ...(mode === "hologram" ? { interiorDensity: nextHologramOptions.interiorDensity ?? 0 } : {}),
     });
     if (!resources.allowed) {
-      setToast(t(resources.reason === "volume" ? "toast.resourceVolumeRejected" : "toast.resourceMemoryRejected", {
+      const resourceReason = resources.reason === "blocks"
+        ? "toast.resourceBlocksRejected"
+        : resources.reason === "candidates"
+          ? "toast.resourceCandidatesRejected"
+          : resources.reason === "volume"
+            ? "toast.resourceVolumeRejected"
+            : "toast.resourceMemoryRejected";
+      setToast(t(resourceReason as TranslationKey, {
         memory: formatBinaryBytes(resources.estimatedBytes),
       }));
       return;
@@ -1014,12 +1212,34 @@ export default function App() {
               type: "GENERATE_SOLID",
               jobId,
               options: nextSolidOptions,
+              versionId: javaVersionId,
+              heightMode,
+              datapackAcknowledged: heightMode !== "default",
+              targetDimension: heightMode === "default"
+                ? versionProfile.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION
+                : declaredTargetDimension,
+              placementBottomY: placementForHeightPreflight,
+              confirmations: extremeConfirmationsRef.current,
+              configurationFingerprint: extremeConfigurationFingerprint ?? undefined,
               source: { kind: "mesh", mesh: snapshot },
             }
           : {
               type: "GENERATE_HOLOGRAM",
               jobId,
               options: nextHologramOptions,
+              versionId: javaVersionId,
+              heightMode,
+              datapackAcknowledged: heightMode !== "default",
+              targetDimension: heightMode === "default"
+                ? versionProfile.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION
+                : declaredTargetDimension,
+              placementBottomY: placementForHeightPreflight,
+              confirmations: extremeConfirmationsRef.current,
+              configurationFingerprint: extremeConfigurationFingerprint ?? undefined,
+              generationSeed: {
+                contentHash: `sha256:${sha256Hex(new Uint8Array(snapshot.positions.buffer))}`,
+                minecraftVersion: javaVersionId,
+              },
               source: { kind: "mesh", mesh: snapshot },
             };
         workerLifecycle.post(jobId, command, snapshotTransferables(snapshot));
@@ -1039,7 +1259,9 @@ export default function App() {
     } finally {
       releaseBackendOperation(operationId);
     }
-  }, [acquireBackendOperation, clearProjectionArtifacts, currentMotionTimes, localizeError, releaseBackendOperation, t]);
+  }, [acquireBackendOperation, clearProjectionArtifacts, currentMotionTimes,
+    declaredTargetDimension, extremeConfigurationFingerprint, heightMode,
+    javaVersionId, localizeError, placementForHeightPreflight, releaseBackendOperation, t]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1056,12 +1278,25 @@ export default function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_UI_SCALE_STORAGE_KEY, String(sidebarUiScale));
+    } catch {
+      // UI scale persistence is optional when storage is unavailable.
+    }
+  }, [sidebarUiScale]);
+
+  useEffect(() => {
     const onResize = () => {
       if (window.innerWidth <= 720) return;
       setSidebarWidth((current) => clampSidebarWidth(current));
     };
+    const onBlur = () => sidebarResizeCleanupRef.current?.();
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("blur", onBlur);
+    };
   }, []);
 
   useEffect(() => () => sidebarResizeCleanupRef.current?.(), []);
@@ -1069,6 +1304,9 @@ export default function App() {
   const beginSidebarResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 || window.innerWidth <= 720) return;
     event.preventDefault();
+    const resizeHandle = event.currentTarget;
+    const pointerId = event.pointerId;
+    resizeHandle.setPointerCapture?.(pointerId);
     sidebarResizeCleanupRef.current?.();
     const startX = event.clientX;
     const startWidth = sidebarWidth;
@@ -1084,6 +1322,9 @@ export default function App() {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", cleanup);
       window.removeEventListener("pointercancel", cleanup);
+      if (resizeHandle.hasPointerCapture?.(pointerId)) {
+        resizeHandle.releasePointerCapture(pointerId);
+      }
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousUserSelect;
       if (sidebarResizeCleanupRef.current === cleanup) sidebarResizeCleanupRef.current = null;
@@ -1102,32 +1343,89 @@ export default function App() {
     setSidebarWidth((current) => clampSidebarWidth(current + delta));
   }, []);
 
+  const changeSidebarUiScale = useCallback((scale: number) => {
+    setSidebarUiScale(normalizeSidebarUiScale(scale));
+  }, []);
+
   const updateOptions = (patch: Partial<HologramOptions>) => {
+    const selectedDefaultHeight = getJavaVersionProfile(javaVersionId)?.defaultDimension?.height
+      ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
+    const maximumHeight = heightMode === "experimental_4064"
+      ? EXPERIMENTAL_WORLD_HEIGHT
+      : heightMode === "extended_2032"
+        ? EXTENDED_WORLD_HEIGHT
+        : selectedDefaultHeight;
     const normalizedPatch = patch.targetHeight === undefined
       ? patch
-      : { ...patch, targetHeight: clampTargetHeight(patch.targetHeight, heightMode) };
+      : {
+          ...patch,
+          targetHeight: Math.max(32, Math.min(maximumHeight, Math.round(patch.targetHeight))),
+        };
     setOptions((current) => ({ ...current, ...normalizedPatch }));
     if (normalizedPatch.targetHeight !== undefined) {
       setSolidOptions((current) => ({ ...current, targetHeight: normalizedPatch.targetHeight ?? current.targetHeight }));
     }
     if (Object.keys(normalizedPatch).some((key) => key !== "glow")) invalidateProjection("hologram-options");
+    if (
+      heightMode === "experimental_4064"
+      && Object.keys(normalizedPatch).some((key) => key !== "glow")
+    ) {
+      setHeightMode("extended_2032");
+      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+      setExtremeUnlockConfigurationFingerprint(null);
+      const normalizedHeight = Math.min(
+        normalizedPatch.targetHeight ?? options.targetHeight,
+        EXTENDED_WORLD_HEIGHT,
+      );
+      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+    }
   };
 
   const updateSolidOptions = (patch: Partial<SolidOptions>) => {
+    const selectedDefaultHeight = getJavaVersionProfile(javaVersionId)?.defaultDimension?.height
+      ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
+    const maximumHeight = heightMode === "experimental_4064"
+      ? EXPERIMENTAL_WORLD_HEIGHT
+      : heightMode === "extended_2032"
+        ? EXTENDED_WORLD_HEIGHT
+        : selectedDefaultHeight;
     const normalizedPatch = patch.targetHeight === undefined
       ? patch
-      : { ...patch, targetHeight: clampTargetHeight(patch.targetHeight, heightMode) };
+      : {
+          ...patch,
+          targetHeight: Math.max(32, Math.min(maximumHeight, Math.round(patch.targetHeight))),
+        };
     setSolidOptions((current) => ({ ...current, ...normalizedPatch }));
     if (normalizedPatch.targetHeight !== undefined) {
       setOptions((current) => ({ ...current, targetHeight: normalizedPatch.targetHeight ?? current.targetHeight }));
     }
     invalidateProjection("solid-options");
+    if (heightMode === "experimental_4064") {
+      setHeightMode("extended_2032");
+      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+      setExtremeUnlockConfigurationFingerprint(null);
+      const normalizedHeight = Math.min(
+        normalizedPatch.targetHeight ?? solidOptions.targetHeight,
+        EXTENDED_WORLD_HEIGHT,
+      );
+      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+    }
   };
 
   const toggleExtendedHeight = () => {
-    if (heightMode === "extended") {
-      setHeightMode("vanilla");
-      const targetHeight = Math.min(options.targetHeight, VANILLA_WORLD_HEIGHT);
+    if (heightMode !== "default") {
+      setHeightMode("default");
+      setTargetDimensionMinY(null);
+      setTargetDimensionHeight(null);
+      setPlacementBottomY(null);
+      setExtremeDialogStage(null);
+      setExtremeUnlockConfigurationFingerprint(null);
+      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+      const defaultHeight = getJavaVersionProfile(javaVersionId)?.defaultDimension?.height
+        ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
+      const targetHeight = Math.min(options.targetHeight, defaultHeight);
       setOptions((current) => ({ ...current, targetHeight }));
       setSolidOptions((current) => ({ ...current, targetHeight }));
       invalidateProjection("height-lock");
@@ -1137,7 +1435,10 @@ export default function App() {
   };
 
   const unlockExtendedHeight = () => {
-    setHeightMode("extended");
+    setHeightMode("extended_2032");
+    setTargetDimensionMinY(-1024);
+    setTargetDimensionHeight(EXTENDED_WORLD_HEIGHT);
+    setPlacementBottomY(-1024);
     setHeightUnlockOpen(false);
     setToast(t("toast.extendedHeightUnlocked", { maximum: number(EXTENDED_WORLD_HEIGHT) }));
   };
@@ -1148,7 +1449,131 @@ export default function App() {
       return;
     }
     invalidateProjection("mode");
+    if (heightMode === "experimental_4064") {
+      setHeightMode("extended_2032");
+      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+      setExtremeUnlockConfigurationFingerprint(null);
+      const normalizedHeight = Math.min(options.targetHeight, EXTENDED_WORLD_HEIGHT);
+      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+    }
     setGenerationMode(mode);
+  };
+
+  const beginExtremeHeightUnlock = () => {
+    if (heightMode !== "extended_2032") return;
+    setOptions((current) => ({ ...current, targetHeight: EXPERIMENTAL_WORLD_HEIGHT }));
+    setSolidOptions((current) => ({ ...current, targetHeight: EXPERIMENTAL_WORLD_HEIGHT }));
+    setTargetDimensionMinY(-2032);
+    setTargetDimensionHeight(EXPERIMENTAL_WORLD_HEIGHT);
+    setPlacementBottomY(-2032);
+    invalidateProjection("extreme-height-unlock");
+    setExtremeDialogStage("unlock");
+    setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
+  };
+
+  const confirmExtremeUnlockStage = () => {
+    const fingerprint = extremeFingerprintBase
+      ? createExtremeHeightConfigurationFingerprint(extremeFingerprintBase)
+      : null;
+    if (!fingerprint) return;
+    replaceExtremeConfirmations((current) => confirmExtremeUnlock(
+      current,
+      fingerprint,
+      `Java ${javaVersionId}; Y=-2032..2031; 2033-4064 layers`,
+    ));
+    setExtremeUnlockConfigurationFingerprint(fingerprint);
+    setExtremeDialogStage("environment");
+  };
+
+  const cancelExtremeHeightUnlock = () => {
+    setExtremeDialogStage(null);
+    setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
+    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+    setExtremeUnlockConfigurationFingerprint(null);
+    setHeightMode("extended_2032");
+    setTargetDimensionMinY(-1024);
+    setTargetDimensionHeight(EXTENDED_WORLD_HEIGHT);
+    setPlacementBottomY(-1024);
+    const normalizedHeight = Math.min(options.targetHeight, EXTENDED_WORLD_HEIGHT);
+    setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+    setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+  };
+
+  const confirmExtremeEnvironmentStage = () => {
+    const fingerprint = extremeFingerprintBase
+      ? createExtremeHeightConfigurationFingerprint(extremeFingerprintBase)
+      : null;
+    if (!fingerprint || !Object.values(extremeEnvironmentChecks).every(Boolean)) return;
+    try {
+      replaceExtremeConfirmations((current) => confirmExtremeEnvironment(
+        current,
+        fingerprint,
+        `Java ${javaVersionId}; data pack, backup, and toolchain self-checked`,
+      ));
+      setHeightMode("experimental_4064");
+      setExtremeUnlockConfigurationFingerprint(fingerprint);
+      setExtremeDialogStage(null);
+    } catch (error) {
+      setToast(localizeError(error));
+    }
+  };
+
+  const changeTargetDimension = (patch: {
+    minY?: number | null;
+    height?: number | null;
+    placementBottomY?: number | null;
+  }) => {
+    const normalize = (value: number | null) => Number.isSafeInteger(value) ? value : null;
+    if (patch.minY !== undefined) setTargetDimensionMinY(normalize(patch.minY));
+    if (patch.height !== undefined) {
+      const height = normalize(patch.height);
+      setTargetDimensionHeight(height !== null && height > 0 ? height : null);
+    }
+    if (patch.placementBottomY !== undefined) {
+      setPlacementBottomY(normalize(patch.placementBottomY));
+    }
+    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+    setExtremeUnlockConfigurationFingerprint(null);
+    if (heightMode === "experimental_4064") {
+      setHeightMode("extended_2032");
+      const normalizedHeight = Math.min(options.targetHeight, EXTENDED_WORLD_HEIGHT);
+      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+    }
+    projectionDocumentRef.current = null;
+    setSurvivalDocument(null);
+    setSurvivalToolsOpen(false);
+    setExportCenterOpen(false);
+    setExportPreflights({});
+    setPendingExport(null);
+    setExtendedExportAcknowledged(false);
+  };
+
+  const changeJavaVersion = (versionId: string) => {
+    const profile = getJavaVersionProfile(versionId);
+    if (!profile) return;
+    setJavaVersionId(versionId);
+    setHeightMode("default");
+    setTargetDimensionMinY(null);
+    setTargetDimensionHeight(null);
+    setPlacementBottomY(null);
+    const maximum = profile.defaultDimension?.height ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
+    const targetHeight = Math.min(options.targetHeight, maximum);
+    setOptions((current) => ({
+      ...current,
+      targetHeight,
+    }));
+    setSolidOptions((current) => ({ ...current, targetHeight }));
+    setHeightUnlockOpen(false);
+    setExtremeDialogStage(null);
+    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+    setExtremeUnlockConfigurationFingerprint(null);
+    setExtendedExportAcknowledged(false);
+    invalidateProjection("java-version");
+    if (profile.releaseStatus !== "verified") {
+      setToast(t("toast.javaVersionUnverified", { version: profile.id }));
+    }
   };
 
   const captureMmdRuntimeRestoreState = useCallback((
@@ -2435,30 +2860,121 @@ export default function App() {
   const prepareProjectionDocument = useCallback(async () => {
     if (!result) throw appError("error.litematic.emptyProjection");
     const cached = projectionDocumentRef.current;
-    if (cached?.result === result) return cached.document;
+    if (cached?.result === result && cached.document.minecraftVersion === javaVersionId) {
+      return cached.document;
+    }
     await yieldToBrowser();
+    const profile = getJavaVersionProfile(javaVersionId);
+    const defaultDimension = profile?.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION;
+    const requiredHeight = Math.max(targetHeight, result.stats.dimensions[1]);
+    const documentHeightMode: HeightMode = requiredHeight > EXTENDED_WORLD_HEIGHT
+      ? "experimental_4064"
+      : requiredHeight > defaultDimension.height
+        ? "extended_2032"
+        : "default";
+    const placementMetadata: Record<string, string | number | boolean> = documentHeightMode === "default"
+      ? {
+          placementBottomY: defaultDimension.minY,
+          targetDimensionMinY: defaultDimension.minY,
+          targetDimensionMaxY: defaultDimension.minY + defaultDimension.height - 1,
+        }
+      : Number.isSafeInteger(targetDimensionMinY)
+        && Number.isSafeInteger(targetDimensionHeight)
+        && (targetDimensionHeight ?? 0) > 0
+        && Number.isSafeInteger(placementBottomY)
+        ? {
+            placementBottomY: placementBottomY!,
+            targetDimensionMinY: targetDimensionMinY!,
+            targetDimensionMaxY: targetDimensionMinY! + targetDimensionHeight! - 1,
+          }
+        : {};
     const document = createProjectionDocumentFromResult(result, {
       edition: "java",
-      minecraftVersion: "1.20.1",
+      minecraftVersion: javaVersionId,
       metadata: {
         name: projectionName,
         generator: "MELY",
         targetHeight,
+        heightMode: documentHeightMode,
+        datapackAcknowledged: documentHeightMode !== "default" && heightMode !== "default",
+        ...placementMetadata,
+        heightDisclaimer: documentHeightMode === "default"
+          ? ""
+          : "Requires a third-party height data pack matching the exact Java version and target dimension. MELY does not provide, install, validate, or endorse it.",
         generationMode: result.kind === "solid" ? "solid" : "hologram",
       },
     });
     projectionDocumentRef.current = { result, document };
     return document;
-  }, [projectionName, result, targetHeight]);
+  }, [heightMode, javaVersionId, placementBottomY, projectionName, result,
+    targetDimensionHeight, targetDimensionMinY, targetHeight]);
 
-  const describeExportPreflight = useCallback((preflight: ExportPreflightResult) => {
+  const documentResultId = useCallback(
+    (document: ProjectionDocument) => {
+      const cached = projectionDocumentRef.current;
+      if (cached?.document === document && cached.contentHash) return cached.contentHash;
+      const contentHash = createProjectionDocumentContentHash(document);
+      if (cached?.document === document) cached.contentHash = contentHash;
+      return contentHash;
+    },
+    [],
+  );
+
+  const heightSafetyForExport = useCallback((
+    document: ProjectionDocument,
+    format: ExportFormat,
+    exportFingerprint?: string,
+    snapshot?: PendingExport["safety"],
+  ) => ({
+    heightMode: snapshot?.heightMode ?? heightMode,
+    targetHeight: snapshot?.targetHeight ?? targetHeight,
+    datapackAcknowledged: (snapshot?.heightMode ?? heightMode) !== "default",
+    placementBottomY: snapshot?.placementBottomY ?? Number(document.metadata?.placementBottomY),
+    targetDimension: snapshot?.targetDimension ?? (typeof document.metadata?.targetDimensionMinY === "number"
+      && typeof document.metadata?.targetDimensionMaxY === "number"
+      ? {
+          minY: document.metadata.targetDimensionMinY,
+          height: document.metadata.targetDimensionMaxY - document.metadata.targetDimensionMinY + 1,
+        }
+      : undefined),
+    confirmations: snapshot?.confirmations ?? extremeConfirmationsRef.current,
+    configurationFingerprint: snapshot?.configurationFingerprint
+      ?? extremeConfigurationFingerprint
+      ?? undefined,
+    exportFingerprint,
+    versionId: document.minecraftVersion,
+    exportFormat: format,
+  }), [extremeConfigurationFingerprint, heightMode, targetHeight]);
+
+  const extremeExportFingerprints = useCallback((
+    document: ProjectionDocument,
+    format: ExportFormat,
+  ) => {
+    if (!extremeFingerprintBase || !extremeConfigurationFingerprint) return null;
+    const input: ExtremeHeightFingerprintInput = {
+      ...extremeFingerprintBase,
+      resultId: documentResultId(document),
+      actualHeight: document.bounds?.dimensions[1] ?? 0,
+      bounds: document.bounds,
+      exportFormat: format,
+    };
+    return {
+      configurationFingerprint: extremeConfigurationFingerprint,
+      exportFingerprint: createExtremeExportFingerprint(input),
+    };
+  }, [documentResultId, extremeConfigurationFingerprint, extremeFingerprintBase]);
+
+  const describeExportPreflight = useCallback((preflight: HeightAwareExportPreflightResult | ExportPreflightResult) => {
     if (!preflight.reason) return "";
+    if (!(preflight.reason in exportPreflightReasonKeys)) {
+      return t("exportCenter.unavailable.capability", { reason: preflight.reason });
+    }
     const volume = preflight.volume === null
       ? "0"
       : Number.isFinite(preflight.volume)
         ? number(preflight.volume)
         : `>${number(Number.MAX_SAFE_INTEGER)}`;
-    return t(exportPreflightReasonKeys[preflight.reason], {
+    return t(exportPreflightReasonKeys[preflight.reason as ExportPreflightReason], {
       volume,
       limit: number(preflight.reason === "dimensionLimit"
         ? preflight.dimensionLimit ?? 0
@@ -2467,7 +2983,7 @@ export default function App() {
     });
   }, [number, t]);
 
-  const exportPreflightMessage = useCallback((preflight: ExportPreflightResult) => {
+  const exportPreflightMessage = useCallback((preflight: HeightAwareExportPreflightResult | ExportPreflightResult) => {
     const reason = describeExportPreflight(preflight);
     return preflight.reason && preflight.reason !== "empty"
       ? `${reason} ${t("exportCenter.useBundle")}`
@@ -2475,13 +2991,20 @@ export default function App() {
   }, [describeExportPreflight, t]);
 
   const updateExportPreflights = useCallback((document: ProjectionDocument) => {
+    const bedrockDocument = deriveBedrockProjectionDocument(document);
     const preflights = Object.fromEntries(exportFormats.map((format) => [
       format,
-      preflightProjectionExport(document, format),
-    ])) as Record<ExportFormat, ExportPreflightResult>;
+      isBedrockExportFormat(format)
+        ? preflightProjectionExport(bedrockDocument, format)
+        : preflightProjectionHeightExport(
+            document,
+            format,
+            heightSafetyForExport(document, format),
+          ),
+    ])) as Record<ExportFormat, HeightAwareExportPreflightResult | ExportPreflightResult>;
     setExportPreflights(preflights);
     return preflights;
-  }, []);
+  }, [heightSafetyForExport]);
 
   const openExportCenter = async () => {
     if (!result || exporting) return;
@@ -2498,7 +3021,18 @@ export default function App() {
   };
 
   const performExport = useCallback(async (request: PendingExport) => {
-    const preflight = preflightProjectionExport(request.document, request.format);
+    const bedrockFormat = isBedrockExportFormat(request.format);
+    const exportDocument = bedrockFormat
+      ? deriveBedrockProjectionDocument(request.document)
+      : request.document;
+    const exportFingerprint = bedrockFormat ? undefined : request.exportFingerprint;
+    const preflight = bedrockFormat
+      ? preflightProjectionExport(exportDocument, request.format)
+      : preflightProjectionHeightExport(
+          request.document,
+          request.format,
+          heightSafetyForExport(request.document, request.format, exportFingerprint, request.safety),
+        );
     setExportPreflights((current) => ({ ...current, [request.format]: preflight }));
     if (!preflight.allowed) {
       setExporting(false);
@@ -2529,16 +3063,22 @@ export default function App() {
           includeMcfunction: request.bundleFormats?.includeMcfunction ?? false,
           litematic: {
             author: "MELY",
-            description: t("export.description.unified", { version: "1.20.1" }),
+            description: t("export.description.unified", { version: request.document.minecraftVersion }),
           },
           schematic: {
             author: "MELY",
-            description: t("export.description.unified", { version: "1.20.1" }),
+            description: t("export.description.unified", { version: request.document.minecraftVersion }),
           },
           mcfunction: {
             packName: request.name,
             description: t("export.description.bedrockPack"),
           },
+          safety: heightSafetyForExport(
+            request.document,
+            request.format,
+            exportFingerprint,
+            request.safety,
+          ),
           onProgress: (event: import("./core/exportBundle").ExportBundleProgress) => {
             setProgress(event.progress);
             setStageKey(exportBundleStageKeys[event.phase]);
@@ -2615,7 +3155,7 @@ export default function App() {
           if (!writer) return;
           try {
             const streamed = await createMcfunctionBehaviorPackZipStream(
-              request.document,
+              exportDocument,
               (chunk) => writer.write(chunk),
               behaviorPackOptions,
             );
@@ -2628,7 +3168,7 @@ export default function App() {
         } else {
           const chunks: Uint8Array[] = [];
           const streamed = await createMcfunctionBehaviorPackZipStream(
-            request.document,
+            exportDocument,
             (chunk) => {
               chunks.push(chunk);
             },
@@ -2654,8 +3194,14 @@ export default function App() {
         bytes = createLitematicFromDocument(request.document, {
           name: request.name,
           author: "MELY",
-          description: t("export.description.unified", { version: "1.20.1" }),
+          description: t("export.description.unified", { version: request.document.minecraftVersion }),
           regionMaxSize: 32,
+          safety: heightSafetyForExport(
+            request.document,
+            request.format,
+            exportFingerprint,
+            request.safety,
+          ),
         }).bytes;
         extension = "litematic";
         mime = "application/gzip";
@@ -2664,13 +3210,19 @@ export default function App() {
         bytes = createSchematic(request.document, {
           name: request.name,
           author: "MELY",
-          description: t("export.description.unified", { version: "1.20.1" }),
+          description: t("export.description.unified", { version: request.document.minecraftVersion }),
+          safety: heightSafetyForExport(
+            request.document,
+            request.format,
+            exportFingerprint,
+            request.safety,
+          ),
         }).bytes;
         extension = "schem";
         mime = "application/gzip";
       } else if (request.format === "mcstructure") {
         const { createMcstructure } = await import("./core/mcstructure");
-        bytes = createMcstructure(request.document).bytes;
+        bytes = createMcstructure(exportDocument).bytes;
         extension = "mcstructure";
       } else {
         throw new RangeError(`Unsupported export format: ${request.format}`);
@@ -2694,18 +3246,39 @@ export default function App() {
       setExportCurrentFile("");
       setPendingExport(null);
       setExtendedExportAcknowledged(false);
+      setExtremeExportPhraseInput("");
+      replaceExtremeConfirmations((current) => clearExtremeExportConfirmation(current));
       if (!survivalToolsOpen) projectionDocumentRef.current = null;
     }
-  }, [exportPreflightMessage, locale, localizeError, survivalToolsOpen, t]);
+  }, [exportPreflightMessage, heightSafetyForExport, locale,
+    localizeError, survivalToolsOpen, t]);
 
   const requestExport = async (format: ExportFormat) => {
     if (!result || exporting) return;
     setExporting(true);
     try {
       const document = await prepareProjectionDocument();
-      const preflight = preflightProjectionExport(document, format);
+      const fingerprints = isBedrockExportFormat(format)
+        ? null
+        : extremeExportFingerprints(document, format);
+      const preflight = isBedrockExportFormat(format)
+        ? preflightProjectionExport(deriveBedrockProjectionDocument(document), format)
+        : preflightProjectionHeightExport(
+            document,
+            format,
+            heightSafetyForExport(document, format, fingerprints?.exportFingerprint),
+          );
       setExportPreflights((current) => ({ ...current, [format]: preflight }));
-      if (!preflight.allowed) {
+      const requestHeightRisk = evaluateProjectionHeightRisk(
+        targetHeight,
+        document.bounds,
+        selectedDefaultHeight,
+      );
+      const needsExtremeExportConfirmation = !isBedrockExportFormat(format)
+        && requestHeightRisk.risk === "experimental"
+        && preflight.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"
+        && fingerprints;
+      if (!preflight.allowed && !needsExtremeExportConfirmation) {
         setExporting(false);
         setToast(exportPreflightMessage(preflight));
         return;
@@ -2716,10 +3289,29 @@ export default function App() {
         name: projectionName,
         targetHeight,
         actualHeight: document.bounds?.dimensions[1] ?? 0,
-        safetyHeight: evaluateProjectionHeightRisk(targetHeight, document.bounds).requiredHeight,
+        safetyHeight: requestHeightRisk.requiredHeight,
+        configurationFingerprint: fingerprints?.configurationFingerprint,
+        exportFingerprint: fingerprints?.exportFingerprint,
+        safety: {
+          heightMode,
+          targetHeight,
+          placementBottomY: Number(document.metadata?.placementBottomY),
+          targetDimension: typeof document.metadata?.targetDimensionMinY === "number"
+            && typeof document.metadata?.targetDimensionMaxY === "number"
+            ? {
+                minY: document.metadata.targetDimensionMinY,
+                height: document.metadata.targetDimensionMaxY - document.metadata.targetDimensionMinY + 1,
+              }
+            : undefined,
+          configurationFingerprint: fingerprints?.configurationFingerprint,
+          confirmations: extremeConfirmationsRef.current,
+        },
+        resultId: documentResultId(document),
+        experimental: requestHeightRisk.risk === "experimental",
         ...(format === "bundle" ? { bundleFormats: { ...bundleFormats } } : {}),
       };
-      if (evaluateProjectionHeightRisk(targetHeight, document.bounds).requiresExportConfirmation) {
+      if (!isBedrockExportFormat(format)
+        && requestHeightRisk.requiresExportConfirmation) {
         setExportCenterOpen(false);
         setPendingExport(request);
         setExtendedExportAcknowledged(false);
@@ -2730,6 +3322,55 @@ export default function App() {
     } catch (error) {
       setExporting(false);
       setToast(t("toast.exportFailed", { reason: localizeError(error) }));
+    }
+  };
+
+  const confirmPendingExport = () => {
+    if (!pendingExport) return;
+    if (
+      !projectionDocumentRef.current
+      || projectionDocumentRef.current.result !== result
+      || projectionDocumentRef.current.document !== pendingExport.document
+      || projectionDocumentRef.current.contentHash !== pendingExport.resultId
+      || pendingExport.safety.heightMode !== heightMode
+      || pendingExport.safety.targetHeight !== targetHeight
+      || pendingExport.safety.configurationFingerprint !== (extremeConfigurationFingerprint ?? undefined)
+      || pendingExport.safety.placementBottomY !== placementForHeightPreflight
+      || pendingExport.safety.targetDimension?.minY !== declaredTargetDimension?.minY
+      || pendingExport.safety.targetDimension?.height !== declaredTargetDimension?.height
+    ) {
+      setPendingExport(null);
+      setExtendedExportAcknowledged(false);
+      setExtremeExportPhraseInput("");
+      setToast(t("toast.heightPreflightRejected", { reason: "HEIGHT_CONFIRMATION_STALE" }));
+      return;
+    }
+    if (!pendingExport.experimental) {
+      void performExport(pendingExport);
+      return;
+    }
+    if (
+      !pendingExport.configurationFingerprint
+      || !pendingExport.exportFingerprint
+    ) return;
+    try {
+      const confirmed = confirmExtremeExport(
+        extremeConfirmationsRef.current,
+        pendingExport.configurationFingerprint,
+        pendingExport.exportFingerprint,
+        extremeExportPhraseInput,
+        pendingExport.safetyHeight,
+        `${pendingExport.format}; ${pendingExport.actualHeight} layers; ${pendingExport.safety.placementBottomY}..${
+          pendingExport.safety.placementBottomY + Math.max(0, pendingExport.actualHeight - 1)
+        }`,
+      );
+      replaceExtremeConfirmations(confirmed);
+      void performExport({
+        ...pendingExport,
+        safety: { ...pendingExport.safety, confirmations: confirmed },
+      });
+    } catch (error) {
+      setToast(localizeError(error));
     }
   };
 
@@ -2878,15 +3519,30 @@ export default function App() {
             modelLoading={modelLoading}
             modelLoadStage={t(modelLoadStageKey)}
             exporting={exporting}
-            heightMaximum={heightMode === "extended" ? EXTENDED_WORLD_HEIGHT : VANILLA_WORLD_HEIGHT}
-            extendedHeightUnlocked={heightMode === "extended"}
+            javaVersionProfiles={JAVA_VERSION_PROFILES}
+            selectedJavaVersionId={javaVersionId}
+            versionCompatibilityWarning={selectedProfile?.releaseStatus === "verified"
+              ? undefined
+              : t("toast.javaVersionUnverified", { version: javaVersionId })}
+            heightMaximum={heightMode === "experimental_4064"
+              ? EXPERIMENTAL_WORLD_HEIGHT
+              : heightMode === "extended_2032"
+                ? EXTENDED_WORLD_HEIGHT
+                : selectedDefaultHeight}
+            extendedHeightUnlocked={heightMode !== "default"}
+            experimentalHeightActive={heightMode === "experimental_4064"}
             extendedHeightActive={extendedHeightActive}
+            targetDimensionMinY={targetDimensionMinY}
+            targetDimensionHeight={targetDimensionHeight}
+            placementBottomY={placementBottomY}
             estimatedBlockCount={estimatedBlockCount}
             resourceEstimateLabel={resourceEstimate ? formatBinaryBytes(resourceEstimate.estimatedBytes) : null}
             progress={progress}
             stage={t(stageKey)}
             progressDetail={exporting ? exportCurrentFile : ""}
             sidebarWidth={sidebarWidth}
+            sidebarWidthMaximum={sidebarWidthMaximum()}
+            sidebarUiScale={sidebarUiScale}
             physicsAvailable={mmdModel?.physicsAvailable ?? false}
             physicsEnabled={physicsEnabled}
             physicsLoading={physicsLoading}
@@ -2900,6 +3556,7 @@ export default function App() {
             onSidebarResizeStart={beginSidebarResize}
             onSidebarResizeStep={stepSidebarWidth}
             onSidebarResizeReset={resetSidebarWidth}
+            onSidebarUiScaleChange={changeSidebarUiScale}
             onPoseEditingChange={setPoseEditingState}
             onBoneSelected={selectBone}
             onPoseNudge={nudgeSelectedBone}
@@ -2911,7 +3568,10 @@ export default function App() {
             onPoseImport={importExternalPose}
             onGenerate={generateCurrentPose}
             onExport={() => void openExportCenter()}
+            onJavaVersionChange={changeJavaVersion}
             onExtendedHeightToggle={toggleExtendedHeight}
+            onExperimentalHeightUnlock={beginExtremeHeightUnlock}
+            onTargetDimensionChange={changeTargetDimension}
           />
         ) : null}
 
@@ -3179,9 +3839,78 @@ export default function App() {
       >
         <div className="safety-copy">
           <p>{t("heightUnlock.body", {
-            vanilla: number(VANILLA_WORLD_HEIGHT),
+            vanilla: number(selectedDefaultHeight),
             maximum: number(EXTENDED_WORLD_HEIGHT),
           })}</p>
+        </div>
+      </Windows>
+
+      {(() => {
+        const currentExtremeFingerprint = extremeFingerprintBase
+          ? createExtremeHeightConfigurationFingerprint(extremeFingerprintBase)
+          : null;
+        return <Windows
+        open={extremeDialogStage === "unlock"}
+        title={t("extremeHeight.unlockTitle")}
+        closeLabel={t("common.close")}
+        danger
+        onClose={cancelExtremeHeightUnlock}
+        actions={[
+          {
+            label: t("common.cancel"),
+            onClick: cancelExtremeHeightUnlock,
+          },
+          {
+            label: t("extremeHeight.continue"),
+            emphasis: "danger",
+            disabled: !currentExtremeFingerprint,
+            onClick: confirmExtremeUnlockStage,
+          },
+        ]}
+      >
+        <div className="safety-copy">
+          <p>{t("extremeHeight.unlockBody")}</p>
+          <ul>
+            <li>{t("extremeHeight.boundary")}</li>
+            <li>{t("extremeHeight.thirdParty")}</li>
+          </ul>
+        </div>
+      </Windows>;
+      })()}
+
+      <Windows
+        open={extremeDialogStage === "environment"}
+        title={t("extremeHeight.environmentTitle")}
+        closeLabel={t("common.close")}
+        danger
+        onClose={cancelExtremeHeightUnlock}
+        actions={[
+          {
+            label: t("common.cancel"),
+            onClick: cancelExtremeHeightUnlock,
+          },
+          {
+            label: t("extremeHeight.environmentConfirm"),
+            emphasis: "danger",
+            disabled: !Object.values(extremeEnvironmentChecks).every(Boolean),
+            onClick: confirmExtremeEnvironmentStage,
+          },
+        ]}
+      >
+        <div className="safety-copy">
+          {(["datapack", "backup", "toolchain"] as const).map((key) => (
+            <label className="risk-acknowledgement" key={key}>
+              <input
+                type="checkbox"
+                checked={extremeEnvironmentChecks[key]}
+                onChange={(event) => {
+                  const checked = event.currentTarget.checked;
+                  setExtremeEnvironmentChecks((current) => ({ ...current, [key]: checked }));
+                }}
+              />
+              <span>{t(`extremeHeight.environment.${key}` as TranslationKey)}</span>
+            </label>
+          ))}
         </div>
       </Windows>
 
@@ -3199,7 +3928,11 @@ export default function App() {
         <div className="export-format-grid">
           {exportFormats.map((format) => {
             const preflight = exportPreflights[format];
-            const unavailable = Boolean(preflight && !preflight.allowed);
+            const awaitsExtremeConfirmation = preflight
+              && !preflight.allowed
+              && preflight.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"
+              && heightMode === "experimental_4064";
+            const unavailable = Boolean(preflight && !preflight.allowed && !awaitsExtremeConfirmation);
             return (
               <button
                 type="button"
@@ -3216,7 +3949,7 @@ export default function App() {
                 <span>
                   <strong>{t(`export.format.${format}` as TranslationKey)}</strong>
                   <small>{t(`export.format.${format}.hint` as TranslationKey)}</small>
-                  {preflight && !preflight.allowed ? (
+                  {preflight && !preflight.allowed && !awaitsExtremeConfirmation ? (
                     <>
                       <small className="export-format__reason">{describeExportPreflight(preflight)}</small>
                       {preflight.reason !== "empty" ? (
@@ -3266,6 +3999,8 @@ export default function App() {
           if (exporting) return;
           setPendingExport(null);
           setExtendedExportAcknowledged(false);
+          setExtremeExportPhraseInput("");
+          replaceExtremeConfirmations((current) => clearExtremeExportConfirmation(current));
           if (!survivalToolsOpen) projectionDocumentRef.current = null;
         }}
         actions={[
@@ -3275,21 +4010,27 @@ export default function App() {
             onClick: () => {
               setPendingExport(null);
               setExtendedExportAcknowledged(false);
+              setExtremeExportPhraseInput("");
+              replaceExtremeConfirmations((current) => clearExtremeExportConfirmation(current));
               if (!survivalToolsOpen) projectionDocumentRef.current = null;
             },
           },
           {
             label: exporting ? t("sidebar.packaging") : t("extendedExport.confirm"),
             emphasis: "danger",
-            disabled: !extendedExportAcknowledged || exporting || !pendingExport,
-            onClick: () => pendingExport && void performExport(pendingExport),
+            disabled: !extendedExportAcknowledged
+              || exporting
+              || !pendingExport
+              || (Boolean(pendingExport?.experimental)
+                && extremeExportPhraseInput !== extremeExportPhrase(pendingExport.safetyHeight)),
+            onClick: confirmPendingExport,
           },
         ]}
       >
         <div className="safety-copy">
           <p>{t("extendedExport.body", {
-            height: number(pendingExport?.safetyHeight ?? heightRisk.requiredHeight),
-            vanilla: number(VANILLA_WORLD_HEIGHT),
+            height: number(pendingExport?.safetyHeight ?? selectedDefaultHeight),
+            vanilla: number(selectedDefaultHeight),
           })}</p>
           <ul>
             <li>{t("extendedExport.checkDatapack")}</li>
@@ -3303,6 +4044,19 @@ export default function App() {
             />
             <span>{t("extendedExport.acknowledge")}</span>
           </label>
+          {pendingExport?.experimental ? (
+            <label className="extreme-export-phrase">
+              <span>{t("extremeHeight.exportPhrase", {
+                phrase: extremeExportPhrase(pendingExport.safetyHeight),
+              })}</span>
+              <input
+                type="text"
+                value={extremeExportPhraseInput}
+                autoComplete="off"
+                onChange={(event) => setExtremeExportPhraseInput(event.currentTarget.value)}
+              />
+            </label>
+          ) : null}
         </div>
       </Windows>
 
