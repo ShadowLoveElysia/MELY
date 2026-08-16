@@ -11,6 +11,8 @@ test("project bundle extras are opt-in and forwarded to the exporter", () => {
   assert.match(source, /exportCenter\.bundleFormats\.schematic/);
   assert.match(source, /exportCenter\.bundleFormats\.mcstructure/);
   assert.match(source, /exportCenter\.bundleFormats\.mcfunction/);
+  assert.match(source, /const checked = event\.currentTarget\.checked;[\s\S]{0,120}\[option\]: checked/);
+  assert.doesNotMatch(source, /\[option\]: event\.currentTarget\.checked/);
   assert.match(source, /includeSchematic:\s*request\.bundleFormats\?\.includeSchematic\s*\?\?\s*false/);
   assert.match(source, /includeMcstructure:\s*request\.bundleFormats\?\.includeMcstructure\s*\?\?\s*false/);
   assert.match(source, /includeMcfunction:\s*request\.bundleFormats\?\.includeMcfunction\s*\?\?\s*false/);

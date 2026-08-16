@@ -175,12 +175,12 @@ The English entry point is `Build MELY.bat`. The build script automatically:
 3. Uses Tauri to produce the Windows x64 application and NSIS installer.
 4. Places the portable ZIP, installer, and SHA-256 checksum file in `release/`.
 
-The default filenames for version `0.2.0` are:
+The default filenames use the version from `src/version/version.json`:
 
 ```text
-MELY-0.2.0-windows-x64-portable.zip
-MELY-0.2.0-windows-x64-setup.exe
-MELY-0.2.0-windows-x64-SHA256SUMS.txt
+MELY-<version>-windows-x64-portable.zip
+MELY-<version>-windows-x64-setup.exe
+MELY-<version>-windows-x64-SHA256SUMS.txt
 ```
 
 The packaged portable and installed builds do not require Node.js.
@@ -194,12 +194,12 @@ The project provides two Windows release workflows:
 
 Recommended formal release procedure:
 
-1. Update the version in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` to the same value.
+1. Update `src/version/version.json`, then run `npm run version:sync` to refresh Cargo's derived version fields.
 2. Commit the changes and create a tag for that commit. The tag name can follow any release naming scheme.
 3. Create and publish a formal GitHub Release from that tag.
 4. Wait for the **Windows Release Assets** workflow to finish uploading the assets.
 
-The Release title and tag name do not need to match the application's internal version. Artifact filenames use the internal version from the three project files, which must still match each other. If Immutable Releases is enabled for the GitHub repository, assets cannot be appended to or replaced in an already published Release. Keep that feature disabled to use the current post-publication build process.
+The Release title and tag name do not need to match the application's internal version. Artifact filenames use the application version from `src/version/version.json`. If Immutable Releases is enabled for the GitHub repository, assets cannot be appended to or replaced in an already published Release. Keep that feature disabled to use the current post-publication build process.
 
 To rebuild an existing Release, manually run **Windows Release Assets** from the Actions page and enter that Release's tag name.
 

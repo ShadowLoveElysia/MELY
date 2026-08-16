@@ -100,6 +100,7 @@ import type {
   WorkerEvent,
   WorkerStage,
 } from "./types";
+import { APP_VERSION } from "./version";
 
 type AppStageKey = Extract<TranslationKey, `app.stage.${string}`>;
 type WorkerStageKey = Extract<TranslationKey, `worker.stage.${string}`>;
@@ -2809,7 +2810,7 @@ export default function App() {
               ) : null)}
             </span>
           ) : statusText}</span>
-          <span className="version-chip">{t("app.version")}</span>
+          <span className="version-chip">{`v${APP_VERSION} · ${t("app.version")}`}</span>
         </div>
         <div className="title-actions">
           <label className="locale-control" title={t("language.selector")}>
@@ -2852,7 +2853,7 @@ export default function App() {
           >
             <ListChecks size={17} />
           </IconButton>
-          <IconButton label={t("toolbar.projectInfo")} onClick={() => setToast(t("app.info"))}> <Info size={17} /> </IconButton>
+          <IconButton label={t("toolbar.projectInfo")} onClick={() => setToast(t("app.info", { version: APP_VERSION }))}> <Info size={17} /> </IconButton>
         </div>
       </header>
 
@@ -3240,10 +3241,13 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={bundleFormats[option]}
-                onChange={(event) => setBundleFormats((current) => ({
-                  ...current,
-                  [option]: event.currentTarget.checked,
-                }))}
+                onChange={(event) => {
+                  const checked = event.currentTarget.checked;
+                  setBundleFormats((current) => ({
+                    ...current,
+                    [option]: checked,
+                  }));
+                }}
               />
               <span>{t(label)}</span>
             </label>

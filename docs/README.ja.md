@@ -175,12 +175,12 @@ Node.js 20 以降、Rust stable MSVC、Visual Studio 2022 C++ Build Tools、Wind
 3. Tauri で Windows x64 アプリ本体と NSIS インストーラーを生成します。
 4. ポータブル ZIP、インストーラー、SHA-256 チェックサムファイルを `release/` に配置します。
 
-バージョン `0.2.0` の既定ファイル名は次のとおりです。
+既定ファイル名には `src/version/version.json` のバージョンが使用されます。
 
 ```text
-MELY-0.2.0-windows-x64-portable.zip
-MELY-0.2.0-windows-x64-setup.exe
-MELY-0.2.0-windows-x64-SHA256SUMS.txt
+MELY-<version>-windows-x64-portable.zip
+MELY-<version>-windows-x64-setup.exe
+MELY-<version>-windows-x64-SHA256SUMS.txt
 ```
 
 パッケージ化されたポータブル版とインストール版に Node.js は必要ありません。
@@ -194,12 +194,12 @@ MELY-0.2.0-windows-x64-SHA256SUMS.txt
 
 正式リリースの推奨手順は次のとおりです。
 
-1. `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` のバージョンを同じ値に更新します。
+1. `src/version/version.json` を更新し、`npm run version:sync` を実行して Cargo 用の派生バージョンフィールドを更新します。
 2. 変更をコミットし、そのコミットにタグを作成します。タグ名はリリース方針に合わせて自由に設定できます。
 3. そのタグから正式な GitHub Release を作成し、公開します。
 4. **Windows Release Assets** ワークフローがアセットのアップロードを完了するまで待ちます。
 
-Release のタイトルとタグ名は、アプリケーション内部のバージョンと一致する必要はありません。アセットのファイル名には上記 3 か所の内部バージョンが使用され、これら 3 つの値は引き続き互いに一致している必要があります。GitHub リポジトリで Immutable Releases が有効な場合、公開済み Release にアセットを追加または置換できません。現在の「公開後にビルド」フローを使用するには、この機能を無効にしてください。
+Release のタイトルとタグ名は、アプリケーション内部のバージョンと一致する必要はありません。アセットのファイル名には `src/version/version.json` のアプリケーションバージョンが使用されます。GitHub リポジトリで Immutable Releases が有効な場合、公開済み Release にアセットを追加または置換できません。現在の「公開後にビルド」フローを使用するには、この機能を無効にしてください。
 
 既存の Release を再ビルドする場合は、Actions ページから **Windows Release Assets** を手動実行し、その Release のタグ名を入力します。
 

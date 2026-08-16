@@ -8,7 +8,7 @@ export const enUS = {
   "app.documentTitle": "MELY | PMX to Litematica",
   "app.subtitle": "PMX to Litematica",
   "app.version": "Java 1.20.1",
-  "app.info": "MELY 0.2 · Litematica export prototype",
+  "app.info": "MELY {{version}} · Litematica export prototype",
   "app.status.waitingModel": "Waiting for an MMD model",
   "app.status.modelLoaded": "{{name}} loaded",
   "app.status.pose": "Pose · {{name}}",

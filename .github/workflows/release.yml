@@ -39,7 +39,7 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $version = (Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json).version
+          $version = (Get-Content -LiteralPath src/version/version.json -Raw | ConvertFrom-Json).version
           "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Set up Node.js

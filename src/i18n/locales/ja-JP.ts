@@ -8,7 +8,7 @@ export const jaJP = {
   "app.documentTitle": "MELY | PMX から Litematica へ",
   "app.subtitle": "PMX から Litematica へ",
   "app.version": "Java 1.20.1",
-  "app.info": "MELY 0.2 · Litematica エクスポート試作版",
+  "app.info": "MELY {{version}} · Litematica エクスポート試作版",
   "app.status.waitingModel": "MMD モデルを待機中",
   "app.status.modelLoaded": "{{name}} を読み込みました",
   "app.status.pose": "ポーズ · {{name}}",

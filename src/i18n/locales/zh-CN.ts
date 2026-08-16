@@ -9,7 +9,7 @@ export const zhCN = {
   "app.documentTitle": "MELY | PMX 转 Litematica",
   "app.subtitle": "PMX 转 Litematica",
   "app.version": "Java 1.20.1",
-  "app.info": "MELY 0.2 · Litematica 导出原型",
+  "app.info": "MELY {{version}} · Litematica 导出原型",
   "app.status.waitingModel": "等待导入 MMD 模型",
   "app.status.modelLoaded": "{{name}} 已加载",
   "app.status.pose": "姿态 · {{name}}",

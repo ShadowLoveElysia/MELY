@@ -178,12 +178,12 @@ Windows 10/11 SDK 的电脑上，双击：
 3. 使用 Tauri 生成 Windows x64 主程序和 NSIS 安装包。
 4. 整理便携 ZIP、安装程序与 SHA-256 校验文件到 `release/`。
 
-当前 `0.2.0` 版本的默认文件名为：
+当前版本的默认文件名为（`<版本号>` 取自 `src/version/version.json`）：
 
 ```text
-MELY-0.2.0-windows-x64-portable.zip
-MELY-0.2.0-windows-x64-setup.exe
-MELY-0.2.0-windows-x64-SHA256SUMS.txt
+MELY-<版本号>-windows-x64-portable.zip
+MELY-<版本号>-windows-x64-setup.exe
+MELY-<版本号>-windows-x64-SHA256SUMS.txt
 ```
 
 已打包的便携版和安装版不需要 Node.js。
@@ -201,14 +201,14 @@ MELY-0.2.0-windows-x64-SHA256SUMS.txt
 
 正式版本的推荐发布顺序：
 
-1. 同步修改 `package.json`、`src-tauri/tauri.conf.json` 和 `src-tauri/Cargo.toml`
-   中的版本号。
+1. 修改 `src/version/version.json` 中的版本号，并运行 `npm run version:sync`
+   更新 Cargo 所需的派生版本字段。
 2. 提交代码并为该提交创建标签。标签名称可按发布需要自由命名。
 3. 在 GitHub 上以该标签创建并发布正式 Release。
 4. 等待 `Windows Release Assets` 工作流将附件上传完成。
 
-Release 标题和标签名称不需要与应用内部版本一致；产物文件名使用上述
-三处配置的内部版本号，且这三处版本仍须彼此一致。如果 GitHub
+Release 标题和标签名称不需要与应用内部版本一致；产物文件名使用
+`src/version/version.json` 中的应用版本号。如果 GitHub
 仓库开启了 Immutable Releases，已发布的 Release 不允许再追加或替换附件；
 要使用当前的“发布后构建”流程，需保持该功能关闭。
 
