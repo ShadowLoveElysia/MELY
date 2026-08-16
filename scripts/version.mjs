@@ -39,7 +39,7 @@ const replaceCargoPackageVersion = (source, version, path) => {
   const sectionEnd = nextSectionOffset < 0 ? source.length : sectionStart + nextSectionOffset;
   const section = source.slice(sectionStart, sectionEnd);
 
-  const versionField = /^version\s*=\s*"[^"]+"\s*$/m;
+  const versionField = /^version[^\S\r\n]*=[^\S\r\n]*"[^"\r\n]+"[^\S\r\n]*$/m;
   if (!versionField.test(section)) {
     throw new Error(`无法在 ${path} 的 [package] 中找到 version`);
   }
