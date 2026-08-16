@@ -6,6 +6,17 @@ import { getBlockDefinition } from "../core/blockRegistry";
 import { isThreeMmdModel } from "../core/mmdRuntime";
 import type { LoadedMmdModel, ThreeMmdViewportSource } from "../core/mmdRuntime";
 import { createMmdFaceFrameSnapshot } from "../core/mmdSnapshot";
+import {
+  createThreeMmdOutlinePass,
+  readThreeMmdOutlineParameters,
+  syncThreeMmdOutlineMaterials,
+  type ThreeMmdOutlinePass,
+} from "../core/threeMmdOutline";
+import {
+  MMD_PREVIEW_VERTICAL_FOV_DEGREES,
+  perspectiveFrameDistance,
+} from "../core/perspectiveFraming";
+import { applyThreePreviewDisplayProfile } from "../core/threePreviewDisplayProfiles";
 import { useI18n } from "../i18n/I18nProvider";
 import type { CameraMode, MmdMotionTimes, PreviewMode, ProjectionResult } from "../types";
 import type { RendererViewportBinding } from "./rendererViewportTypes";
@@ -62,6 +73,7 @@ interface ViewportRuntime {
   keyLight: THREE.DirectionalLight;
   rimLight: THREE.DirectionalLight;
   hemisphereLight: THREE.HemisphereLight;
+  mmdOutlinePass: ThreeMmdOutlinePass | null;
   animationFrame: number;
 }
 
@@ -72,10 +84,6 @@ interface ProjectionMaterialMetadata {
   lightLevel?: number;
 }
 
-const DAY_BACKGROUND = "#111314";
-const NIGHT_BACKGROUND = "#050811";
-const DAY_FOG = "#111314";
-const NIGHT_FOG = "#070b16";
 const MATERIAL_METADATA_KEY = "melyProjectionMaterial";
 
 const FALLBACK_LIGHT_LEVELS = new Map<string, number>([
@@ -214,34 +222,6 @@ const updateProjectionMaterials = (
   });
 };
 
-const updateNightPreview = (
-  runtime: ViewportRuntime,
-  nightMode: boolean,
-  glow: number,
-) => {
-  const background = runtime.scene.background;
-  if (background instanceof THREE.Color) {
-    background.set(nightMode ? NIGHT_BACKGROUND : DAY_BACKGROUND);
-  } else {
-    runtime.scene.background = new THREE.Color(nightMode ? NIGHT_BACKGROUND : DAY_BACKGROUND);
-  }
-
-  if (runtime.scene.fog instanceof THREE.FogExp2) {
-    runtime.scene.fog.color.set(nightMode ? NIGHT_FOG : DAY_FOG);
-    runtime.scene.fog.density = nightMode ? 0.00075 : 0.00055;
-  }
-
-  runtime.keyLight.color.set(nightMode ? "#7f91c9" : "#e7f6ff");
-  runtime.keyLight.intensity = nightMode ? 0.42 : 2.7;
-  runtime.rimLight.color.set(nightMode ? "#397f92" : "#67e6cb");
-  runtime.rimLight.intensity = nightMode ? 0.5 : 1.9;
-  runtime.hemisphereLight.color.set(nightMode ? "#27375f" : "#a7cbd8");
-  runtime.hemisphereLight.groundColor.set(nightMode ? "#04060c" : "#181b1d");
-  runtime.hemisphereLight.intensity = nightMode ? 0.24 : 1.15;
-  runtime.renderer.toneMappingExposure = nightMode ? 0.78 : 1.08;
-  updateProjectionMaterials(runtime.hologramContent, nightMode, glow);
-};
-
 const disposePoseHelpers = (runtime: ViewportRuntime) => {
   runtime.transformControls.detach();
   if (runtime.skeletonHelper) {
@@ -370,10 +350,12 @@ const fitCameraToBounds = (
 
   if (camera instanceof THREE.PerspectiveCamera) {
     const verticalFov = THREE.MathUtils.degToRad(camera.fov);
-    const fitHeight = size.y / (2 * Math.tan(verticalFov / 2));
-    const fitWidth = size.x / (2 * Math.tan(verticalFov / 2) * Math.max(aspect, 0.1));
-    const distance = Math.max(fitHeight, fitWidth, size.z) * 1.28 + size.z * 0.45;
-    camera.position.copy(center).addScaledVector(direction, Math.max(distance, 28));
+    const distance = perspectiveFrameDistance({
+      width: size.x,
+      height: size.y,
+      depth: size.z,
+    }, aspect, verticalFov);
+    camera.position.copy(center).addScaledVector(direction, distance);
     camera.near = Math.max(0.05, distance / 200);
     camera.far = Math.max(1200, distance * 8);
     camera.updateProjectionMatrix();
@@ -496,6 +478,75 @@ const updateRendererSize = (
   renderer.setSize(safeWidth, safeHeight);
 };
 
+interface ThreeMaterialProgramState {
+  currentProgram?: {
+    diagnostics?: { runnable?: boolean };
+    program?: WebGLProgram;
+  };
+}
+
+interface VanillaSphereProbeMaterial extends THREE.Material {
+  melyMmdSphereMap?: THREE.Texture | null;
+}
+
+const publishThreeMaterialProbe = (
+  renderer: THREE.WebGLRenderer,
+  model: ViewportThreeModel | null,
+) => {
+  const probeWindow = window as Window & { __MELY_E2E_MATERIAL_PROBE__?: boolean };
+  if (!probeWindow.__MELY_E2E_MATERIAL_PROBE__ || model?.rendererMode !== "vanilla") return false;
+  const materials = (Array.isArray(model.mesh.material)
+    ? model.mesh.material
+    : [model.mesh.material]) as VanillaSphereProbeMaterial[];
+  const context = renderer.getContext();
+  context.finish();
+  const sphereMaterials = materials.flatMap((material, index) => {
+    const sphere = material.userData.melyVanillaMmdSphere as {
+      mode?: "multiply" | "add";
+      path?: string;
+      shaderApplied?: boolean;
+    } | undefined;
+    if (!sphere?.mode) return [];
+    const shader = material.userData.melyVanillaMmdSphereShader as {
+      fragmentShader?: string;
+      uniforms?: Record<string, { value?: unknown }>;
+    } | undefined;
+    const sphereMap = material.melyMmdSphereMap ?? null;
+    const programState = renderer.properties.get(material) as ThreeMaterialProgramState;
+    const program = programState.currentProgram?.program;
+    const expectedOperation = sphere.mode === "multiply"
+      ? /outgoingLight \*= melyMmdSphereColor;/
+      : /outgoingLight \+= melyMmdSphereColor;/;
+    return [{
+      index,
+      name: material.name,
+      mode: sphere.mode,
+      path: sphere.path ?? null,
+      shaderApplied: sphere.shaderApplied === true,
+      texturePresent: Boolean(sphereMap),
+      textureColorSpace: sphereMap?.colorSpace ?? null,
+      uniformBound: shader?.uniforms?.melyMmdSphereMap?.value === sphereMap,
+      fragmentOperationPresent: expectedOperation.test(shader?.fragmentShader ?? ""),
+      programPresent: Boolean(program),
+      programLinked: program
+        ? context.getProgramParameter(program, context.LINK_STATUS) === true
+        : false,
+      programRunnable: programState.currentProgram?.diagnostics?.runnable !== false,
+    }];
+  });
+  window.dispatchEvent(new CustomEvent("mely:three-material-state", {
+    detail: {
+      backend: model.rendererMode,
+      materialCount: materials.length,
+      sphereMaterials,
+      glError: context.getError(),
+    },
+  }));
+  return sphereMaterials.length > 0 && sphereMaterials.every((material) => (
+    material.programLinked && material.fragmentOperationPresent && material.uniformBound
+  ));
+};
+
 export function Viewport3D({
   result,
   model: modelValue,
@@ -568,18 +619,17 @@ export function Viewport3D({
     const instanceBinding = lifecycleBinding;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(DAY_BACKGROUND);
-    scene.fog = new THREE.FogExp2(DAY_FOG, 0.00055);
-
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
     updateRendererSize(renderer, mount.clientWidth, mount.clientHeight);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.08;
     mount.appendChild(renderer.domElement);
 
     const aspect = mount.clientWidth / Math.max(1, mount.clientHeight);
-    const perspective = new THREE.PerspectiveCamera(34, aspect, 0.1, 1200);
+    const perspective = new THREE.PerspectiveCamera(
+      MMD_PREVIEW_VERTICAL_FOV_DEGREES,
+      aspect,
+      0.1,
+      1200,
+    );
     const orthographic = new THREE.OrthographicCamera(-135 * aspect, 135 * aspect, 135, -135, 0.1, 1200);
     perspective.position.set(118, 77, 145);
     orthographic.position.copy(perspective.position);
@@ -613,13 +663,11 @@ export function Viewport3D({
     });
     scene.add(bounds);
 
-    const keyLight = new THREE.DirectionalLight("#e7f6ff", 2.7);
-    keyLight.position.set(55, 120, 95);
+    const keyLight = new THREE.DirectionalLight();
     scene.add(keyLight);
-    const rimLight = new THREE.DirectionalLight("#67e6cb", 1.9);
-    rimLight.position.set(-90, 48, -65);
+    const rimLight = new THREE.DirectionalLight();
     scene.add(rimLight);
-    const hemisphereLight = new THREE.HemisphereLight("#a7cbd8", "#181b1d", 1.15);
+    const hemisphereLight = new THREE.HemisphereLight();
     scene.add(hemisphereLight);
 
     const runtime: ViewportRuntime = {
@@ -645,10 +693,11 @@ export function Viewport3D({
       keyLight,
       rimLight,
       hemisphereLight,
+      mmdOutlinePass: null,
       animationFrame: 0,
     };
     runtimeRef.current = runtime;
-    updateNightPreview(runtime, nightMode, glow);
+    applyThreePreviewDisplayProfile(runtime, previewMode, nightMode);
     refreshActiveScene(runtime, previewMode, showBounds, false);
     fitCameraToBounds(runtime, DEFAULT_BOUNDS, true);
 
@@ -706,8 +755,50 @@ export function Viewport3D({
     transformControls.addEventListener("objectChange", updateTransform);
     transformControls.addEventListener("mouseUp", commitTransform);
 
+    const viewProbeWindow = window as Window & { __MELY_E2E_VIEW_PROBE__?: boolean };
+    const applyE2eView = (event: Event) => {
+      if (!viewProbeWindow.__MELY_E2E_VIEW_PROBE__) return;
+      const view = (event as CustomEvent<{ view?: "front" | "oblique" }>).detail?.view;
+      if (view !== "front" && view !== "oblique") return;
+      const camera = runtime.controls.object as THREE.PerspectiveCamera | THREE.OrthographicCamera;
+      const distance = Math.max(1, camera.position.distanceTo(runtime.controls.target));
+      const frameSize = activeBounds(runtime).getSize(new THREE.Vector3());
+      const beta = Math.PI / 2.4;
+      const horizontal = Math.sin(beta) * distance;
+      const x = view === "front" ? 0 : horizontal / Math.sqrt(2);
+      const z = view === "front" ? horizontal : horizontal / Math.sqrt(2);
+      camera.position.set(
+        runtime.controls.target.x + x,
+        runtime.controls.target.y + Math.cos(beta) * distance,
+        runtime.controls.target.z + z,
+      );
+      camera.lookAt(runtime.controls.target);
+      runtime.controls.update();
+      runtime.grid.visible = false;
+      runtime.bounds.visible = false;
+      window.dispatchEvent(new CustomEvent("mely:e2e-view-applied", {
+        detail: {
+          backend: modelRef.current?.rendererMode ?? null,
+          view,
+          beta,
+          distance,
+          target: runtime.controls.target.toArray(),
+          eye: camera.position.toArray(),
+          fovRadians: camera instanceof THREE.PerspectiveCamera
+            ? THREE.MathUtils.degToRad(camera.fov)
+            : null,
+          aspect: camera instanceof THREE.PerspectiveCamera ? camera.aspect : null,
+          frameSize: frameSize.toArray(),
+        },
+      }));
+    };
+    if (viewProbeWindow.__MELY_E2E_VIEW_PROBE__) {
+      window.addEventListener("mely:e2e-set-view", applyE2eView);
+    }
+
     let disposed = false;
     let readyNotified = false;
+    let materialProbeComplete = false;
     const animate = (now: number) => {
       if (disposed) return;
       const previous = previousNowRef.current;
@@ -726,7 +817,70 @@ export function Viewport3D({
       if (poseEditingRef.current && runtime.activeMode === "source") {
         refreshBoneMarkers(runtime, modelRef.current, selectedBoneIndexRef.current);
       }
-      renderer.render(scene, controls.object as THREE.Camera);
+      const activeCamera = controls.object as THREE.Camera;
+      renderer.render(scene, activeCamera);
+      const outlineDisabledForE2e = Boolean((window as Window & {
+        __MELY_E2E_DISABLE_MMD_OUTLINE__?: boolean;
+      }).__MELY_E2E_DISABLE_MMD_OUTLINE__);
+      if (runtime.activeMode === "source" && !outlineDisabledForE2e) {
+        runtime.mmdOutlinePass?.render(renderer, scene, activeCamera);
+      }
+      if (!materialProbeComplete) {
+        materialProbeComplete = publishThreeMaterialProbe(renderer, modelRef.current);
+      }
+      const displayProfileProbeEnabled = Boolean((window as Window & {
+        __MELY_E2E_DISPLAY_PROFILE_PROBE__?: boolean;
+      }).__MELY_E2E_DISPLAY_PROFILE_PROBE__);
+      if (displayProfileProbeEnabled) {
+        window.dispatchEvent(new CustomEvent("mely:three-display-profile-state", {
+          detail: {
+            backend: modelRef.current?.rendererMode ?? null,
+            mode: runtime.activeMode,
+            outputColorSpace: renderer.outputColorSpace,
+            toneMapping: renderer.toneMapping,
+            toneMappingExposure: renderer.toneMappingExposure,
+            keyLightIntensity: runtime.keyLight.intensity,
+            rimLightIntensity: runtime.rimLight.intensity,
+            hemisphereLightIntensity: runtime.hemisphereLight.intensity,
+            sourceVisible: runtime.sourceContent.visible,
+            projectionVisible: runtime.hologramContent.visible,
+          },
+        }));
+      }
+      const outlineProbeEnabled = Boolean((window as Window & {
+        __MELY_E2E_OUTLINE_PROBE__?: boolean;
+      }).__MELY_E2E_OUTLINE_PROBE__);
+      if (outlineProbeEnabled && runtime.mmdOutlinePass) {
+        const sourceMaterials = Array.isArray(runtime.mmdOutlinePass.mesh.material)
+          ? runtime.mmdOutlinePass.mesh.material
+          : [runtime.mmdOutlinePass.mesh.material];
+        syncThreeMmdOutlineMaterials(runtime.mmdOutlinePass.materials, sourceMaterials);
+        window.dispatchEvent(new CustomEvent("mely:three-outline-state", {
+          detail: {
+            sdefVertexCount: runtime.mmdOutlinePass.sdefVertexCount,
+            sourceMaterialCount: sourceMaterials.length,
+            visibleOutlineMaterialCount: runtime.mmdOutlinePass.materials
+              .filter((material) => material.visible).length,
+            transparentSourceMaterialCount: sourceMaterials
+              .filter((material) => material.transparent || material.opacity < 1).length,
+            materials: sourceMaterials.map((material, index) => {
+              const parameters = readThreeMmdOutlineParameters(material);
+              return {
+                index,
+                name: material.name,
+                sourceVisible: material.visible,
+                outlineVisible: runtime.mmdOutlinePass?.materials[index]?.visible ?? false,
+                thickness: parameters?.thickness ?? 0,
+                alpha: parameters?.alpha ?? 0,
+                sourceOpacity: material.opacity,
+                transparent: material.transparent,
+                alphaTest: material.alphaTest,
+                sdef: runtime.mmdOutlinePass?.materials[index]?.defines?.MELY_USE_SDEF === 1,
+              };
+            }),
+          },
+        }));
+      }
       const gpuSynchronized = Boolean((window as Window & {
         __MELY_E2E_GPU_PROBE__?: boolean;
       }).__MELY_E2E_GPU_PROBE__);
@@ -751,6 +905,7 @@ export function Viewport3D({
       perspective.updateProjectionMatrix();
       updateOrthographicProjection(runtime);
       updateRendererSize(renderer, width, height);
+      fitCameraToBounds(runtime, activeBounds(runtime));
     });
     resizeObserver.observe(mount);
     return () => {
@@ -769,7 +924,10 @@ export function Viewport3D({
         attempt(() => transformControls.removeEventListener("mouseDown", beginTransform));
         attempt(() => transformControls.removeEventListener("objectChange", updateTransform));
         attempt(() => transformControls.removeEventListener("mouseUp", commitTransform));
+        attempt(() => window.removeEventListener("mely:e2e-set-view", applyE2eView));
         attempt(() => disposePoseHelpers(runtime));
+        attempt(() => runtime.mmdOutlinePass?.dispose());
+        runtime.mmdOutlinePass = null;
         attempt(() => scene.remove(transformControls.getHelper()));
         attempt(() => transformControls.dispose());
         attempt(() => controls.dispose());
@@ -826,7 +984,13 @@ export function Viewport3D({
   useEffect(() => {
     const runtime = runtimeRef.current;
     if (!runtime) return;
-    updateNightPreview(runtime, nightMode, glow);
+    applyThreePreviewDisplayProfile(runtime, previewMode, nightMode);
+  }, [previewMode, nightMode]);
+
+  useEffect(() => {
+    const runtime = runtimeRef.current;
+    if (!runtime) return;
+    updateProjectionMaterials(runtime.hologramContent, nightMode, glow);
   }, [glow, nightMode]);
 
   useEffect(() => {
@@ -849,13 +1013,20 @@ export function Viewport3D({
 
     if (attachedModelRef.current !== model) runtime.renderer.renderLists.dispose();
     attachedModelRef.current = model;
+    runtime.mmdOutlinePass?.dispose();
+    runtime.mmdOutlinePass = null;
     runtime.sourceContent.clear();
     runtime.sourceBounds.makeEmpty();
     if (!model) return;
 
     runtime.sourceContent.add(model.root);
+    runtime.mmdOutlinePass = createThreeMmdOutlinePass(model.mesh);
 
     return () => {
+      if (runtime.mmdOutlinePass?.mesh === model.mesh) {
+        runtime.mmdOutlinePass.dispose();
+        runtime.mmdOutlinePass = null;
+      }
       if (model.root.parent === runtime.sourceContent) runtime.sourceContent.remove(model.root);
     };
   }, [model]);

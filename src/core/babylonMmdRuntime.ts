@@ -35,7 +35,6 @@ import {
   MmdModelAnimationContainer,
   MmdStandardMaterialBuilder,
   MmdStandardMaterialProxy,
-  MmdWasmInstanceTypeSPR,
   MmdWasmPhysics,
   MmdWasmRuntime,
   SdefInjector,
@@ -48,6 +47,8 @@ import {
   type MmdWasmModel,
   type MmdWasmRuntime as MmdWasmRuntimeType,
 } from "babylon-mmd";
+import * as MmdWasmSpr from "babylon-mmd/esm/Runtime/Optimized/wasm/spr";
+import mmdWasmSprUrl from "babylon-mmd/esm/Runtime/Optimized/wasm/spr/index_bg.wasm?url";
 import type {
   MelyPoseApplyResult,
   MelyPoseDocument,
@@ -76,9 +77,23 @@ import {
   threeToBabylonPosition,
 } from "./mmdCoordinates";
 import { createBabylonMmdReferenceFiles } from "./babylonMmdResources";
+import { applyBabylonCameraPanningProfile } from "./babylonCameraControls";
 import { isSuggestedEmissiveMaterial, isSuggestedSkinMaterial } from "./mmdModel";
+import { MMD_PREVIEW_VERTICAL_FOV_RADIANS } from "./perspectiveFraming";
+import { createRetryableAsyncSingleton } from "./retryableAsyncSingleton";
 
 type BabylonModel = MmdWasmModel;
+
+const getBabylonMmdWasmInstance = createRetryableAsyncSingleton(() => {
+  // A fresh binding key lets babylon-mmd retry after its WeakMap cached a failed attempt.
+  const wasmBinding = {
+    ...MmdWasmSpr,
+    default: () => MmdWasmSpr.default(mmdWasmSprUrl),
+  };
+  return GetMmdWasmInstance({
+    getWasmInstanceInner: () => wasmBinding,
+  });
+});
 type BabylonRuntime = MmdWasmRuntimeType;
 type RuntimeAnimation = IMmdRuntimeModelAnimation & {
   animation: MmdAnimationBase;
@@ -835,18 +850,22 @@ export const loadBabylonMmdModel = async (
   let wasmInstance: Awaited<ReturnType<typeof GetMmdWasmInstance>> | null = null;
   let mmdModel: BabylonModel | null = null;
   let disposed = false;
+  let loadStage = "create-canvas";
   try {
     canvas = document.createElement("canvas");
     canvas.width = 960;
     canvas.height = 540;
     engine = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+    loadStage = "configure-scene";
     SdefInjector.OverrideEngineCreateEffect(engine);
     scene = new Scene(engine);
     scene.clearColor = new Color4(0.04, 0.05, 0.06, 1);
     const camera = new ArcRotateCamera("mely-babylon-camera", -Math.PI / 2, Math.PI / 2.4, 45, new Vector3(0, 10, 0), scene);
+    camera.fov = MMD_PREVIEW_VERTICAL_FOV_RADIANS;
     camera.minZ = 0.1;
     camera.maxZ = 20000;
-    camera.attachControl(canvas, true);
+    applyBabylonCameraPanningProfile(camera);
+    camera.attachControl(false, true, 2);
     const light = new DirectionalLight("mely-babylon-key", new Vector3(-0.3, -1, -0.4), scene);
     light.intensity = 1.8;
     const hemi = new HemisphericLight("mely-babylon-hemi", new Vector3(0, 1, 0), scene);
@@ -855,6 +874,7 @@ export const loadBabylonMmdModel = async (
     const textureWarnings = [...referenceBundle.warnings];
     const materialBuilder = new DiagnosticMmdMaterialBuilder(textureWarnings);
 
+    loadStage = "load-asset-container";
     const loadedContainer = await LoadAssetContainerAsync(modelFile, scene, {
       pluginOptions: {
         mmdmodel: {
@@ -870,10 +890,12 @@ export const loadBabylonMmdModel = async (
       },
     });
     container = loadedContainer;
+    loadStage = "attach-asset-container";
     loadedContainer.addAllToScene();
     rootMesh = getRootMesh(loadedContainer);
     sourceMeshes = getModelMeshes(rootMesh);
-    wasmInstance = await GetMmdWasmInstance(new MmdWasmInstanceTypeSPR());
+    loadStage = "load-wasm-runtime";
+    wasmInstance = await getBabylonMmdWasmInstance();
     const physicsClock: MutablePhysicsClock = {
       deltaSeconds: 0,
       getDeltaTime() {
@@ -883,6 +905,7 @@ export const loadBabylonMmdModel = async (
     const physicsBuilder = new ApplicationMmdWasmPhysics(scene, physicsClock);
     mmdRuntime = new MmdWasmRuntime(wasmInstance, null, physicsBuilder);
     const physicsAvailable = Boolean((rootMesh.metadata as { rigidBodies?: readonly unknown[] } | null)?.rigidBodies?.length);
+    loadStage = "create-mmd-runtime-model";
     mmdModel = mmdRuntime.createMmdModel(rootMesh as never, {
       materialProxyConstructor: MmdStandardMaterialProxy,
       buildPhysics: physicsAvailable,
@@ -898,6 +921,7 @@ export const loadBabylonMmdModel = async (
     // BabylonViewport calls scene.render().
     if (mmdModel.rigidBodyStates.length) mmdModel.rigidBodyStates.fill(0);
 
+    loadStage = "build-runtime-metadata";
     const metadata = (rootMesh.metadata ?? {}) as {
       header?: { modelName?: string; englishModelName?: string };
       bones?: readonly { name: string; englishName: string; parentBoneIndex: number; ik?: unknown }[];
@@ -1506,9 +1530,19 @@ export const loadBabylonMmdModel = async (
         mmdModel = null;
       },
     };
+    loadStage = "evaluate-initial-pose";
     evaluate({ dance: 0, expression: 0 }, false);
     return model;
   } catch (error) {
+    const probeWindow = window as Window & { __MELY_E2E_RENDERER_DIAGNOSTICS__?: boolean };
+    if (probeWindow.__MELY_E2E_RENDERER_DIAGNOSTICS__) {
+      probeWindow.dispatchEvent(new CustomEvent("mely:babylon-load-error", {
+        detail: {
+          stage: loadStage,
+          category: error instanceof Error ? "error" : "unknown",
+        },
+      }));
+    }
     try { mmdRuntime?.dispose(scene!); } catch { /* best effort */ }
     disposeMeshResources(container, scene!, rootMesh);
     try { engine?.dispose(); } catch { /* best effort */ }

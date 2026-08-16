@@ -11,12 +11,20 @@ import {
 } from "three-stdlib";
 import type { MmdModel } from "@yohawing/three-mmd-loader/parser";
 import { FallbackCore } from "@yohawing/three-mmd-loader/parser";
+import { initAmmo as initSharedThreeAmmo } from "@moeru/three-mmd-physics-ammo";
 import { appError } from "./appError";
 import { createMmdResourceUrlBundle } from "./mmdResourceUrls";
 import { normalizeMelyBoneName } from "./melyPose";
+import { createRetryableAsyncSingleton } from "./retryableAsyncSingleton";
 import { withThreeMmdBindPose } from "./threeMmdBindPose";
 import {
+  calibrateVanillaMmdMaterials,
+  captureVanillaMmdLoaderTextures,
+  type VanillaMmdLoaderTextureCapture,
+} from "./threeVanillaMmdMaterials";
+import {
   createThreeMmdModel,
+  disposeThreeMmdResources,
   type LoadedThreeMmdModel,
   type ThreeMmdBackendDriver,
 } from "./threeMmdRuntime";
@@ -44,6 +52,25 @@ interface AmmoModule {
 }
 
 type AmmoGlobal = AmmoModule | undefined;
+
+const publishVanillaPhysicsProbe = (stage: string, detail: Record<string, unknown> = {}) => {
+  const probeWindow = globalThis as typeof globalThis & {
+    __MELY_E2E_RENDERER_DIAGNOSTICS__?: boolean;
+    dispatchEvent?: (event: Event) => boolean;
+  };
+  if (!probeWindow.__MELY_E2E_RENDERER_DIAGNOSTICS__ || !probeWindow.dispatchEvent) return;
+  probeWindow.dispatchEvent(new CustomEvent("mely:vanilla-physics-stage", {
+    detail: { stage, ...detail },
+  }));
+};
+
+const loadVanillaAmmoModule = createRetryableAsyncSingleton(async () => {
+  const candidate = await initSharedThreeAmmo() as unknown as AmmoModule;
+  if (typeof candidate.btDiscreteDynamicsWorld !== "function") {
+    throw new Error("Ammo initialized without the Bullet dynamics API");
+  }
+  return candidate;
+});
 
 interface AmmoPhysicsCapture {
   readonly objects: unknown[];
@@ -250,11 +277,18 @@ export const loadThreeVanillaMmdModel = async (
   resources.manager.onError = (url) => textureWarnings.push(url);
   let parsed: MmdModel | null = null;
   let mesh: SkinnedMesh | null = null;
+  let textureCapture: VanillaMmdLoaderTextureCapture | null = null;
   try {
     parsed = await loadModelMetadata(modelFile);
     const loader = new MMDLoader(resources.manager);
-    mesh = await loader.loadAsync(resources.modelUrl);
+    textureCapture = captureVanillaMmdLoaderTextures(loader);
+    try {
+      mesh = await loader.loadAsync(resources.modelUrl);
+    } finally {
+      textureCapture.restore();
+    }
     const loadedMesh = mesh;
+    const materialMetadata = parsed.materials();
     const root = new Group();
     root.name = modelFile.name.replace(/\.[^.]+$/, "") || "MMD Model";
     root.add(loadedMesh);
@@ -288,7 +322,6 @@ export const loadThreeVanillaMmdModel = async (
         if (name) morphAliases.set(normalizeMelyBoneName(name), nativeName);
       });
     });
-    const materialMetadata = parsed.materials();
     let ammo: AmmoModule | null = null;
     let capture: AmmoPhysicsCapture | null = null;
     let physicsEnabled = false;
@@ -311,12 +344,12 @@ export const loadThreeVanillaMmdModel = async (
         jointCount: metadata.counts.joints,
         boneEnglishNames: skeleton.bones.map((bone) => bone.englishName),
         morphEnglishNames: morphs.map((morph) => morph.englishName),
-          materialNames: materialMetadata.map((material) => ({
-            name: material.name,
-            englishName: material.englishName,
-            diffuse: material.diffuse,
-            ambient: material.ambient,
-          })),
+        materialNames: materialMetadata.map((material) => ({
+          name: material.name,
+          englishName: material.englishName,
+          diffuse: material.diffuse,
+          ambient: material.ambient,
+        })),
       },
       textureWarnings,
       physicsAvailable: metadata.counts.rigidBodies > 0,
@@ -339,16 +372,10 @@ export const loadThreeVanillaMmdModel = async (
         helper.enable("physics", false);
         if (!enabled) return;
         if (enabled && !helperObject?.physics) {
-          const imported = await import("ammojs-typed");
+          publishVanillaPhysicsProbe("load-ammo-start");
+          ammo = await loadVanillaAmmoModule();
+          publishVanillaPhysicsProbe("load-ammo-complete");
           if (disposed || requestId !== physicsRequestId) return;
-          const ammoFactory = imported.default as unknown as (
-            target?: unknown,
-          ) => Promise<AmmoModule>;
-          const candidate = ammoFactory as unknown as AmmoModule;
-          ammo = typeof candidate.btDiscreteDynamicsWorld === "function"
-            ? candidate
-            : await ammoFactory(candidate);
-          if (disposed || requestId !== physicsRequestId || !ammo) return;
           const globalScope = globalThis as typeof globalThis & { Ammo?: AmmoModule };
           if (globalScope.Ammo !== ammo) {
             previousGlobalAmmo = globalScope.Ammo;
@@ -358,6 +385,7 @@ export const loadThreeVanillaMmdModel = async (
           const pendingCapture = installAmmoCapture(ammo) as AmmoPhysicsCapture & { restore: () => void };
           try {
             if (disposed || requestId !== physicsRequestId) return;
+            publishVanillaPhysicsProbe("build-world-start");
             withThreeMmdBindPose(loadedMesh, () => {
               helperInternals._setupMeshPhysics(loadedMesh, {
                 physics: true,
@@ -366,6 +394,10 @@ export const loadThreeVanillaMmdModel = async (
                 unitStep: 1 / 120,
                 maxStepNum: 10,
               });
+            });
+            publishVanillaPhysicsProbe("build-world-complete", {
+              bodyCount: helperObject?.physics?.bodies.length ?? 0,
+              constraintCount: helperObject?.physics?.constraints.length ?? 0,
             });
             if (disposed || requestId !== physicsRequestId) {
               helper.enable("physics", false);
@@ -379,7 +411,11 @@ export const loadThreeVanillaMmdModel = async (
         if (disposed || requestId !== physicsRequestId) return;
         physicsEnabled = enabled;
         helper.enable("physics", enabled);
-        if (enabled) hardResetAmmoPhysics(ammo, helperObject?.physics);
+        if (enabled) {
+          publishVanillaPhysicsProbe("reset-start");
+          hardResetAmmoPhysics(ammo, helperObject?.physics);
+          publishVanillaPhysicsProbe("enabled");
+        }
       },
       physicsEnabled: () => physicsEnabled,
       dispose: () => {
@@ -400,9 +436,28 @@ export const loadThreeVanillaMmdModel = async (
         resources.dispose();
       },
     };
-    return createThreeMmdModel({ driver });
+    const model = createThreeMmdModel({ driver });
+    try {
+      // Runtime metadata and snapshot inputs are captured before this display-only calibration.
+      calibrateVanillaMmdMaterials(loadedMesh, materialMetadata, {
+        format: metadata.format,
+        resolveSphereTexture: textureCapture.resolve,
+      });
+      textureCapture.disposeDetached(loadedMesh);
+      textureCapture = null;
+      return model;
+    } catch (error) {
+      textureCapture?.disposeDetached(loadedMesh);
+      textureCapture = null;
+      await model.dispose();
+      mesh = null;
+      throw error;
+    }
   } catch (error) {
     parsed?.dispose?.();
+    textureCapture?.disposeDetached(mesh);
+    textureCapture = null;
+    if (mesh) disposeThreeMmdResources(mesh.parent instanceof Group ? mesh.parent : new Group(), mesh);
     resources.dispose();
     throw appError("error.model.loadFailed", undefined, error);
   }

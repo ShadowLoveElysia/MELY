@@ -11,8 +11,16 @@ import {
   Vector3,
 } from "@babylonjs/core";
 import type { BabylonMmdViewportSource, LoadedMmdModel } from "../core/mmdRuntime";
+import {
+  BABYLON_DEFAULT_CAMERA_ALPHA,
+  BABYLON_DEFAULT_CAMERA_BETA,
+  resetBabylonCameraView,
+  syncBabylonCameraPanningSensibility,
+  type BabylonResettableCamera,
+} from "../core/babylonCameraControls";
+import { babylonToThreePosition, reflectMmdQuaternionZ } from "../core/mmdCoordinates";
+import { perspectiveFrameDistance, transformFrameBounds } from "../core/perspectiveFraming";
 import type { MmdMotionTimes, ProjectionResult } from "../types";
-import { Vector3 as ThreeVector3 } from "three";
 import type { RendererViewportBinding, RendererViewportProps } from "./rendererViewportTypes";
 
 interface BabylonEngineLike {
@@ -20,6 +28,8 @@ interface BabylonEngineLike {
   stopRenderLoop: (callback?: () => void) => void;
   resize: () => void;
   dispose: () => void;
+  getRenderHeight?: () => number;
+  getRenderWidth?: () => number;
 }
 
 interface BabylonSceneLike {
@@ -28,11 +38,14 @@ interface BabylonSceneLike {
   activeCamera?: BabylonCameraLike | null;
 }
 
-interface BabylonCameraLike {
-  alpha?: number;
-  beta?: number;
-  radius?: number;
+interface BabylonCameraLike extends BabylonResettableCamera<Vector3> {
+  fov: number;
+  position?: { x: number; y: number; z: number };
+  getViewMatrix?: () => unknown;
   target?: {
+    x?: number;
+    y?: number;
+    z?: number;
     set?: (x: number, y: number, z: number) => void;
     copyFrom?: (value: Vector3) => void;
   };
@@ -47,6 +60,10 @@ interface BabylonSceneRuntime {
   baseScaling: Vector3;
   basePosition: Vector3;
   baseRotation: Quaternion | null;
+  frameTarget: Vector3;
+  frameRadius: number;
+  frameSize: Vector3;
+  frameAspect: number;
   modelId: string;
 }
 
@@ -63,6 +80,38 @@ const isBabylonSource = (
 
 const asBabylonEngine = (value: unknown) => value as BabylonEngineLike;
 const asBabylonScene = (value: unknown) => value as BabylonSceneLike;
+
+const publishBabylonCameraProbe = (
+  camera: BabylonCameraLike,
+  sourceRoot: AbstractMesh,
+) => {
+  const probeWindow = window as Window & { __MELY_E2E_CAMERA_PROBE__?: boolean };
+  if (!probeWindow.__MELY_E2E_CAMERA_PROBE__) return;
+  probeWindow.dispatchEvent(new CustomEvent("mely:babylon-camera-state", {
+    detail: {
+      timestamp: performance.now(),
+      alpha: camera.alpha ?? null,
+      beta: camera.beta ?? null,
+      radius: camera.radius,
+      fovRadians: camera.fov,
+      target: [
+        camera.target?.x ?? null,
+        camera.target?.y ?? null,
+        camera.target?.z ?? null,
+      ],
+      panningSensibility: camera.panningSensibility,
+      panningInertia: camera.panningInertia,
+      angularSensibilityX: camera.angularSensibilityX,
+      angularSensibilityY: camera.angularSensibilityY,
+      inertia: camera.inertia,
+      sourceTransform: {
+        scaling: sourceRoot.scaling.asArray(),
+        position: sourceRoot.position.asArray(),
+        rotationQuaternion: sourceRoot.rotationQuaternion?.asArray() ?? null,
+      },
+    },
+  }));
+};
 
 const disposeGeneratedProjection = (root: TransformNode) => {
   root.getChildMeshes().forEach((mesh) => {
@@ -218,6 +267,10 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
       baseScaling: sourceTransform.scaling,
       basePosition: sourceTransform.position,
       baseRotation: sourceTransform.rotation,
+      frameTarget: Vector3.Zero(),
+      frameRadius: camera.radius,
+      frameSize: Vector3.Zero(),
+      frameAspect: 1,
       modelId: model.id,
     };
 
@@ -226,6 +279,45 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
     canvas.style.width = "100%";
     canvas.style.height = "100%";
     canvas.setAttribute("aria-label", "Babylon.js MMD viewport");
+    const preventContextMenu = (event: MouseEvent) => event.preventDefault();
+    canvas.addEventListener("contextmenu", preventContextMenu);
+    const probeWindow = window as Window & { __MELY_E2E_VIEW_PROBE__?: boolean };
+    const applyE2eView = (event: Event) => {
+      if (!probeWindow.__MELY_E2E_VIEW_PROBE__) return;
+      const view = (event as CustomEvent<{ view?: "front" | "oblique" }>).detail?.view;
+      if (view !== "front" && view !== "oblique") return;
+      const current = sceneRuntimeRef.current;
+      if (!current || current.modelId !== model.id) return;
+      resetBabylonCameraView(current.camera, current.frameTarget, current.frameRadius);
+      current.camera.alpha = view === "front" ? BABYLON_DEFAULT_CAMERA_ALPHA : -Math.PI / 4;
+      current.camera.beta = BABYLON_DEFAULT_CAMERA_BETA;
+      current.camera.getViewMatrix?.();
+      const renderWidth = engine.getRenderWidth?.() ?? canvas.width;
+      const renderHeight = engine.getRenderHeight?.() ?? canvas.height;
+      window.dispatchEvent(new CustomEvent("mely:e2e-view-applied", {
+        detail: {
+          backend: "babylon",
+          view,
+          alpha: current.camera.alpha,
+          beta: current.camera.beta,
+          radius: current.camera.radius,
+          distance: current.camera.radius,
+          target: current.frameTarget.asArray(),
+          eye: [
+            current.camera.position?.x ?? null,
+            current.camera.position?.y ?? null,
+            current.camera.position?.z ?? null,
+          ],
+          fovRadians: current.camera.fov,
+          aspect: current.frameAspect,
+          actualAspect: renderWidth / Math.max(1, renderHeight),
+          frameSize: current.frameSize.asArray(),
+        },
+      }));
+    };
+    if (probeWindow.__MELY_E2E_VIEW_PROBE__) {
+      window.addEventListener("mely:e2e-set-view", applyE2eView);
+    }
 
     let disposed = false;
     let readyNotified = false;
@@ -242,7 +334,9 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
         evaluated = { dance: seconds, expression: seconds };
         modelRef.current.updatePreviewPose(evaluated);
       }
+      syncBabylonCameraPanningSensibility(camera);
       scene.render();
+      publishBabylonCameraProbe(camera, sourceRoot);
       const gpuSynchronized = Boolean((window as Window & {
         __MELY_E2E_GPU_PROBE__?: boolean;
       }).__MELY_E2E_GPU_PROBE__);
@@ -259,7 +353,24 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
 
     const resizeObserver = typeof ResizeObserver === "undefined"
       ? null
-      : new ResizeObserver(() => engine.resize());
+      : new ResizeObserver(() => {
+        engine.resize();
+        const current = sceneRuntimeRef.current;
+        if (!current || current.modelId !== model.id) return;
+        const width = mount.clientWidth;
+        const aspect = width / Math.max(1, mount.clientHeight);
+        if (!Number.isFinite(aspect) || aspect <= 0 || Math.abs(aspect - current.frameAspect) < 1e-6) {
+          return;
+        }
+        current.frameAspect = aspect;
+        current.frameRadius = perspectiveFrameDistance({
+          width: current.frameSize.x,
+          height: current.frameSize.y,
+          depth: current.frameSize.z,
+        }, aspect, current.camera.fov);
+        current.camera.radius = current.frameRadius;
+        syncBabylonCameraPanningSensibility(current.camera);
+      });
     resizeObserver?.observe(mount);
     engine.resize();
     loopRef.current = { engine, renderFrame };
@@ -281,6 +392,8 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
           if (loopRef.current?.engine === engine) loopRef.current = null;
         });
         attempt(() => resizeObserver?.disconnect());
+        attempt(() => canvas.removeEventListener("contextmenu", preventContextMenu));
+        attempt(() => window.removeEventListener("mely:e2e-set-view", applyE2eView));
         attempt(() => {
           if (sceneRuntimeRef.current?.modelId === model.id) {
             disposeGeneratedProjection(sceneRuntimeRef.current.generatedRoot);
@@ -321,27 +434,76 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
     source.position.copyFrom(runtime.basePosition);
     if (runtime.baseRotation) source.rotationQuaternion = runtime.baseRotation.clone();
     const bounds = model.visibleBounds();
-    const size = bounds.getSize(new ThreeVector3());
-    const centerBounds = bounds.getCenter(new ThreeVector3());
     source.computeWorldMatrix(true);
 
-    const camera = runtime.camera as BabylonCameraLike & { target?: Vector3; radius?: number };
+    const camera = runtime.camera;
     const isHologram = props.previewMode === "hologram";
-    // Projection coordinates are already normalized to targetHeight. Source
-    // coordinates stay native, so frame each mode without changing the model
-    // transform seen by the runtime.
-    const center = isHologram
-      ? new Vector3(0, Math.max(0, (props.targetHeight ?? 96) * 0.45), 0)
-      : new Vector3(centerBounds.x, centerBounds.y, -centerBounds.z);
-    const frameHeight = isHologram
-      ? Math.max(1, props.targetHeight ?? 96)
-      : Math.max(1, size.y);
+    const projectionBounds = isHologram ? props.result?.bounds : null;
+    const transformedSourceBounds = transformFrameBounds({
+      min: [bounds.min.x, bounds.min.y, bounds.min.z],
+      max: [bounds.max.x, bounds.max.y, bounds.max.z],
+    }, {
+      scale: runtime.baseScaling.asArray(),
+      position: babylonToThreePosition([
+        runtime.basePosition.x,
+        runtime.basePosition.y,
+        runtime.basePosition.z,
+      ]),
+      rotationQuaternion: runtime.baseRotation
+        ? reflectMmdQuaternionZ([
+          runtime.baseRotation.x,
+          runtime.baseRotation.y,
+          runtime.baseRotation.z,
+          runtime.baseRotation.w,
+        ])
+        : null,
+    });
+    const size = projectionBounds
+      ? new Vector3(
+        Math.max(0, projectionBounds.max[0] - projectionBounds.min[0]),
+        Math.max(0, projectionBounds.max[1] - projectionBounds.min[1]),
+        Math.max(0, projectionBounds.max[2] - projectionBounds.min[2]),
+      )
+      : new Vector3(
+        transformedSourceBounds.max[0] - transformedSourceBounds.min[0],
+        transformedSourceBounds.max[1] - transformedSourceBounds.min[1],
+        transformedSourceBounds.max[2] - transformedSourceBounds.min[2],
+      );
+    const center = projectionBounds
+      ? new Vector3(
+        (projectionBounds.min[0] + projectionBounds.max[0]) / 2,
+        (projectionBounds.min[1] + projectionBounds.max[1]) / 2,
+        -(projectionBounds.min[2] + projectionBounds.max[2]) / 2,
+      )
+      : new Vector3(
+        (transformedSourceBounds.min[0] + transformedSourceBounds.max[0]) / 2,
+        (transformedSourceBounds.min[1] + transformedSourceBounds.max[1]) / 2,
+        -(transformedSourceBounds.min[2] + transformedSourceBounds.max[2]) / 2,
+      );
+    const aspect = mountRef.current?.clientWidth
+      ? mountRef.current.clientWidth / Math.max(1, mountRef.current.clientHeight)
+      : 1;
+    runtime.frameTarget.copyFrom(center);
+    runtime.frameSize.copyFrom(size);
+    runtime.frameAspect = aspect;
+    runtime.frameRadius = perspectiveFrameDistance({
+      width: size.x,
+      height: size.y,
+      depth: size.z,
+    }, aspect, camera.fov);
     camera.target?.copyFrom?.(center);
-    camera.radius = Math.max(3, frameHeight * 1.45);
+    camera.radius = runtime.frameRadius;
+    syncBabylonCameraPanningSensibility(camera);
     runtime.generatedRoot.setEnabled(props.previewMode === "hologram");
     source.setEnabled(props.previewMode !== "hologram");
     rebuildGeneratedProjection(runtime, props.result ?? null);
-  }, [props.model, props.previewMode, props.result, props.targetHeight, props.glow]);
+  }, [props.model, props.previewMode, props.result]);
+
+  useEffect(() => {
+    const runtime = sceneRuntimeRef.current;
+    if (!runtime) return;
+    resetBabylonCameraView(runtime.camera, runtime.frameTarget, runtime.frameRadius);
+  }, [props.resetToken]);
 
   useEffect(() => {
     activeRef.current = active;

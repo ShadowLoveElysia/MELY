@@ -10,6 +10,7 @@ import { MMDAmmoPhysics, initAmmo } from "@moeru/three-mmd-physics-ammo";
 import { appError } from "./appError";
 import { createMmdResourceUrlBundle } from "./mmdResourceUrls";
 import { normalizeMelyBoneName } from "./melyPose";
+import { adaptMoeruMmdOutlineParameters } from "./threeMmdOutline";
 import {
   createThreeMmdModel,
   type LoadedThreeMmdModel,
@@ -82,6 +83,7 @@ export const loadThreeMoeruMmdModel = async (
     mmd = await new MMDLoader(resources.manager).loadAsync(resources.modelUrl);
     const root = new Group();
     root.name = modelFile.name.replace(/\.[^.]+$/, "") || "MMD Model";
+    adaptMoeruMmdOutlineParameters(mmd.mesh);
     root.add(mmd.mesh);
     const mixer = new AnimationMixer(mmd.mesh);
     let physicsEnabled = false;

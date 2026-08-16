@@ -253,9 +253,11 @@ const disposeTextureSource = (value: unknown) => {
 };
 
 export const disposeThreeMmdResources = (root: Group, mesh: SkinnedMesh) => {
+  const skeleton = mesh.skeleton;
   const geometries = new Set<BufferGeometry>();
   const materials = new Set<Material>();
   const textures = new Set<Texture>();
+  const textureSources = new Set<Texture["source"]>();
   root.traverse((object) => {
     if (!(object instanceof Mesh)) return;
     geometries.add(object.geometry);
@@ -277,12 +279,17 @@ export const disposeThreeMmdResources = (root: Group, mesh: SkinnedMesh) => {
   textures.forEach((texture) => {
     const source = texture.source.data ?? texture.image;
     texture.dispose();
-    disposeTextureSource(source);
-    texture.source.data = null;
+    // Texture.clone() shares Source; release that image once while disposing every GPU texture.
+    if (!textureSources.has(texture.source)) {
+      textureSources.add(texture.source);
+      disposeTextureSource(source);
+      texture.source.data = null;
+    }
     texture.mipmaps.length = 0;
   });
   geometries.forEach((geometry) => geometry.dispose());
   materials.forEach((material) => material.dispose());
+  skeleton?.dispose();
   root.clear();
   mesh.geometry = new BufferGeometry();
   mesh.material = [];
