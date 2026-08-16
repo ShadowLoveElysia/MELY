@@ -513,6 +513,11 @@ const reachExtremeHeight = async (page, report) => {
     name: "Safety confirmation: this is not a vanilla projection",
   });
   await exportDialog.waitFor({ state: "visible" });
+  const exportDialogText = await exportDialog.innerText();
+  if (!exportDialogText.includes("target world is 4,064 layers tall")
+    || exportDialogText.includes("target world is 2,032 layers tall")) {
+    throw new Error(`The 4,064-layer export confirmation shows the wrong height: ${exportDialogText}`);
+  }
   const confirm = exportDialog.getByRole("button", { name: "Confirm export", exact: true });
   const confirmDisabledInitially = await confirm.isDisabled();
   await exportDialog.locator('input[type="checkbox"]').check();

@@ -24,6 +24,11 @@ test("4064 product flow wires three distinct confirmations and final fingerprint
   assert.match(app, /contentHash\?: string/);
   assert.match(app, /projectionDocumentRef\.current\.contentHash !== pendingExport\.resultId/);
   assert.doesNotMatch(app, /documentResultId\(projectionDocumentRef\.current\.document\)/);
+  assert.match(app, /requiredHeight: "requiredHeight" in preflight[\s\S]*?\? preflight\.requiredHeight/);
+  assert.match(app, /targetDimensionHeight: typeof document\.metadata\?\.targetDimensionMinY/);
+  assert.match(app, /extendedExport\.projectionHeight/);
+  assert.match(app, /extremeExportPhrase\(pendingExport\.requiredHeight\)/);
+  assert.doesNotMatch(app, /pendingExport\.safetyHeight/);
 });
 
 test("registered versions keep generation and both height unlock controls actionable", async () => {
@@ -58,4 +63,21 @@ test("experimental preflight can enter its final confirmation dialog", async () 
   assert.match(app, /preflight\.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"/);
   assert.match(app, /!preflight\.allowed && !needsExtremeExportConfirmation/);
   assert.match(app, /!preflight\.allowed && !awaitsExtremeConfirmation/);
+});
+
+test("final confirmation distinguishes projection height from declared world height", async () => {
+  const [app, zh, en, ja] = await Promise.all([
+    readFile("src/App.tsx", "utf8"),
+    readFile("src/i18n/locales/zh-CN.ts", "utf8"),
+    readFile("src/i18n/locales/en-US.ts", "utf8"),
+    readFile("src/i18n/locales/ja-JP.ts", "utf8"),
+  ]);
+
+  assert.match(app, /height: number\(pendingExport\?\.targetDimensionHeight/);
+  assert.match(app, /height: number\(pendingExport\.requiredHeight\)/);
+  assert.match(app, /pendingExport\.targetDimensionHeight !== pendingExport\.requiredHeight/);
+  for (const locale of [zh, en, ja]) {
+    assert.match(locale, /"extendedExport\.body": "[^"]*\{\{height\}\}[^"]*\{\{vanilla\}\}/);
+    assert.match(locale, /"extendedExport\.projectionHeight": "[^"]*\{\{height\}\}/);
+  }
 });

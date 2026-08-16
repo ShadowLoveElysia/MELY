@@ -211,7 +211,8 @@ interface PendingExport {
   name: string;
   targetHeight: number;
   actualHeight: number;
-  safetyHeight: number;
+  requiredHeight: number;
+  targetDimensionHeight: number;
   configurationFingerprint?: string;
   exportFingerprint?: string;
   safety: {
@@ -3289,7 +3290,13 @@ export default function App() {
         name: projectionName,
         targetHeight,
         actualHeight: document.bounds?.dimensions[1] ?? 0,
-        safetyHeight: requestHeightRisk.requiredHeight,
+        requiredHeight: "requiredHeight" in preflight
+          ? preflight.requiredHeight
+          : requestHeightRisk.requiredHeight,
+        targetDimensionHeight: typeof document.metadata?.targetDimensionMinY === "number"
+          && typeof document.metadata?.targetDimensionMaxY === "number"
+          ? document.metadata.targetDimensionMaxY - document.metadata.targetDimensionMinY + 1
+          : selectedDefaultHeight,
         configurationFingerprint: fingerprints?.configurationFingerprint,
         exportFingerprint: fingerprints?.exportFingerprint,
         safety: {
@@ -3359,7 +3366,7 @@ export default function App() {
         pendingExport.configurationFingerprint,
         pendingExport.exportFingerprint,
         extremeExportPhraseInput,
-        pendingExport.safetyHeight,
+        pendingExport.requiredHeight,
         `${pendingExport.format}; ${pendingExport.actualHeight} layers; ${pendingExport.safety.placementBottomY}..${
           pendingExport.safety.placementBottomY + Math.max(0, pendingExport.actualHeight - 1)
         }`,
@@ -4022,16 +4029,21 @@ export default function App() {
               || exporting
               || !pendingExport
               || (Boolean(pendingExport?.experimental)
-                && extremeExportPhraseInput !== extremeExportPhrase(pendingExport.safetyHeight)),
+                && extremeExportPhraseInput !== extremeExportPhrase(pendingExport.requiredHeight)),
             onClick: confirmPendingExport,
           },
         ]}
       >
         <div className="safety-copy">
           <p>{t("extendedExport.body", {
-            height: number(pendingExport?.safetyHeight ?? selectedDefaultHeight),
+            height: number(pendingExport?.targetDimensionHeight ?? selectedDefaultHeight),
             vanilla: number(selectedDefaultHeight),
           })}</p>
+          {pendingExport && pendingExport.targetDimensionHeight !== pendingExport.requiredHeight ? (
+            <p>{t("extendedExport.projectionHeight", {
+              height: number(pendingExport.requiredHeight),
+            })}</p>
+          ) : null}
           <ul>
             <li>{t("extendedExport.checkDatapack")}</li>
             <li>{t("extendedExport.checkRisk")}</li>
@@ -4047,7 +4059,7 @@ export default function App() {
           {pendingExport?.experimental ? (
             <label className="extreme-export-phrase">
               <span>{t("extremeHeight.exportPhrase", {
-                phrase: extremeExportPhrase(pendingExport.safetyHeight),
+                phrase: extremeExportPhrase(pendingExport.requiredHeight),
               })}</span>
               <input
                 type="text"
