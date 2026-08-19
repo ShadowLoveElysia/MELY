@@ -177,6 +177,48 @@ test("generation height preflight enforces modes without requiring verification 
   }).errorCode, "JAVA_VERSION_PROFILE_UNKNOWN");
 });
 
+test("a 4064 target dimension requires experimental confirmation for a 2032 projection", () => {
+  const profile = syntheticProfile();
+  const common = {
+    versionId: profile.id,
+    targetHeight: 2032,
+    targetDimension: { minY: -2032, height: 4064 },
+    datapackAcknowledged: true,
+    profile,
+  };
+
+  const extended = preflightGenerationHeight({
+    ...common,
+    heightMode: "extended_2032",
+  });
+  assert.equal(extended.requiredHeight, 2032);
+  assert.equal(extended.confirmationHeight, 4064);
+  assert.equal(extended.requiredMode, "experimental_4064");
+  assert.equal(extended.errorCode, "HEIGHT_EXTREME_CONFIRMATION_REQUIRED");
+
+  const configurationFingerprint = "sha256:dimension-extreme";
+  const confirmations = confirmExtremeEnvironment(
+    confirmExtremeUnlock(
+      createExtremeHeightConfirmationState(),
+      configurationFingerprint,
+      "unlock",
+      1,
+    ),
+    configurationFingerprint,
+    "environment",
+    2,
+  );
+  const experimental = preflightGenerationHeight({
+    ...common,
+    heightMode: "experimental_4064",
+    confirmations,
+    configurationFingerprint,
+  });
+  assert.equal(experimental.allowed, true);
+  assert.equal(experimental.requiredHeight, 2032);
+  assert.equal(experimental.confirmationHeight, 4064);
+});
+
 test("legacy profiles may attempt community extended heights after explicit acknowledgement", () => {
   const profile = syntheticProfile({
     id: "1.16.5-test",
@@ -426,4 +468,50 @@ test("extended exports require an explicit third-party dimension declaration", (
     ...common,
     targetDimension: { minY: -2032, height: 4065 },
   }).errorCode, "TARGET_DIMENSION_DECLARATION_REQUIRED");
+});
+
+test("projection preflight keeps geometry height separate from world confirmation height", () => {
+  const profile = syntheticProfile();
+  const configurationFingerprint = "sha256:short-extreme-world";
+  const environment = confirmExtremeEnvironment(
+    confirmExtremeUnlock(
+      createExtremeHeightConfirmationState(),
+      configurationFingerprint,
+      "unlock",
+      1,
+    ),
+    configurationFingerprint,
+    "environment",
+    2,
+  );
+  const input = {
+    versionId: profile.id,
+    heightMode: "experimental_4064" as const,
+    targetHeight: 2032,
+    targetDimension: { minY: -2032, height: 4064 },
+    placementBottomY: -2032,
+    datapackAcknowledged: true,
+    profile,
+    bounds: {
+      min: [0, 0, 0] as const,
+      max: [0, 2031, 0] as const,
+      dimensions: [1, 2032, 1] as const,
+    },
+    confirmations: environment,
+    configurationFingerprint,
+  };
+
+  const generationResult = preflightProjectionHeight({
+    ...input,
+    requireExtremeExportConfirmation: false,
+  });
+  assert.equal(generationResult.allowed, true);
+  assert.equal(generationResult.requiredHeight, 2032);
+  assert.equal(generationResult.confirmationHeight, 4064);
+  assert.equal(generationResult.requiredMode, "experimental_4064");
+
+  const exportResult = preflightProjectionHeight(input);
+  assert.equal(exportResult.requiredHeight, 2032);
+  assert.equal(exportResult.confirmationHeight, 4064);
+  assert.equal(exportResult.errorCode, "HEIGHT_EXTREME_CONFIRMATION_REQUIRED");
 });

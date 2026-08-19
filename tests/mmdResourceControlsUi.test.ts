@@ -78,6 +78,8 @@ test("physics is explicit, lazy, and settled before generation snapshots", () =>
 test("model resources expose collapsible parts with hidden entries first", () => {
   const app = readFileSync("src/App.tsx", "utf8");
   const sidebar = readFileSync("src/components/Sidebar.tsx", "utf8");
+  const section = readFileSync("src/components/Section.tsx", "utf8");
+  const styles = readFileSync("src/index.css", "utf8");
   const snapshot = readFileSync("src/core/mmdSnapshot.ts", "utf8");
 
   assert.doesNotMatch(sidebar, /assets\.slice\(0, 5\)/);
@@ -87,6 +89,22 @@ test("model resources expose collapsible parts with hidden entries first", () =>
   assert.match(sidebar, /checked=\{!hidden\}/);
   assert.match(sidebar, /title=\{cannotHide \? t\("sidebar\.parts\.keepOne"\) : displayName\}/);
   assert.match(sidebar, /visibleMaterialCount <= 1/);
+  assert.match(sidebar, /selectedMaterialIndex: number \| null/);
+  assert.match(sidebar, /materialSelectionRequestId: number/);
+  assert.match(sidebar, /materialSelectionRequestId === handledMaterialSelectionRequestRef\.current/);
+  assert.match(sidebar, /setAssetsSectionOpen\(true\)[\s\S]*setPartsExpanded\(true\)/);
+  assert.match(sidebar, /row\.scrollIntoView\(\{ block: "nearest", behavior: "auto" \}\)/);
+  assert.match(sidebar, /checkbox\.focus\(\{ preventScroll: true \}\)/);
+  assert.match(sidebar, /aria-current=\{selected \? "true" : undefined\}/);
+  assert.match(sidebar, /model-part--selected/);
+  assert.match(sidebar, /selectedMaterialHidden[\s\S]*onMaterialVisibilityChange\([\s\S]*selectedMaterialHidden/);
+  assert.match(sidebar, /event\.key !== "Escape"[\s\S]*onMaterialSelectionChange\(null\)/);
+  assert.match(sidebar, /input:not\(\[type="checkbox"\]\), textarea, select/);
+  assert.match(section, /open\?: boolean/);
+  assert.match(section, /onOpenChange\?: \(open: boolean\) => void/);
+  assert.match(styles, /\.model-part--selected[\s\S]*box-shadow: inset 3px 0/);
+  assert.match(styles, /\.model-part--selected\.model-part--hidden/);
+  assert.match(styles, /\.model-part input:focus-visible/);
   assert.match(app, /model\.setMaterialVisible\(index, visible\)/);
   assert.match(app, /invalidateProjection\("material-visibility"\)/);
   assert.match(snapshot, /sourceVertexIndices/);

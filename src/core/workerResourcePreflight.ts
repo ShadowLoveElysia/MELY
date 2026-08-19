@@ -7,6 +7,10 @@ import {
   getJavaVersionProfile,
   type JavaVersionProfile,
 } from "./minecraftVersions";
+import {
+  estimateSolidVoxelizationWork,
+  type SolidVoxelWorkEstimate,
+} from "./solidVoxelWork";
 
 export type WorkerResourcePreflightResult = ResourceEstimate & {
   width: number;
@@ -14,6 +18,7 @@ export type WorkerResourcePreflightResult = ResourceEstimate & {
   depth: number;
   triangleCount: number;
   textureBytes: number;
+  solidWorkEstimate?: SolidVoxelWorkEstimate;
 };
 
 const positiveTargetHeight = (value: number) => {
@@ -89,6 +94,13 @@ export const preflightWorkerResources = (
     0,
   ) ?? 0;
   const hologram = command.type === "GENERATE_HOLOGRAM";
+  const solidWorkEstimate = command.type === "GENERATE_SOLID"
+    ? estimateSolidVoxelizationWork(
+        command.source.mesh,
+        height,
+        command.options.thicknessCompensation,
+      )
+    : undefined;
   const fillMode = hologram ? "shell" : command.options.fillMode;
   const surfaceBlocks = estimatedSurfaceBlocks(dimensions);
   const estimatedBlocks = hologram
@@ -113,6 +125,7 @@ export const preflightWorkerResources = (
     depth: dimensions[2],
     triangleCount,
     textureBytes: hologram ? 0 : textureBytes,
+    ...(solidWorkEstimate ? { solidWorkEstimate } : {}),
   };
 };
 
@@ -138,9 +151,7 @@ export const assertWorkerMaterialCapabilities = (
 
 export const assertWorkerResources = (command: WorkerCommand): WorkerResourcePreflightResult => {
   assertWorkerMaterialCapabilities(command);
-  const result = preflightWorkerResources(command);
-  if (!result.allowed) {
-    throw new RangeError(`WORKER_RESOURCE_${result.reason.toUpperCase()}`);
-  }
-  return result;
+  // 资源超预算是需用户确认的风险，不是 Worker 结构错误。
+  // 几何、索引和安全整数检查仍由预检函数抛出并 fail closed。
+  return preflightWorkerResources(command);
 };

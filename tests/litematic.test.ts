@@ -2,13 +2,20 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Buffer } from "node:buffer";
 import * as nbt from "prismarine-nbt";
+import { encode, Int, type TagObject } from "nbt-ts";
+import { gzip, ungzip } from "pako";
 import {
   createLitematic,
   createLitematicFromDocument,
   packBlockStates,
+  streamLitematicFromDocument,
   unpackBlockState,
 } from "../src/core/litematic";
-import { createProjectionDocument } from "../src/core/projectionDocument";
+import {
+  createProjectionDocument,
+  iterateProjectionViewBlocks,
+  splitProjectionViews,
+} from "../src/core/projectionDocument";
 import type { HologramOptions, HologramResult } from "../src/types";
 import type { SolidOptions, SolidVoxelResult } from "../src/types";
 
@@ -42,6 +49,81 @@ const unpackIndependent = (
 
   const second = unpackPrismarineLong(longs[longIndex + 1]);
   return Number(((first >> BigInt(innerOffset)) | (second << BigInt(available))) & mask);
+};
+
+const legacyLitematicBytes = (
+  document: ReturnType<typeof createProjectionDocument>,
+  name: string,
+  author: string,
+  timestamp: number,
+) => {
+  const palette = [
+    { Name: "minecraft:air" },
+    ...document.palette.map((state) => ({
+      Name: state.blockId,
+      ...(state.properties ? { Properties: { ...state.properties } } : {}),
+    })),
+  ];
+  const views = splitProjectionViews(document, 32);
+  const regions: Record<string, TagObject> = {};
+  let totalVolume = 0;
+  for (const view of views) {
+    const [sizeX, sizeY, sizeZ] = view.bounds.dimensions;
+    const volume = sizeX * sizeY * sizeZ;
+    const indices = new Uint32Array(volume);
+    for (const block of iterateProjectionViewBlocks(document, view)) {
+      const x = block.position[0] - view.bounds.min[0];
+      const y = block.position[1] - view.bounds.min[1];
+      const z = block.position[2] - view.bounds.min[2];
+      indices[(y * sizeZ + z) * sizeX + x] = block.paletteIndex + 1;
+    }
+    totalVolume += volume;
+    const region = views.length === 1
+      ? "Hologram"
+      : `R_${view.index[1]}_${view.index[2]}_${view.index[0]}`;
+    regions[region] = {
+      Position: {
+        x: new Int(view.bounds.min[0] - document.bounds!.min[0]),
+        y: new Int(view.bounds.min[1] - document.bounds!.min[1]),
+        z: new Int(view.bounds.min[2] - document.bounds!.min[2]),
+      },
+      Size: {
+        x: new Int(sizeX),
+        y: new Int(sizeY),
+        z: new Int(sizeZ),
+      },
+      BlockStatePalette: palette,
+      BlockStates: packBlockStates(indices, palette.length).packed,
+      Entities: [],
+      TileEntities: [],
+      PendingBlockTicks: [],
+      PendingFluidTicks: [],
+    };
+  }
+  const [sizeX, sizeY, sizeZ] = document.bounds!.dimensions;
+  return gzip(encode("", {
+    Version: new Int(6),
+    SubVersion: new Int(1),
+    MinecraftDataVersion: new Int(3465),
+    Metadata: {
+      EnclosingSize: { x: new Int(sizeX), y: new Int(sizeY), z: new Int(sizeZ) },
+      Author: author,
+      Description: "MELY | Minecraft 1.20.1",
+      Name: name,
+      Software: "MELY_1.0.0",
+      TargetMinecraftVersion: "1.20.1",
+      SerializerMinecraftVersion: "1.20.1",
+      CompatibilityLevel: "exact",
+      CompatibilityWarning: "",
+      RegionCount: new Int(views.length),
+      TimeCreated: BigInt(timestamp),
+      TimeModified: BigInt(timestamp),
+      TotalBlocks: new Int(document.blockCount),
+      TotalVolume: new Int(totalVolume),
+      PreviewImageData: new Int32Array(0),
+    },
+    Regions: regions,
+  }), { level: 9 });
 };
 
 test("continuous palette indices survive 64-bit boundaries", () => {
@@ -142,6 +224,150 @@ test("generated file is a valid Minecraft 1.20.1 Litematica v6 schematic", async
   }
 });
 
+test("streaming Litematic output matches the synchronous compatibility API", async () => {
+  const document = createProjectionDocument([
+    { position: [-33, -2, 0], paletteIndex: 0 },
+    { position: [-1, -1, 31], paletteIndex: 1 },
+    { position: [0, 0, 32], paletteIndex: 0 },
+    { position: [35, 33, 65], paletteIndex: 1 },
+  ], [
+    { blockId: "minecraft:white_concrete", properties: { axis: "x" } },
+    { blockId: "minecraft:black_concrete" },
+  ]);
+  const exportOptions = {
+    name: "流式 NBT 测试",
+    author: "MELY 测试",
+    timestamp: 1_786_000_000_000,
+    regionMaxSize: 32,
+  } as const;
+  const synchronous = createLitematicFromDocument(document, exportOptions);
+  const legacyBytes = legacyLitematicBytes(
+    document,
+    exportOptions.name,
+    exportOptions.author,
+    exportOptions.timestamp,
+  );
+  assert.deepEqual(ungzip(synchronous.bytes), ungzip(legacyBytes));
+  assert.deepEqual(synchronous.bytes, legacyBytes);
+  const chunks: Uint8Array[] = [];
+  const summary = await streamLitematicFromDocument(document, async (chunk) => {
+    await Promise.resolve();
+    chunks.push(chunk);
+  }, exportOptions);
+  const streamed = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+
+  assert.deepEqual(streamed, Buffer.from(synchronous.bytes));
+  assert.deepEqual(summary, synchronous.summary);
+  assert.ok(chunks.length >= 1);
+
+  const { parsed } = await nbt.parse(streamed, "big");
+  const root = nbt.simplify(parsed) as any;
+  assert.equal(root.Metadata.TotalBlocks, 4);
+  assert.equal(root.Metadata.RegionCount, 4);
+  assert.deepEqual(root.Metadata.EnclosingSize, { x: 69, y: 36, z: 66 });
+});
+
+test("many sparse regions stream without retaining a Regions tag object", async () => {
+  const regionCount = 1_024;
+  const document = createProjectionDocument(
+    Array.from({ length: regionCount }, (_, index) => ({
+      position: [index * 32, index % 7, index % 11] as [number, number, number],
+      paletteIndex: 0,
+    })),
+    [{ blockId: "minecraft:white_concrete" }],
+  );
+  const chunks: Uint8Array[] = [];
+  const summary = await streamLitematicFromDocument(document, (chunk) => {
+    chunks.push(chunk);
+  }, { timestamp: 1, regionMaxSize: 32 });
+
+  assert.equal(summary.regionCount, regionCount);
+  assert.equal(summary.blockCount, regionCount);
+  assert.ok(chunks.length >= 1);
+  assert.equal(
+    summary.byteLength,
+    chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
+  );
+  const { parsed } = await nbt.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))), "big");
+  const root = nbt.simplify(parsed) as any;
+  assert.equal(Object.keys(root.Regions).length, regionCount);
+  assert.equal(root.Metadata.TotalBlocks, regionCount);
+});
+
+test("streaming sink is awaited serially and receives multiple owned gzip chunks", async () => {
+  const blockCount = 700_000;
+  const document = createProjectionDocument(
+    Array.from({ length: blockCount }, (_, index) => ({
+      position: [index % 2_000, Math.floor(index / 2_000), 0] as [number, number, number],
+      paletteIndex: (
+        Math.imul(index ^ (index >>> 16), 0x45d9f3b)
+        ^ Math.imul(index ^ (index >>> 13), 0x119de1f3)
+      ) >>> 28,
+    })),
+    [
+      { blockId: "minecraft:white_concrete" },
+      { blockId: "minecraft:black_concrete" },
+      { blockId: "minecraft:red_concrete" },
+      { blockId: "minecraft:blue_concrete" },
+      { blockId: "minecraft:green_concrete" },
+      { blockId: "minecraft:yellow_concrete" },
+      { blockId: "minecraft:orange_concrete" },
+      { blockId: "minecraft:purple_concrete" },
+      { blockId: "minecraft:cyan_concrete" },
+      { blockId: "minecraft:lime_concrete" },
+      { blockId: "minecraft:pink_concrete" },
+      { blockId: "minecraft:brown_concrete" },
+      { blockId: "minecraft:gray_concrete" },
+      { blockId: "minecraft:light_gray_concrete" },
+      { blockId: "minecraft:light_blue_concrete" },
+      { blockId: "minecraft:magenta_concrete" },
+    ],
+  );
+  const chunks: Uint8Array[] = [];
+  let activeSinks = 0;
+  let maximumActiveSinks = 0;
+  const summary = await streamLitematicFromDocument(document, async (chunk) => {
+    activeSinks += 1;
+    maximumActiveSinks = Math.max(maximumActiveSinks, activeSinks);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    chunks.push(chunk);
+    activeSinks -= 1;
+  }, { timestamp: 1, regionMaxSize: [2_048, 384, 1] });
+
+  assert.equal(maximumActiveSinks, 1);
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => chunk.byteLength <= 16 * 1024));
+  assert.equal(summary.byteLength, chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
+  const { parsed } = await nbt.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))), "big");
+  assert.equal((nbt.simplify(parsed) as any).Metadata.TotalBlocks, blockCount);
+});
+
+test("Litematic NBT rejects values that would silently wrap signed fields", async () => {
+  const document = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }]);
+
+  assert.throws(
+    () => createLitematicFromDocument(document, { timestamp: Number.NaN }),
+    /timestamp must be a safe integer/,
+  );
+  assert.throws(
+    () => createLitematicFromDocument(document, { timestamp: 1.5 }),
+    /timestamp must be a safe integer/,
+  );
+  assert.throws(
+    () => createLitematicFromDocument(document, { author: "界".repeat(22_000), timestamp: 1 }),
+    /UTF-8 string limit/,
+  );
+  await assert.rejects(
+    () => streamLitematicFromDocument(document, () => undefined, {
+      timestamp: 1,
+      signal: AbortSignal.abort(new DOMException("cancelled", "AbortError")),
+    }),
+    /cancelled/,
+  );
+});
+
 test("coordinate isolation cannot be bypassed by direct serialization", () => {
   const result: HologramResult = {
     positions: Float32Array.from([0, 0, 0, 1, 0, 0]),
@@ -195,11 +421,22 @@ test("direct Litematica serialization still rejects injected adjacency", () => {
   ], [
     { blockId: "minecraft:end_rod" },
     { blockId: "minecraft:white_stained_glass_pane" },
-  ]);
+  ], { metadata: { source: "hologram" } });
   assert.throws(
     () => createLitematicFromDocument(adjacent),
     /six-way isolation/,
   );
+});
+
+test("solid Litematica may use adjacent light blocks without inheriting hologram isolation", () => {
+  const solid = createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [1, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:end_rod" }], {
+    metadata: { source: "solid", generationMode: "solid" },
+  });
+
+  assert.doesNotThrow(() => createLitematicFromDocument(solid, { timestamp: 1 }));
 });
 
 test("direct Litematica serialization rejects block ids absent from the compatibility registry", () => {

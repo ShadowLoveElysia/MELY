@@ -616,6 +616,58 @@ input:focus-visible {
   white-space: nowrap;
 }
 
+.model-parts__selection {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 9px;
+  border-bottom: 1px solid #26323a;
+  color: #81919a;
+  background: #11191f;
+  font-size: var(--sidebar-text-xs);
+}
+
+.model-parts__selection-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.model-parts__selection-copy > strong,
+.model-parts__selection-copy > small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-parts__selection-copy > strong { color: #b8c8ce; font-weight: 600; }
+.model-parts__selection-copy > small { color: #d4a66a; }
+
+.model-parts__selection > button {
+  display: inline-flex;
+  min-height: 28px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border: 1px solid #4a6672;
+  border-radius: 3px;
+  color: #c6d6dc;
+  background: #1b2930;
+  cursor: pointer;
+  font-size: var(--sidebar-text-xs);
+}
+
+.model-parts__selection > button:hover:not(:disabled) { background: #223640; }
+.model-parts__selection > button:disabled { cursor: default; opacity: 0.42; }
+.model-parts__selection > button:focus-visible {
+  outline: 2px solid #71d7e1;
+  outline-offset: 2px;
+}
+
 .model-parts__list--expanded {
   max-height: 260px;
   overflow: hidden auto;
@@ -639,6 +691,15 @@ input:focus-visible {
 .model-part:hover { background: #1a252c; }
 .model-part--hidden { background: #211c1d; }
 .model-part--hidden:hover { background: #282022; }
+.model-part--selected {
+  background: #172a31;
+  box-shadow: inset 3px 0 #71d7e1, inset 0 0 0 1px #3d6973;
+}
+.model-part--selected:hover { background: #1b323a; }
+.model-part--selected.model-part--hidden {
+  background: #292226;
+  box-shadow: inset 3px 0 #71d7e1, inset 0 0 0 1px #74515a;
+}
 
 .model-part input {
   width: 13px;
@@ -648,6 +709,10 @@ input:focus-visible {
 }
 
 .model-part input:disabled { cursor: default; }
+.model-part input:focus-visible {
+  outline: 2px solid #d8f6f8;
+  outline-offset: 2px;
+}
 
 .model-part__swatch {
   width: 16px;
@@ -683,6 +748,16 @@ input:focus-visible {
   font-size: 7px;
   white-space: nowrap;
 }
+
+.model-part__statuses {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+.model-part__status--selected { color: #8edbe3; }
 
 .motion-control {
   overflow: hidden;
@@ -1794,6 +1869,38 @@ select:focus-visible { border-color: #71d7e1; }
 .viewport-motion__transport { gap: 4px; }
 .viewport-motion__scrubber { gap: 10px; }
 .viewport-motion__scrubber input { min-width: 0; flex: 1; }
+.viewport-motion__frame-input {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+.viewport-motion__frame-input > span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.viewport-motion__frame-input input {
+  width: 72px;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid #35444e;
+  border-radius: 3px;
+  outline: 0;
+  color: #cbd7dd;
+  background: #0d1317;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9px;
+  text-align: right;
+}
+.viewport-motion__frame-input input:focus-visible {
+  border-color: #71d7e1;
+  outline: 2px solid #71d7e1;
+  outline-offset: 1px;
+}
+.viewport-motion__frame-input input:disabled { opacity: 0.38; }
 .viewport-motion__scrubber output {
   min-width: max-content;
   color: #9caab3;
@@ -2115,6 +2222,38 @@ kbd {
 }
 
 .risk-acknowledgement input { flex: 0 0 auto; width: 15px; height: 15px; margin: 2px 0 0; accent-color: #d49d3d; }
+
+.generation-resource-risk__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.generation-resource-risk__facts > div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #51442d;
+  border-radius: 4px;
+  background: #191711;
+}
+
+.generation-resource-risk__facts dt {
+  color: #9c8c68;
+  font-size: 10px;
+}
+
+.generation-resource-risk__facts dd {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  color: #f0d394;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+}
+
+@media (max-width: 520px) {
+  .generation-resource-risk__facts { grid-template-columns: 1fr; }
+}
 
 .extreme-export-phrase {
   display: grid;

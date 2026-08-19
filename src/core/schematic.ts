@@ -1,4 +1,5 @@
 import { Int, Short, encode, type TagObject } from "nbt-ts";
+import { Buffer } from "buffer";
 import { gzip } from "pako";
 import type {
   ProjectionBlockState,
@@ -7,6 +8,7 @@ import type {
 import { resolveBlockId } from "./blockRegistry";
 import {
   assertJavaProjectionExportSafety,
+  DENSE_NBT_ARRAY_LENGTH_LIMIT,
   type JavaProjectionExportSafetyInput,
 } from "./exportPreflight";
 import { iterateProjectionBlocks } from "./projectionDocument";
@@ -36,8 +38,6 @@ interface IndexedBlock {
   linearIndex: number;
   paletteIndex: number;
 }
-
-const DEFAULT_MAX_VOLUME = 64 * 1024 * 1024;
 
 const stateString = (state: ProjectionBlockState, version: string) => {
   const blockId = resolveBlockId(state.blockId, "java", version);
@@ -95,6 +95,19 @@ const sanitizeText = (value: string | undefined, fallback: string) => {
   return normalized || fallback;
 };
 
+const encodeNbt = (name: string, root: TagObject) => {
+  const runtime = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
+  const previousBuffer = runtime.Buffer;
+  // nbt-ts 内部依赖 Node Buffer，浏览器导出期间按同步调用范围提供兼容实现。
+  runtime.Buffer = Buffer;
+  try {
+    return encode(name, root);
+  } finally {
+    if (previousBuffer === undefined) Reflect.deleteProperty(runtime, "Buffer");
+    else runtime.Buffer = previousBuffer;
+  }
+};
+
 export const createSchematic = (
   document: ProjectionDocument,
   options: SchematicExportOptions = {},
@@ -117,10 +130,22 @@ export const createSchematic = (
     }
   });
   const [width, height, length] = dimensions;
+  document.bounds.min.forEach((coordinate) => {
+    if (!Number.isInteger(coordinate) || coordinate < -0x8000_0000 || coordinate > 0x7fff_ffff) {
+      throw new RangeError("Sponge schematic offset must fit signed 32-bit NBT integers");
+    }
+  });
   const volume = width * height * length;
-  const maxVolume = options.maxVolume ?? DEFAULT_MAX_VOLUME;
-  if (!Number.isSafeInteger(volume) || volume > maxVolume) {
-    throw new RangeError(`Sponge schematic volume ${volume} exceeds limit ${maxVolume}`);
+  if (!Number.isSafeInteger(volume) || volume <= 0 || volume > DENSE_NBT_ARRAY_LENGTH_LIMIT) {
+    throw new RangeError(
+      `Sponge schematic volume ${volume} exceeds the NBT array length limit ${DENSE_NBT_ARRAY_LENGTH_LIMIT}`,
+    );
+  }
+  if (
+    options.maxVolume !== undefined
+    && (!Number.isSafeInteger(options.maxVolume) || options.maxVolume <= 0)
+  ) {
+    throw new RangeError("Sponge schematic volume warning threshold must be a positive safe integer");
   }
 
   const { states, sourceIndices } = buildPalette(document);
@@ -140,7 +165,13 @@ export const createSchematic = (
 
   let dataLength = volume;
   indexedBlocks.forEach((block) => {
-    dataLength += varIntLength(block.paletteIndex) - 1;
+    const extra = varIntLength(block.paletteIndex) - 1;
+    if (dataLength > DENSE_NBT_ARRAY_LENGTH_LIMIT - extra) {
+      throw new RangeError(
+        `Sponge schematic BlockData exceeds the NBT byte-array length limit ${DENSE_NBT_ARRAY_LENGTH_LIMIT}`,
+      );
+    }
+    dataLength += extra;
   });
   const blockData = new Int8Array(dataLength);
   let cursor = 0;
@@ -185,7 +216,7 @@ export const createSchematic = (
     },
     Entities: [],
   };
-  const bytes = gzip(encode("Schematic", root), { level: 9 });
+  const bytes = gzip(encodeNbt("Schematic", root), { level: 9 });
   return {
     bytes,
     summary: {

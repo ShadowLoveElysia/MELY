@@ -11,6 +11,16 @@ export interface ZipStreamOptions {
   maxOutputBytes?: number;
   signal?: AbortSignal;
   inputChunkBytes?: number;
+  /** 仅供边界测试注入 ZIP32 计数初值，不应用于生产调用。 */
+  zip32TestState?: Zip32TestState;
+}
+
+export interface Zip32TestState {
+  entryCount?: number;
+  localOffset?: number;
+  centralDirectorySize?: number;
+  entryUncompressedSize?: number;
+  entryCompressedSize?: number;
 }
 
 export interface ZipStreamSummary {
@@ -29,8 +39,103 @@ export interface ZipStreamDiagnostics {
   peakPendingOutputBytes: number;
 }
 
-export const MAX_ZIP32_OUTPUT_BYTES = 0xffff_ffff - 65_536;
+export const MAX_ZIP32_VALUE = 0xffff_ffff;
+export const MAX_ZIP32_ENTRIES = 0xffff;
+export const MAX_ZIP32_NAME_BYTES = 0xffff;
+export const MAX_ZIP32_OUTPUT_BYTES = MAX_ZIP32_VALUE;
 export const DEFAULT_ZIP_INPUT_CHUNK_BYTES = 256 * 1024;
+
+const ZIP_LOCAL_HEADER_FIXED_BYTES = 30;
+const ZIP_DATA_DESCRIPTOR_BYTES = 16;
+const ZIP_CENTRAL_HEADER_FIXED_BYTES = 46;
+const ZIP_END_RECORD_BYTES = 22;
+const utf8Encoder = new TextEncoder();
+
+interface Zip32State {
+  entryCount: number;
+  localOffset: number;
+  centralDirectorySize: number;
+}
+
+export interface Zip32EntryCheck {
+  nameBytes: number;
+  uncompressedSize: number;
+  compressedSize: number;
+}
+
+const zip32Error = (field: string, value: number, maximum: number) => new RangeError(
+  `ZIP32 ${field} ${value} exceeds maximum ${maximum}`,
+);
+
+const zip32Integer = (value: number, field: string) => {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`ZIP32 ${field} must be a non-negative safe integer`);
+  }
+  return value;
+};
+
+const checkedZip32Sum = (field: string, maximum: number, ...values: number[]) => {
+  const sum = values.reduce((total, value) => total + zip32Integer(value, field), 0);
+  if (!Number.isSafeInteger(sum) || sum > maximum) throw zip32Error(field, sum, maximum);
+  return sum;
+};
+
+export const assertZip32Entry = (
+  state: Readonly<Zip32State>,
+  entry: Readonly<Zip32EntryCheck>,
+): Zip32State => {
+  const entryCount = checkedZip32Sum("entry count", MAX_ZIP32_ENTRIES, state.entryCount, 1);
+  const nameBytes = zip32Integer(entry.nameBytes, "UTF-8 filename length");
+  if (nameBytes > MAX_ZIP32_NAME_BYTES) {
+    throw zip32Error("UTF-8 filename length", nameBytes, MAX_ZIP32_NAME_BYTES);
+  }
+  const uncompressedSize = zip32Integer(entry.uncompressedSize, "uncompressed entry size");
+  if (uncompressedSize > MAX_ZIP32_VALUE) {
+    throw zip32Error("uncompressed entry size", uncompressedSize, MAX_ZIP32_VALUE);
+  }
+  const compressedSize = zip32Integer(entry.compressedSize, "compressed entry size");
+  if (compressedSize > MAX_ZIP32_VALUE) {
+    throw zip32Error("compressed entry size", compressedSize, MAX_ZIP32_VALUE);
+  }
+  const localRecordSize = checkedZip32Sum(
+    "local record size",
+    MAX_ZIP32_VALUE,
+    ZIP_LOCAL_HEADER_FIXED_BYTES,
+    nameBytes,
+    compressedSize,
+    ZIP_DATA_DESCRIPTOR_BYTES,
+  );
+  const localOffset = checkedZip32Sum(
+    "local data offset",
+    MAX_ZIP32_VALUE,
+    state.localOffset,
+    localRecordSize,
+  );
+  const centralDirectorySize = checkedZip32Sum(
+    "central directory size",
+    MAX_ZIP32_VALUE,
+    state.centralDirectorySize,
+    ZIP_CENTRAL_HEADER_FIXED_BYTES,
+    nameBytes,
+  );
+  checkedZip32Sum(
+    "central directory offset",
+    MAX_ZIP32_VALUE,
+    localOffset,
+    centralDirectorySize,
+    ZIP_END_RECORD_BYTES,
+  );
+  return { entryCount, localOffset, centralDirectorySize };
+};
+
+const initialZip32State = (testState?: Zip32TestState): Zip32State => ({
+  entryCount: zip32Integer(testState?.entryCount ?? 0, "entry count"),
+  localOffset: zip32Integer(testState?.localOffset ?? 0, "local data offset"),
+  centralDirectorySize: zip32Integer(
+    testState?.centralDirectorySize ?? 0,
+    "central directory size",
+  ),
+});
 
 const outputLimit = (maximum?: number) => {
   const resolved = Math.min(maximum ?? MAX_ZIP32_OUTPUT_BYTES, MAX_ZIP32_OUTPUT_BYTES);
@@ -79,8 +184,10 @@ export const createZipStreamWriter = (
 ) => {
   const maximumOutput = outputLimit(options.maxOutputBytes);
   const maximumInputChunk = inputChunkSize(options.inputChunkBytes);
+  let zip32State = initialZip32State(options.zip32TestState);
   let bytesWritten = 0;
   let fileCount = 0;
+  let currentEntryCompressedSize = 0;
   let failure: unknown;
   let inputChunksPushed = 0;
   let pendingInputBytes = 0;
@@ -106,6 +213,7 @@ export const createZipStreamWriter = (
   const archive = new Zip((error, chunk, final) => {
     const ownedChunk = chunk?.byteLength ? chunk.slice() : undefined;
     if (ownedChunk) {
+      if (state === "open") currentEntryCompressedSize += ownedChunk.byteLength;
       pendingOutputChunks += 1;
       pendingOutputBytes += ownedChunk.byteLength;
       peakPendingOutputChunks = Math.max(peakPendingOutputChunks, pendingOutputChunks);
@@ -163,6 +271,17 @@ export const createZipStreamWriter = (
     if (state !== "open") throw new Error(`ZIP writer is ${state}`);
     throwIfAborted(options.signal);
     await waitForOutput();
+    const nameBytes = utf8Encoder.encode(path).byteLength;
+    const uncompressedSize = options.zip32TestState?.entryUncompressedSize ?? bytes.byteLength;
+    if (nameBytes > MAX_ZIP32_NAME_BYTES) {
+      throw zip32Error("UTF-8 filename length", nameBytes, MAX_ZIP32_NAME_BYTES);
+    }
+    if (uncompressedSize > MAX_ZIP32_VALUE) {
+      throw zip32Error("uncompressed entry size", uncompressedSize, MAX_ZIP32_VALUE);
+    }
+    // 已知字段在交给 fflate 前验证，避免其 16/32 位写入发生静默截断。
+    assertZip32Entry(zip32State, { nameBytes, uncompressedSize, compressedSize: 0 });
+    currentEntryCompressedSize = 0;
     const input = compress
       ? new ZipDeflate(path, { level: 6 })
       : new ZipPassThrough(path);
@@ -204,6 +323,20 @@ export const createZipStreamWriter = (
     }
     await Promise.race([completed, failed]);
     await waitForOutput();
+    const emittedLocalRecordBytes = currentEntryCompressedSize;
+    currentEntryCompressedSize = 0;
+    const compressedSize = options.zip32TestState?.entryCompressedSize
+      ?? emittedLocalRecordBytes - ZIP_LOCAL_HEADER_FIXED_BYTES - nameBytes - ZIP_DATA_DESCRIPTOR_BYTES;
+    try {
+      zip32State = assertZip32Entry(zip32State, {
+        nameBytes,
+        uncompressedSize,
+        compressedSize,
+      });
+    } catch (error) {
+      setFailure(error);
+      throw error;
+    }
     fileCount += 1;
   };
 
@@ -220,6 +353,13 @@ export const createZipStreamWriter = (
       throwIfFailed();
       if (state !== "open") throw new Error(`ZIP writer is ${state}`);
       throwIfAborted(options.signal);
+      checkedZip32Sum(
+        "central directory offset",
+        MAX_ZIP32_VALUE,
+        zip32State.localOffset,
+        zip32State.centralDirectorySize,
+        ZIP_END_RECORD_BYTES,
+      );
       state = "closing";
       archive.end();
       await Promise.race([closed, failed]);
@@ -246,8 +386,12 @@ export const createZipStreamWriter = (
   };
 };
 
-export const createZipCollector = (options: Pick<ZipStreamOptions, "maxOutputBytes"> = {}) => {
+export const createZipCollector = (options: Pick<
+  ZipStreamOptions,
+  "maxOutputBytes" | "zip32TestState"
+> = {}) => {
   const maximumOutput = outputLimit(options.maxOutputBytes);
+  let zip32State = initialZip32State(options.zip32TestState);
   const chunks: Uint8Array[] = [];
   let bytesWritten = 0;
   let fileCount = 0;
@@ -273,6 +417,16 @@ export const createZipCollector = (options: Pick<ZipStreamOptions, "maxOutputByt
   return {
     add: (path: string, bytes: Uint8Array, compress = true) => {
       assertHealthy();
+      const nameBytes = utf8Encoder.encode(path).byteLength;
+      const uncompressedSize = options.zip32TestState?.entryUncompressedSize ?? bytes.byteLength;
+      if (nameBytes > MAX_ZIP32_NAME_BYTES) {
+        throw zip32Error("UTF-8 filename length", nameBytes, MAX_ZIP32_NAME_BYTES);
+      }
+      if (uncompressedSize > MAX_ZIP32_VALUE) {
+        throw zip32Error("uncompressed entry size", uncompressedSize, MAX_ZIP32_VALUE);
+      }
+      assertZip32Entry(zip32State, { nameBytes, uncompressedSize, compressedSize: 0 });
+      const entryStart = bytesWritten;
       const input = compress
         ? new ZipDeflate(path, { level: 6 })
         : new ZipPassThrough(path);
@@ -285,9 +439,29 @@ export const createZipCollector = (options: Pick<ZipStreamOptions, "maxOutputByt
           assertHealthy();
         }
       }
+      const emittedLocalRecordBytes = bytesWritten - entryStart;
+      const compressedSize = options.zip32TestState?.entryCompressedSize
+        ?? emittedLocalRecordBytes - ZIP_LOCAL_HEADER_FIXED_BYTES - nameBytes - ZIP_DATA_DESCRIPTOR_BYTES;
+      try {
+        zip32State = assertZip32Entry(zip32State, {
+          nameBytes,
+          uncompressedSize,
+          compressedSize,
+        });
+      } catch (zip32Failure) {
+        error = zip32Failure;
+        throw zip32Failure;
+      }
       fileCount += 1;
     },
     close: () => {
+      checkedZip32Sum(
+        "central directory offset",
+        MAX_ZIP32_VALUE,
+        zip32State.localOffset,
+        zip32State.centralDirectorySize,
+        ZIP_END_RECORD_BYTES,
+      );
       archive.end();
       assertHealthy();
       if (!finished) throw new Error("ZIP collector did not finish synchronously");

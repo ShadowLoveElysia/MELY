@@ -8,6 +8,8 @@ import {
   ChevronUp,
   CircleCheck,
   Download,
+  Eye,
+  EyeOff,
   FileBox,
   FolderOpen,
   GripVertical,
@@ -24,7 +26,7 @@ import {
   UserRound,
   WandSparkles,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, DragEvent, KeyboardEvent, PointerEvent } from "react";
 import { orderModelParts } from "../core/modelParts";
 import { useI18n } from "../i18n/I18nProvider";
@@ -65,6 +67,8 @@ interface SidebarProps {
   bones: readonly MmdBoneInfo[];
   materials: readonly MmdMaterialInfo[];
   hiddenMaterialIndices: readonly number[];
+  selectedMaterialIndex: number | null;
+  materialSelectionRequestId: number;
   selectedBoneIndex: number | null;
   poseEditing: boolean;
   poseState: MmdPoseState;
@@ -78,6 +82,7 @@ interface SidebarProps {
   heightMaximum: number;
   extendedHeightUnlocked: boolean;
   experimentalHeightActive: boolean;
+  experimentalHeightConfirmed: boolean;
   extendedHeightActive: boolean;
   targetDimensionMinY: number | null;
   targetDimensionHeight: number | null;
@@ -100,6 +105,7 @@ interface SidebarProps {
   onAssetsAdded: (files: File[]) => void | Promise<void>;
   onPhysicsEnabledChange: (enabled: boolean) => void | Promise<void>;
   onMaterialVisibilityChange: (index: number, visible: boolean) => void;
+  onMaterialSelectionChange?: (index: number | null) => void;
   onSidebarResizeStart: (event: PointerEvent<HTMLDivElement>) => void;
   onSidebarResizeStep: (delta: number) => void;
   onSidebarResizeReset: () => void;
@@ -137,6 +143,8 @@ export function Sidebar({
   bones,
   materials,
   hiddenMaterialIndices,
+  selectedMaterialIndex,
+  materialSelectionRequestId,
   selectedBoneIndex,
   poseEditing,
   poseState,
@@ -150,6 +158,7 @@ export function Sidebar({
   heightMaximum,
   extendedHeightUnlocked,
   experimentalHeightActive,
+  experimentalHeightConfirmed,
   extendedHeightActive,
   targetDimensionMinY,
   targetDimensionHeight,
@@ -172,6 +181,7 @@ export function Sidebar({
   onAssetsAdded,
   onPhysicsEnabledChange,
   onMaterialVisibilityChange,
+  onMaterialSelectionChange,
   onSidebarResizeStart,
   onSidebarResizeStep,
   onSidebarResizeReset,
@@ -196,7 +206,13 @@ export function Sidebar({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const poseInputRef = useRef<HTMLInputElement>(null);
+  const materialRowRefs = useRef(new Map<number, HTMLLabelElement>());
+  const materialCheckboxRefs = useRef(new Map<number, HTMLInputElement>());
+  const handledMaterialSelectionRequestRef = useRef(0);
+  const pendingMaterialSelectionRequestRef = useRef<number | null>(null);
+  const previousMaterialsRef = useRef(materials);
   const [dragging, setDragging] = useState(false);
+  const [assetsSectionOpen, setAssetsSectionOpen] = useState(true);
   const [partsExpanded, setPartsExpanded] = useState(false);
   const selectedBone = selectedBoneIndex === null ? null : bones[selectedBoneIndex] ?? null;
   const boneDisplayName = (bone: MmdBoneInfo) => bone.displayName
@@ -210,6 +226,17 @@ export function Sidebar({
   const visibleMaterialCount = materials.length - hiddenMaterialCount;
   const orderedMaterials = orderModelParts(materials, hiddenMaterials);
   const displayedMaterials = partsExpanded ? orderedMaterials : orderedMaterials.slice(0, 3);
+  const selectedMaterial = selectedMaterialIndex === null
+    ? null
+    : materials.find((material) => material.index === selectedMaterialIndex) ?? null;
+  const selectedMaterialHidden = selectedMaterial
+    ? hiddenMaterials.has(selectedMaterial.index)
+    : false;
+  const selectedMaterialCannotHide = Boolean(
+    selectedMaterial
+    && !selectedMaterialHidden
+    && visibleMaterialCount <= 1,
+  );
   const unlockedMotionTracks = (["dance", "expression"] as const)
     .filter((kind) => motionTracks[kind] && lockedMotionFrames[kind] === null)
     .map((kind) => t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack"));
@@ -242,7 +269,52 @@ export function Sidebar({
     input.setAttribute("directory", "");
   }, []);
 
-  useEffect(() => setPartsExpanded(false), [materials]);
+  useEffect(() => {
+    if (previousMaterialsRef.current === materials) return;
+    previousMaterialsRef.current = materials;
+    setPartsExpanded(false);
+  }, [materials]);
+
+  useLayoutEffect(() => {
+    if (
+      materialSelectionRequestId <= 0
+      || materialSelectionRequestId === handledMaterialSelectionRequestRef.current
+      || selectedMaterialIndex === null
+    ) return;
+
+    handledMaterialSelectionRequestRef.current = materialSelectionRequestId;
+    pendingMaterialSelectionRequestRef.current = materialSelectionRequestId;
+    setAssetsSectionOpen(true);
+    setPartsExpanded(true);
+  }, [materialSelectionRequestId, selectedMaterialIndex]);
+
+  useLayoutEffect(() => {
+    if (
+      pendingMaterialSelectionRequestRef.current !== materialSelectionRequestId
+      || selectedMaterialIndex === null
+      || !assetsSectionOpen
+      || !partsExpanded
+    ) return;
+
+    const row = materialRowRefs.current.get(selectedMaterialIndex);
+    const checkbox = materialCheckboxRefs.current.get(selectedMaterialIndex);
+    if (!row || !checkbox) return;
+
+    row.scrollIntoView({ block: "nearest", behavior: "auto" });
+    checkbox.focus({ preventScroll: true });
+    pendingMaterialSelectionRequestRef.current = null;
+  }, [assetsSectionOpen, materialSelectionRequestId, partsExpanded, selectedMaterialIndex]);
+
+  const onSidebarKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Escape" || selectedMaterialIndex === null || !onMaterialSelectionChange) return;
+    const target = event.target;
+    if (
+      target instanceof HTMLElement
+      && (target.isContentEditable || target.matches('input:not([type="checkbox"]), textarea, select'))
+    ) return;
+    event.preventDefault();
+    onMaterialSelectionChange(null);
+  };
 
   const addFiles = (files: FileList | null) => {
     if (!files?.length || modelLoading) return;
@@ -262,6 +334,7 @@ export function Sidebar({
     <aside
       className="sidebar"
       aria-label={t("sidebar.aria")}
+      onKeyDown={onSidebarKeyDown}
       style={{
         "--sidebar-width": `${sidebarWidth}px`,
         "--sidebar-ui-scale": sidebarUiScale,
@@ -296,7 +369,13 @@ export function Sidebar({
             </select>
           </Field>
         </div>
-        <Section index="01" title={t("sidebar.section.assets")} subtitle={t("sidebar.section.assetsSubtitle")}>
+        <Section
+          index="01"
+          title={t("sidebar.section.assets")}
+          subtitle={t("sidebar.section.assetsSubtitle")}
+          open={assetsSectionOpen}
+          onOpenChange={setAssetsSectionOpen}
+        >
           <div
             className={`drop-zone ${dragging ? "drop-zone--active" : ""} ${modelLoading ? "drop-zone--loading" : ""}`}
             aria-busy={modelLoading}
@@ -435,6 +514,43 @@ export function Sidebar({
                     : null}
                 </span>
               </button>
+              <div className="model-parts__selection" aria-live="polite" aria-atomic="true">
+                {selectedMaterial ? (
+                  <>
+                    <span className="model-parts__selection-copy">
+                      <strong>{t("sidebar.parts.selectedName", {
+                        name: selectedMaterial.displayName
+                          || t("model.materialFallback", { index: number(selectedMaterial.index + 1) }),
+                      })}</strong>
+                      {selectedMaterialCannotHide
+                        ? <small>{t("sidebar.parts.keepOne")}</small>
+                        : null}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={selectedMaterialCannotHide || modelLoading || processing || exporting}
+                      title={selectedMaterialCannotHide
+                        ? t("sidebar.parts.keepOne")
+                        : t(selectedMaterialHidden
+                          ? "sidebar.parts.showSelected"
+                          : "sidebar.parts.hideSelected")}
+                      onClick={() => onMaterialVisibilityChange(
+                        selectedMaterial.index,
+                        selectedMaterialHidden,
+                      )}
+                    >
+                      {selectedMaterialHidden
+                        ? <Eye aria-hidden="true" size={13} />
+                        : <EyeOff aria-hidden="true" size={13} />}
+                      {t(selectedMaterialHidden
+                        ? "sidebar.parts.showSelected"
+                        : "sidebar.parts.hideSelected")}
+                    </button>
+                  </>
+                ) : (
+                  <span>{t("sidebar.parts.selectHint")}</span>
+                )}
+              </div>
               <div
                 id="model-parts-list"
                 className={`model-parts__list ${partsExpanded ? "model-parts__list--expanded" : ""}`}
@@ -444,16 +560,27 @@ export function Sidebar({
                   const displayName = material.displayName
                     || t("model.materialFallback", { index: number(material.index + 1) });
                   const cannotHide = !hidden && visibleMaterialCount <= 1;
+                  const selected = material.index === selectedMaterialIndex;
                   return (
                     <label
-                      className={`model-part ${hidden ? "model-part--hidden" : ""}`}
+                      ref={(node) => {
+                        if (node) materialRowRefs.current.set(material.index, node);
+                        else materialRowRefs.current.delete(material.index);
+                      }}
+                      className={`model-part${selected ? " model-part--selected" : ""}${hidden ? " model-part--hidden" : ""}`}
                       key={material.index}
+                      data-material-index={material.index}
                       title={cannotHide ? t("sidebar.parts.keepOne") : displayName}
+                      aria-current={selected ? "true" : undefined}
                     >
                       <input
+                        ref={(node) => {
+                          if (node) materialCheckboxRefs.current.set(material.index, node);
+                          else materialCheckboxRefs.current.delete(material.index);
+                        }}
                         type="checkbox"
                         checked={!hidden}
-                        disabled={cannotHide || modelLoading || processing}
+                        disabled={cannotHide || modelLoading || processing || exporting}
                         onChange={(event) => onMaterialVisibilityChange(material.index, event.target.checked)}
                       />
                       <span
@@ -466,7 +593,12 @@ export function Sidebar({
                           index: material.index.toString().padStart(2, "0"),
                         })}</small>
                       </span>
-                      {hidden ? <small className="model-part__status">{t("sidebar.parts.hidden")}</small> : null}
+                      <span className="model-part__statuses">
+                        {selected
+                          ? <small className="model-part__status model-part__status--selected">{t("sidebar.parts.selected")}</small>
+                          : null}
+                        {hidden ? <small className="model-part__status">{t("sidebar.parts.hidden")}</small> : null}
+                      </span>
                     </label>
                   );
                 })}
@@ -678,7 +810,7 @@ export function Sidebar({
                   />
                 </label>
               </div>
-              {!experimentalHeightActive ? (
+              {!experimentalHeightActive || !experimentalHeightConfirmed ? (
                 <button
                   type="button"
                   className="height-unlock"
@@ -686,7 +818,9 @@ export function Sidebar({
                   onClick={onExperimentalHeightUnlock}
                 >
                   <Lock size={15} />
-                  <span>{t("sidebar.scale.experimental4064")}</span>
+                  <span>{t(experimentalHeightActive
+                    ? "sidebar.scale.experimental4064Reconfirm"
+                    : "sidebar.scale.experimental4064")}</span>
                 </button>
               ) : null}
             </>

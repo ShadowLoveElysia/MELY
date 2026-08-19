@@ -8,6 +8,10 @@ export default defineConfig({
   base: "./",
   clearScreen: false,
   plugins: [react()],
+  // Schematic 是动态模块，预构建 Buffer 兼容层可避免首次导出时 Vite 重载应用。
+  optimizeDeps: {
+    include: ["buffer"],
+  },
   server: {
     host: tauriHost || "127.0.0.1",
     port: 4173,

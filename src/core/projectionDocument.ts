@@ -9,6 +9,7 @@ import type {
   ProjectionMaterialCount,
   ProjectionResult,
   ProjectionView,
+  SolidVoxelChunk,
   SolidVoxelResult,
 } from "../types";
 import { DEFAULT_BEDROCK_VERSION, DEFAULT_MINECRAFT_VERSION } from "./minecraftVersions";
@@ -19,11 +20,6 @@ export const PROJECTION_CHUNK_SIZE = 32;
 
 type Point = [number, number, number];
 type MaxSize = number | Point;
-
-interface MutableChunkBlock {
-  localPosition: number;
-  paletteIndex: number;
-}
 
 interface MutableView {
   index: Point;
@@ -36,6 +32,11 @@ const axisIndex = (axis: ProjectionAxis) => axis === "x" ? 0 : axis === "y" ? 1 
 
 const compareYzx = (left: Point, right: Point) =>
   left[1] - right[1] || left[2] - right[2] || left[0] - right[0];
+
+const compareChunkYzx = (
+  left: { chunk: Point },
+  right: { chunk: Point },
+) => compareYzx(left.chunk, right.chunk);
 
 const floorDiv = (value: number, divisor: number) => Math.floor(value / divisor);
 
@@ -82,6 +83,30 @@ const roundedPosition = (positions: Float32Array, index: number): Point => [
   Math.round(positions[index * 3 + 1]),
   Math.round(positions[index * 3 + 2]),
 ];
+
+const projectionOptions = (
+  palette: readonly ProjectionBlockState[],
+  options: ProjectionDocumentOptions,
+) => {
+  const edition = options.edition ?? "java";
+  return {
+    edition,
+    minecraftVersion: options.minecraftVersion ?? (
+      edition === "bedrock" ? DEFAULT_BEDROCK_VERSION.id : DEFAULT_MINECRAFT_VERSION.id
+    ),
+    metadata: options.metadata ? { ...options.metadata } : undefined,
+    palette: palette.map(cloneState),
+  };
+};
+
+const assertProjectionPalette = (
+  palette: readonly ProjectionBlockState[],
+  context: string,
+) => {
+  if (palette.length > 0x1_0000) {
+    throw new RangeError(`${context} palette exceeds the Uint16 index range`);
+  }
+};
 
 const materialFacingState = (material: number, facing: number): ProjectionBlockState => {
   if (material === 0) {
@@ -148,9 +173,12 @@ export const createProjectionDocument = (
   palette: readonly ProjectionBlockState[],
   options: ProjectionDocumentOptions = {},
 ): ProjectionDocument => {
-  const edition = options.edition ?? "java";
-  const clonedPalette = palette.map(cloneState);
-  const chunks = new Map<string, { chunk: Point; blocks: MutableChunkBlock[] }>();
+  const resolved = projectionOptions(palette, options);
+  const chunks = new Map<string, {
+    chunk: Point;
+    positions: number[];
+    paletteIndices: number[];
+  }>();
   const min: Point = [Infinity, Infinity, Infinity];
   const max: Point = [-Infinity, -Infinity, -Infinity];
   let blockCount = 0;
@@ -158,7 +186,7 @@ export const createProjectionDocument = (
   for (const block of blocks) {
     const position = [...block.position] as Point;
     position.forEach((value, index) => assertCoordinate(value, "xyz"[index]));
-    if (!Number.isInteger(block.paletteIndex) || !clonedPalette[block.paletteIndex]) {
+    if (!Number.isInteger(block.paletteIndex) || !resolved.palette[block.paletteIndex]) {
       throw new RangeError(`Unknown projection palette index: ${block.paletteIndex}`);
     }
 
@@ -168,13 +196,11 @@ export const createProjectionDocument = (
     const key = chunkKey(chunk);
     let target = chunks.get(key);
     if (!target) {
-      target = { chunk, blocks: [] };
+      target = { chunk, positions: [], paletteIndices: [] };
       chunks.set(key, target);
     }
-    target.blocks.push({
-      localPosition: encodeLocalPosition(local[0], local[1], local[2]),
-      paletteIndex: block.paletteIndex,
-    });
+    target.positions.push(encodeLocalPosition(local[0], local[1], local[2]));
+    target.paletteIndices.push(block.paletteIndex);
     for (let axis = 0; axis < 3; axis += 1) {
       min[axis] = Math.min(min[axis], position[axis]);
       max[axis] = Math.max(max[axis], position[axis]);
@@ -183,13 +209,20 @@ export const createProjectionDocument = (
   }
 
   const sortedChunks = [...chunks.values()]
-    .sort((left, right) => compareYzx(left.chunk, right.chunk))
-    .map(({ chunk, blocks: chunkBlocks }) => {
-      chunkBlocks.sort((left, right) =>
-        left.localPosition - right.localPosition || left.paletteIndex - right.paletteIndex);
-      for (let index = 1; index < chunkBlocks.length; index += 1) {
-        if (chunkBlocks[index - 1].localPosition === chunkBlocks[index].localPosition) {
-          const local = decodeLocalPosition(chunkBlocks[index].localPosition);
+    .sort(compareChunkYzx)
+    .map(({ chunk, positions, paletteIndices }) => {
+      const order = Uint16Array.from(positions.keys());
+      order.sort((left, right) =>
+        positions[left] - positions[right] || paletteIndices[left] - paletteIndices[right]);
+      const sortedPositions = new Uint16Array(order.length);
+      const sortedPaletteIndices = resolved.palette.length <= 0x1_0000
+        ? new Uint16Array(order.length)
+        : new Uint32Array(order.length);
+      for (let index = 0; index < order.length; index += 1) {
+        sortedPositions[index] = positions[order[index]];
+        sortedPaletteIndices[index] = paletteIndices[order[index]];
+        if (index > 0 && sortedPositions[index - 1] === sortedPositions[index]) {
+          const local = decodeLocalPosition(sortedPositions[index]);
           throw new Error(
             `Duplicate projection block at ${chunk[0] * PROJECTION_CHUNK_SIZE + local[0]},`
             + `${chunk[1] * PROJECTION_CHUNK_SIZE + local[1]},`
@@ -197,25 +230,20 @@ export const createProjectionDocument = (
           );
         }
       }
-      const paletteIndices = clonedPalette.length <= 0x1_0000
-        ? Uint16Array.from(chunkBlocks, (block) => block.paletteIndex)
-        : Uint32Array.from(chunkBlocks, (block) => block.paletteIndex);
       return {
         chunk: [...chunk] as Point,
-        positions: Uint16Array.from(chunkBlocks, (block) => block.localPosition),
-        paletteIndices,
+        positions: sortedPositions,
+        paletteIndices: sortedPaletteIndices,
       };
     });
 
   return {
     format: "MELYProjection",
     version: PROJECTION_DOCUMENT_VERSION,
-    edition,
-    minecraftVersion: options.minecraftVersion ?? (
-      edition === "bedrock" ? DEFAULT_BEDROCK_VERSION.id : DEFAULT_MINECRAFT_VERSION.id
-    ),
-    ...(options.metadata ? { metadata: { ...options.metadata } } : {}),
-    palette: clonedPalette,
+    edition: resolved.edition,
+    minecraftVersion: resolved.minecraftVersion,
+    ...(resolved.metadata ? { metadata: resolved.metadata } : {}),
+    palette: resolved.palette,
     chunks: sortedChunks,
     bounds: blockCount > 0 ? boundsFromExtents(min, max) : null,
     blockCount,
@@ -249,31 +277,151 @@ export const createProjectionDocumentFromHologram = (
   }
   const document = createProjectionDocument(blocks, palette, {
     ...options,
-    metadata: { source: "hologram", ...options.metadata },
+    metadata: { ...options.metadata, source: "hologram" },
   });
   assertProjectionDocumentHologramIsolation(document, "ProjectionDocument");
   return document;
+};
+
+const assertChunkCoordinate = (chunk: Point, context: string) => {
+  chunk.forEach((value, axis) => {
+    if (!Number.isSafeInteger(value)) {
+      throw new RangeError(`${context} ${"xyz"[axis]} coordinate must be a safe integer`);
+    }
+    const minimum = value * PROJECTION_CHUNK_SIZE;
+    const maximum = minimum + PROJECTION_CHUNK_SIZE - 1;
+    if (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum)) {
+      throw new RangeError(`${context} coordinates exceed the safe integer range`);
+    }
+  });
+};
+
+const assertSortedChunkBuffers = (
+  chunk: Pick<SolidVoxelChunk, "chunk" | "positions" | "blockIndices">,
+  paletteSize: number,
+  context: string,
+) => {
+  if (!(chunk.positions instanceof Uint16Array)
+    || !(chunk.blockIndices instanceof Uint16Array)
+    || chunk.positions.length !== chunk.blockIndices.length) {
+    throw new RangeError(`${context} has inconsistent buffers`);
+  }
+  let previous = -1;
+  for (let index = 0; index < chunk.positions.length; index += 1) {
+    const localPosition = chunk.positions[index];
+    if (localPosition >= PROJECTION_CHUNK_SIZE ** 3) {
+      throw new RangeError(`${context} contains invalid local position ${localPosition}`);
+    }
+    if (localPosition <= previous) {
+      throw new Error(`${context} local positions must be strictly increasing and unique`);
+    }
+    const paletteIndex = chunk.blockIndices[index];
+    if (paletteIndex >= paletteSize) {
+      throw new RangeError(`${context} contains unknown palette index ${paletteIndex}`);
+    }
+    previous = localPosition;
+  }
+};
+
+/**
+ * 接收 Worker 已冻结的 32^3 typed chunks，不再建立逐方块 JS 对象。
+ * 输入缓冲区所有权随文档转移，调用方需要保留结果时应先自行复制。
+ */
+export const createProjectionDocumentFromSolidChunks = (
+  chunks: readonly SolidVoxelChunk[],
+  palette: readonly ProjectionBlockState[],
+  options: ProjectionDocumentOptions = {},
+): ProjectionDocument => {
+  const resolved = projectionOptions(palette, options);
+  assertProjectionPalette(resolved.palette, "Solid voxel");
+  const sortedChunks = chunks.every((chunk, index) =>
+    index === 0 || compareChunkYzx(chunks[index - 1], chunk) < 0)
+    ? chunks
+    : [...chunks].sort(compareChunkYzx);
+  const min: Point = [Infinity, Infinity, Infinity];
+  const max: Point = [-Infinity, -Infinity, -Infinity];
+  let blockCount = 0;
+  let previousChunk: Point | undefined;
+
+  const projectionChunks = sortedChunks.map((chunk) => {
+    const coordinates = [...chunk.chunk] as Point;
+    const context = `Solid voxel chunk ${chunkKey(coordinates)}`;
+    assertChunkCoordinate(coordinates, context);
+    if (previousChunk && compareYzx(previousChunk, coordinates) === 0) {
+      throw new Error(`Duplicate solid voxel chunk: ${chunkKey(coordinates)}`);
+    }
+    assertSortedChunkBuffers(chunk, resolved.palette.length, context);
+    if (chunk.positions.length === 0) {
+      throw new RangeError(`${context} must contain at least one block`);
+    }
+    for (let index = 0; index < chunk.positions.length; index += 1) {
+      const local = decodeLocalPosition(chunk.positions[index]);
+      for (let axis = 0; axis < 3; axis += 1) {
+        const coordinate = coordinates[axis] * PROJECTION_CHUNK_SIZE + local[axis];
+        min[axis] = Math.min(min[axis], coordinate);
+        max[axis] = Math.max(max[axis], coordinate);
+      }
+    }
+    blockCount += chunk.positions.length;
+    if (!Number.isSafeInteger(blockCount)) {
+      throw new RangeError("Solid voxel block count exceeds the safe integer range");
+    }
+    previousChunk = coordinates;
+    return {
+      chunk: coordinates,
+      positions: chunk.positions,
+      paletteIndices: chunk.blockIndices,
+    };
+  });
+
+  return {
+    format: "MELYProjection",
+    version: PROJECTION_DOCUMENT_VERSION,
+    edition: resolved.edition,
+    minecraftVersion: resolved.minecraftVersion,
+    ...(resolved.metadata ? { metadata: resolved.metadata } : {}),
+    palette: resolved.palette,
+    chunks: projectionChunks,
+    bounds: blockCount > 0 ? boundsFromExtents(min, max) : null,
+    blockCount,
+  };
 };
 
 export const createProjectionDocumentFromSolid = (
   result: SolidVoxelResult,
   options: ProjectionDocumentOptions = {},
 ): ProjectionDocument => {
-  const blockCount = result.positions.length / 3;
-  if (!Number.isInteger(blockCount) || result.blockIndices.length !== blockCount) {
-    throw new RangeError("Solid voxel result buffers have inconsistent lengths");
-  }
   const palette = result.palette.map((entry) => ({
     blockId: entry.blockId,
     color: [...entry.color] as [number, number, number],
   }));
-  const blocks = Array.from({ length: blockCount }, (_, index): ProjectionBlock => ({
-    position: roundedPosition(result.positions, index),
-    paletteIndex: result.blockIndices[index],
-  }));
-  return createProjectionDocument(blocks, palette, {
+  if (result.storage === "chunked") {
+    if (result.positions.length !== 0 || result.blockIndices.length !== 0) {
+      throw new RangeError("Chunked solid voxel result must not duplicate flat buffers");
+    }
+    if (!result.chunks) {
+      throw new RangeError("Chunked solid voxel result is missing chunks");
+    }
+    return createProjectionDocumentFromSolidChunks(result.chunks, palette, {
+      ...options,
+      metadata: { ...options.metadata, source: "solid" },
+    });
+  }
+  const blockCount = result.positions.length / 3;
+  if (!Number.isInteger(blockCount) || result.blockIndices.length !== blockCount) {
+    throw new RangeError("Solid voxel result buffers have inconsistent lengths");
+  }
+  function* iterateFlatSolidBlocks(): Generator<ProjectionBlock> {
+    for (let index = 0; index < blockCount; index += 1) {
+      yield {
+        position: roundedPosition(result.positions, index),
+        paletteIndex: result.blockIndices[index],
+      };
+    }
+  }
+  return createProjectionDocument(iterateFlatSolidBlocks(), palette, {
     ...options,
-    metadata: { source: "solid", ...options.metadata },
+    metadata: { ...options.metadata, source: "solid" },
   });
 };
 
@@ -327,28 +475,72 @@ export function* iterateProjectionBlocks(document: ProjectionDocument): Generato
   }
 }
 
-/** 最终导出前重算文档事实，拒绝伪造的 blockCount、bounds、调色板索引和重复坐标。 */
+const assertProjectionChunk = (
+  chunk: ProjectionDocument["chunks"][number],
+  paletteSize: number,
+  context: string,
+) => {
+  const coordinates = [...chunk.chunk] as Point;
+  assertChunkCoordinate(coordinates, context);
+  if (!(chunk.positions instanceof Uint16Array)
+    || !(chunk.paletteIndices instanceof Uint16Array)
+      && !(chunk.paletteIndices instanceof Uint32Array)
+    || chunk.positions.length !== chunk.paletteIndices.length) {
+    throw new RangeError(`${context} has inconsistent buffers`);
+  }
+  let previous = -1;
+  for (let index = 0; index < chunk.positions.length; index += 1) {
+    const localPosition = chunk.positions[index];
+    if (localPosition >= PROJECTION_CHUNK_SIZE ** 3) {
+      throw new RangeError(`${context} contains invalid local position ${localPosition}`);
+    }
+    if (localPosition <= previous) {
+      throw new Error(`${context} local positions must be strictly increasing and unique`);
+    }
+    const paletteIndex = chunk.paletteIndices[index];
+    if (!Number.isInteger(paletteIndex) || paletteIndex >= paletteSize) {
+      throw new RangeError(`${context} contains unknown palette index ${paletteIndex}`);
+    }
+    previous = localPosition;
+  }
+  return coordinates;
+};
+
+/** 最终导出前按分块重算文档事实，不为每个方块创建坐标字符串。 */
 export const assertProjectionDocumentIntegrity = (
   document: ProjectionDocument,
   context = "ProjectionDocument",
 ) => {
   const min: Point = [Infinity, Infinity, Infinity];
   const max: Point = [-Infinity, -Infinity, -Infinity];
-  const occupied = new Set<string>();
   let blockCount = 0;
-  for (const block of iterateProjectionBlocks(document)) {
-    if (!Number.isInteger(block.paletteIndex) || !document.palette[block.paletteIndex]) {
-      throw new RangeError(`${context} contains unknown palette index ${block.paletteIndex}`);
+  const chunks = document.chunks.every((chunk, index) =>
+    index === 0 || compareChunkYzx(document.chunks[index - 1], chunk) < 0)
+    ? document.chunks
+    : [...document.chunks].sort(compareChunkYzx);
+  let previousChunk: Point | undefined;
+  for (const chunk of chunks) {
+    const label = `${context} chunk ${chunkKey(chunk.chunk)}`;
+    const coordinates = assertProjectionChunk(chunk, document.palette.length, label);
+    if (previousChunk && compareYzx(previousChunk, coordinates) === 0) {
+      throw new Error(`${context} contains duplicate chunk ${chunkKey(coordinates)}`);
     }
-    block.position.forEach((value, axis) => {
-      assertCoordinate(value, "xyz"[axis]);
-      min[axis] = Math.min(min[axis], value);
-      max[axis] = Math.max(max[axis], value);
-    });
-    const key = block.position.join(",");
-    if (occupied.has(key)) throw new Error(`${context} contains duplicate block at ${key}`);
-    occupied.add(key);
-    blockCount += 1;
+    if (chunk.positions.length === 0) {
+      throw new RangeError(`${label} must contain at least one block`);
+    }
+    for (let index = 0; index < chunk.positions.length; index += 1) {
+      const local = decodeLocalPosition(chunk.positions[index]);
+      for (let axis = 0; axis < 3; axis += 1) {
+        const coordinate = coordinates[axis] * PROJECTION_CHUNK_SIZE + local[axis];
+        min[axis] = Math.min(min[axis], coordinate);
+        max[axis] = Math.max(max[axis], coordinate);
+      }
+    }
+    blockCount += chunk.positions.length;
+    if (!Number.isSafeInteger(blockCount)) {
+      throw new RangeError(`${context} block count exceeds the safe integer range`);
+    }
+    previousChunk = coordinates;
   }
   if (blockCount !== document.blockCount) {
     throw new Error(`${context} blockCount ${document.blockCount} does not match actual ${blockCount}`);
@@ -380,6 +572,10 @@ export const assertProjectionDocumentHologramIsolation = (
   document: ProjectionDocument,
   context = "Hologram projection",
 ) => {
+  const source = document.metadata?.source;
+  const generationMode = document.metadata?.generationMode;
+  // 实体投影允许把末地烛和玻璃板作为普通调色板方块；六向隔离仅是灵动虚空合同。
+  if (source !== "hologram" && generationMode !== "hologram") return;
   assertHologramBlockIsolation(iterateProjectionBlocks(document), document.palette, context);
 };
 

@@ -17,7 +17,10 @@ export function RendererViewport(props: RendererViewportProps) {
   return <ThreeVanillaViewport {...props} />;
 }
 
-export type { RendererViewportProps } from "./rendererViewportTypes";
+export type {
+  RendererMaterialSelection,
+  RendererViewportProps,
+} from "./rendererViewportTypes";
 export { BabylonViewport } from "./BabylonViewport";
 export { ThreeMoeruViewport } from "./ThreeMoeruViewport";
 export { ThreeVanillaViewport } from "./ThreeVanillaViewport";

@@ -17,8 +17,12 @@ import type {
 } from "../types";
 import { appError } from "./appError";
 import { ditherPixels } from "./dithering";
-import { matchEmissiveBlock } from "./emissiveMapping";
-import { MAX_FILLED_VOXEL_VOLUME } from "./resourceBudget";
+import { emissiveBlockChoices, matchEmissiveBlock } from "./emissiveMapping";
+import {
+  estimateNormalizedSolidVoxelWork,
+  visitTriangleVoxelCandidates,
+  type SolidVoxelWorkEstimate,
+} from "./solidVoxelWork";
 import {
   faceFeaturePriority,
   faceLocalPoint,
@@ -44,6 +48,8 @@ interface VoxelSample {
   featureKind?: FaceFeatureKind;
   emissive: boolean;
   distanceSq: number;
+  fixedBlockId?: string;
+  matchedSourceIndex?: number;
 }
 
 interface NormalizedMesh {
@@ -61,6 +67,368 @@ interface VoxelKeyCodec {
   size: Point;
   volume: number;
   encode: (x: number, y: number, z: number) => number;
+}
+
+interface SolidVoxelGenerationControl {
+  workEstimate?: SolidVoxelWorkEstimate;
+  isCancelled?: () => boolean;
+  flatVoxelLimit?: number;
+}
+
+const VOXEL_CHUNK_SIZE = 32;
+const VOXEL_CHUNK_MASK = VOXEL_CHUNK_SIZE - 1;
+const VOXEL_CONTROL_INTERVAL = 4096;
+const MAX_FLAT_SOLID_VOXELS = 1_000_000;
+const VOXEL_CHUNK_INITIAL_CAPACITY = 16;
+const PALETTE_CACHE_MAX_ENTRIES_PER_ROLE = 65_536;
+
+const PALETTE_ROLE_CODE: Record<PaletteRole, number> = {
+  general: 0,
+  skinBase: 1,
+  faceFeature: 2,
+};
+const PALETTE_ROLES = ["general", "skinBase", "faceFeature"] as const;
+const FEATURE_KIND_CODE: Record<FaceFeatureKind, number> = {
+  eye: 1,
+  brow: 2,
+  mouth: 3,
+  overlay: 4,
+};
+const FEATURE_KINDS: readonly (FaceFeatureKind | undefined)[] = [
+  undefined,
+  "eye",
+  "brow",
+  "mouth",
+  "overlay",
+];
+const FIXED_BLOCK_IDS = [
+  undefined,
+  "minecraft:moss_block",
+  "minecraft:mossy_stone_bricks",
+  "minecraft:vine",
+  "minecraft:glow_lichen",
+] as const;
+const FIXED_BLOCK_CODE = new Map(
+  FIXED_BLOCK_IDS.flatMap((blockId, index) => blockId ? [[blockId, index] as const] : []),
+);
+
+const rgbKey = (rgb: readonly number[]) => (
+  (rgb[0] & 0xff) << 16 | (rgb[1] & 0xff) << 8 | (rgb[2] & 0xff)
+);
+
+export class SolidPaletteMatchCache {
+  private readonly roleSparse: Map<number, number>[];
+  private emissiveSparse = new Map<number, number>();
+  private readonly emissiveChoices = emissiveBlockChoices();
+  expensiveMatchCount = 0;
+
+  constructor(
+    private readonly palette: ReturnType<typeof createBlockPalette>,
+  ) {
+    this.roleSparse = PALETTE_ROLES.map(() => new Map<number, number>());
+  }
+
+  private remember(cache: Map<number, number>, key: number, value: number) {
+    if (cache.size >= PALETTE_CACHE_MAX_ENTRIES_PER_ROLE) cache.clear();
+    cache.set(key, value);
+  }
+
+  match(rgb: [number, number, number], role: PaletteRole) {
+    const roleCode = PALETTE_ROLE_CODE[role];
+    const key = rgbKey(rgb);
+    const sparse = this.roleSparse[roleCode];
+    const cached = sparse.get(key);
+    if (cached !== undefined) return cached;
+    this.expensiveMatchCount += 1;
+    const matched = matchBlockColor(rgb, this.palette, role);
+    this.remember(sparse, key, matched);
+    return matched;
+  }
+
+  matchEmissive(rgb: [number, number, number]) {
+    const key = rgbKey(rgb);
+    const cached = this.emissiveSparse.get(key);
+    if (cached !== undefined) return this.emissiveChoices[cached];
+    this.expensiveMatchCount += 1;
+    let matched = this.emissiveChoices.findIndex(
+      (entry) => entry.blockId === matchEmissiveBlock(rgb).blockId,
+    );
+    if (matched < 0) matched = 0;
+    this.remember(this.emissiveSparse, key, matched);
+    return this.emissiveChoices[matched];
+  }
+
+  get cachedEntryCount() {
+    return this.roleSparse.reduce((total, cache) => total + cache.size, this.emissiveSparse.size);
+  }
+}
+
+const voxelChunkCoordinate = (value: number) => Math.floor(value / VOXEL_CHUNK_SIZE);
+const voxelLocalCoordinate = (value: number) => value & VOXEL_CHUNK_MASK;
+const voxelLocalIndex = (x: number, y: number, z: number) =>
+  (voxelLocalCoordinate(y) * VOXEL_CHUNK_SIZE + voxelLocalCoordinate(z))
+  * VOXEL_CHUNK_SIZE + voxelLocalCoordinate(x);
+const voxelChunkKey = (x: number, y: number, z: number) => `${x},${y},${z}`;
+
+class VoxelChunk {
+  private keys = new Uint16Array(VOXEL_CHUNK_INITIAL_CAPACITY);
+  private rgb = new Uint8Array(VOXEL_CHUNK_INITIAL_CAPACITY * 3);
+  private metadata = new Uint8Array(VOXEL_CHUNK_INITIAL_CAPACITY);
+  private distanceSq = new Float64Array(VOXEL_CHUNK_INITIAL_CAPACITY);
+  private matchedSourceIndices?: Uint16Array;
+  private fixedBlockCodes?: Uint8Array;
+  size = 0;
+
+  constructor(
+    readonly x: number,
+    readonly y: number,
+    readonly z: number,
+  ) {}
+
+  private slotFor(localIndex: number) {
+    const mask = this.keys.length - 1;
+    let slot = Math.imul(localIndex, 0x9e3779b1) & mask;
+    const encoded = localIndex + 1;
+    while (this.keys[slot] !== 0 && this.keys[slot] !== encoded) slot = (slot + 1) & mask;
+    return slot;
+  }
+
+  private grow() {
+    const previousKeys = this.keys;
+    const previousRgb = this.rgb;
+    const previousMetadata = this.metadata;
+    const previousDistanceSq = this.distanceSq;
+    const previousMatched = this.matchedSourceIndices;
+    const previousFixed = this.fixedBlockCodes;
+    const capacity = previousKeys.length * 2;
+    this.keys = new Uint16Array(capacity);
+    this.rgb = new Uint8Array(capacity * 3);
+    this.metadata = new Uint8Array(capacity);
+    this.distanceSq = new Float64Array(capacity);
+    this.matchedSourceIndices = previousMatched ? new Uint16Array(capacity) : undefined;
+    this.fixedBlockCodes = previousFixed ? new Uint8Array(capacity) : undefined;
+    for (let slot = 0; slot < previousKeys.length; slot += 1) {
+      const encoded = previousKeys[slot];
+      if (encoded === 0) continue;
+      const next = this.slotFor(encoded - 1);
+      this.keys[next] = encoded;
+      this.rgb.set(previousRgb.subarray(slot * 3, slot * 3 + 3), next * 3);
+      this.metadata[next] = previousMetadata[slot];
+      this.distanceSq[next] = previousDistanceSq[slot];
+      if (previousMatched) this.matchedSourceIndices![next] = previousMatched[slot];
+      if (previousFixed) this.fixedBlockCodes![next] = previousFixed[slot];
+    }
+  }
+
+  private write(slot: number, sample: VoxelSample) {
+    this.rgb[slot * 3] = sample.rgb[0];
+    this.rgb[slot * 3 + 1] = sample.rgb[1];
+    this.rgb[slot * 3 + 2] = sample.rgb[2];
+    this.metadata[slot] = PALETTE_ROLE_CODE[sample.paletteRole]
+      | (sample.faceBase ? 1 << 2 : 0)
+      | ((sample.featureKind ? FEATURE_KIND_CODE[sample.featureKind] : 0) << 3)
+      | (sample.emissive ? 1 << 6 : 0);
+    this.distanceSq[slot] = sample.distanceSq;
+    if (sample.matchedSourceIndex !== undefined && !this.matchedSourceIndices) {
+      this.matchedSourceIndices = new Uint16Array(this.keys.length);
+    }
+    if (this.matchedSourceIndices) {
+      this.matchedSourceIndices[slot] = sample.matchedSourceIndex === undefined
+        ? 0
+        : sample.matchedSourceIndex + 1;
+    }
+    if (sample.fixedBlockId && !this.fixedBlockCodes) {
+      this.fixedBlockCodes = new Uint8Array(this.keys.length);
+    }
+    if (this.fixedBlockCodes) {
+      this.fixedBlockCodes[slot] = sample.fixedBlockId
+        ? FIXED_BLOCK_CODE.get(
+            sample.fixedBlockId as NonNullable<(typeof FIXED_BLOCK_IDS)[number]>,
+          ) ?? 0
+        : 0;
+    }
+  }
+
+  set(localIndex: number, sample: VoxelSample) {
+    let slot = this.slotFor(localIndex);
+    if (this.keys[slot] === 0 && (this.size + 1) * 10 > this.keys.length * 7) {
+      this.grow();
+      slot = this.slotFor(localIndex);
+    }
+    if (this.keys[slot] === 0) {
+      this.keys[slot] = localIndex + 1;
+      this.size += 1;
+    }
+    this.write(slot, sample);
+  }
+
+  has(localIndex: number) {
+    return this.keys[this.slotFor(localIndex)] !== 0;
+  }
+
+  shouldReplace(localIndex: number, featurePriority: number, distanceSq: number) {
+    const slot = this.slotFor(localIndex);
+    if (this.keys[slot] === 0) return true;
+    const existingPriority = ((this.metadata[slot] >> 3) & 0x07) > 0 ? 1 : 0;
+    return existingPriority < featurePriority
+      || (existingPriority === featurePriority && this.distanceSq[slot] > distanceSq);
+  }
+
+  read(localIndex: number, target: VoxelSample) {
+    const slot = this.slotFor(localIndex);
+    if (this.keys[slot] === 0) return undefined;
+    const metadata = this.metadata[slot];
+    target.x = this.x * VOXEL_CHUNK_SIZE + (localIndex & VOXEL_CHUNK_MASK);
+    target.z = this.z * VOXEL_CHUNK_SIZE + ((localIndex >> 5) & VOXEL_CHUNK_MASK);
+    target.y = this.y * VOXEL_CHUNK_SIZE + ((localIndex >> 10) & VOXEL_CHUNK_MASK);
+    target.rgb[0] = this.rgb[slot * 3];
+    target.rgb[1] = this.rgb[slot * 3 + 1];
+    target.rgb[2] = this.rgb[slot * 3 + 2];
+    target.paletteRole = PALETTE_ROLES[metadata & 0x03] ?? "general";
+    target.faceBase = (metadata & (1 << 2)) !== 0;
+    target.featureKind = FEATURE_KINDS[(metadata >> 3) & 0x07];
+    target.emissive = (metadata & (1 << 6)) !== 0;
+    target.distanceSq = this.distanceSq[slot];
+    const matchedSourceIndex = this.matchedSourceIndices?.[slot] ?? 0;
+    target.matchedSourceIndex = matchedSourceIndex > 0
+      ? matchedSourceIndex - 1
+      : undefined;
+    target.fixedBlockId = FIXED_BLOCK_IDS[this.fixedBlockCodes?.[slot] ?? 0];
+    return target;
+  }
+
+  sortedLocalIndices() {
+    const result = new Uint16Array(this.size);
+    let index = 0;
+    for (const encoded of this.keys) {
+      if (encoded > 0) result[index++] = encoded - 1;
+    }
+    result.sort();
+    return result;
+  }
+
+  forEach(
+    callback: (sample: VoxelSample, localIndex: number, index: number) => void,
+    stable = false,
+  ) {
+    const scratch = emptyVoxelSample();
+    let index = 0;
+    for (const localIndex of this.sortedLocalIndices()) {
+      const sample = this.read(localIndex, stable ? emptyVoxelSample() : scratch)!;
+      callback(sample, localIndex, index++);
+      this.set(localIndex, sample);
+    }
+  }
+
+  forEachReadOnly(
+    callback: (sample: VoxelSample, localIndex: number, index: number) => void,
+    stable = false,
+  ) {
+    const scratch = emptyVoxelSample();
+    let index = 0;
+    for (const localIndex of this.sortedLocalIndices()) {
+      callback(this.read(localIndex, stable ? emptyVoxelSample() : scratch)!, localIndex, index++);
+    }
+  }
+}
+
+const emptyVoxelSample = (): VoxelSample => ({
+  x: 0,
+  y: 0,
+  z: 0,
+  rgb: [0, 0, 0],
+  paletteRole: "general",
+  faceBase: false,
+  emissive: false,
+  distanceSq: Infinity,
+});
+
+class ChunkedVoxelSamples {
+  private readonly chunks = new Map<string, VoxelChunk>();
+  size = 0;
+
+  private chunkAt(x: number, y: number, z: number, create: boolean) {
+    const chunkX = voxelChunkCoordinate(x);
+    const chunkY = voxelChunkCoordinate(y);
+    const chunkZ = voxelChunkCoordinate(z);
+    const key = voxelChunkKey(chunkX, chunkY, chunkZ);
+    let chunk = this.chunks.get(key);
+    if (!chunk && create) {
+      chunk = new VoxelChunk(chunkX, chunkY, chunkZ);
+      this.chunks.set(key, chunk);
+    }
+    return chunk;
+  }
+
+  set(sample: VoxelSample) {
+    const chunk = this.chunkAt(sample.x, sample.y, sample.z, true)!;
+    const localIndex = voxelLocalIndex(sample.x, sample.y, sample.z);
+    if (!chunk.has(localIndex)) this.size += 1;
+    chunk.set(localIndex, sample);
+  }
+
+  has(x: number, y: number, z: number) {
+    return this.chunkAt(x, y, z, false)?.has(voxelLocalIndex(x, y, z)) ?? false;
+  }
+
+  shouldReplace(x: number, y: number, z: number, featurePriority: number, distanceSq: number) {
+    const chunk = this.chunkAt(x, y, z, false);
+    return !chunk || chunk.shouldReplace(voxelLocalIndex(x, y, z), featurePriority, distanceSq);
+  }
+
+  *values(stable = false): Generator<VoxelSample> {
+    const scratch = emptyVoxelSample();
+    for (const chunk of this.chunks.values()) {
+      for (const localIndex of chunk.sortedLocalIndices()) {
+        yield chunk.read(localIndex, stable ? emptyVoxelSample() : scratch)!;
+      }
+    }
+  }
+
+  *samplesInYRange(minimumY: number, maximumY: number): Generator<VoxelSample> {
+    const minimumChunkY = voxelChunkCoordinate(minimumY);
+    const maximumChunkY = voxelChunkCoordinate(maximumY);
+    for (const chunk of this.chunks.values()) {
+      if (chunk.y < minimumChunkY || chunk.y > maximumChunkY) continue;
+      const scratch = emptyVoxelSample();
+      for (const localIndex of chunk.sortedLocalIndices()) {
+        const sample = chunk.read(localIndex, scratch)!;
+        if (sample.y >= minimumY && sample.y <= maximumY) yield sample;
+      }
+    }
+  }
+
+  [Symbol.iterator]() {
+    return this.values();
+  }
+
+  stableValues() {
+    return this.values(true);
+  }
+
+  orderedChunks() {
+    return [...this.chunks.values()].sort((left, right) =>
+      left.y - right.y || left.z - right.z || left.x - right.x);
+  }
+
+  forEach(callback: (sample: VoxelSample, index: number) => void, stable = false) {
+    let index = 0;
+    for (const chunk of this.chunks.values()) {
+      chunk.forEach((sample) => callback(sample, index++), stable);
+    }
+  }
+
+  forEachReadOnly(callback: (sample: VoxelSample, index: number) => void, stable = false) {
+    let index = 0;
+    for (const chunk of this.chunks.values()) {
+      chunk.forEachReadOnly((sample) => callback(sample, index++), stable);
+    }
+  }
+
+  clear() {
+    this.chunks.clear();
+    this.size = 0;
+  }
 }
 
 export type SolidProgress = (
@@ -531,7 +899,7 @@ const staysOnFeatureSide = (
 };
 
 const buildVisibleFaceCells = (
-  surfaceVoxels: readonly VoxelSample[],
+  surfaceVoxels: Iterable<VoxelSample>,
   frame: FaceFrameSnapshot,
 ) => {
   const cells = new Map<string, VisibleFaceCell>();
@@ -591,16 +959,16 @@ const faceFeatureClaimScore = (
   - distance * 48;
 
 const enhanceFaceSurface = (
-  surfaceVoxels: readonly VoxelSample[],
+  surfaceVoxels: () => Iterable<VoxelSample>,
   frame: FaceFrameSnapshot | undefined,
   detail: SolidOptions["faceDetail"],
 ) => {
-  if (detail === "off" || !validFaceFrame(frame)) return;
+  if (detail === "off" || !validFaceFrame(frame)) return [];
 
-  const visibleCells = buildVisibleFaceCells(surfaceVoxels, frame);
-  if (visibleCells.size === 0) return;
+  const visibleCells = buildVisibleFaceCells(surfaceVoxels(), frame);
+  if (visibleCells.size === 0) return [];
   const projected = new Map<string, ProjectedFaceFeature>();
-  for (const voxel of surfaceVoxels) {
+  for (const voxel of surfaceVoxels()) {
     const featureKind = voxel.featureKind;
     if (!featureKind) continue;
     const sourceLocal = faceLocalPoint([voxel.x, voxel.y, voxel.z], frame);
@@ -658,11 +1026,14 @@ const enhanceFaceSurface = (
     }
   }
 
+  const changed: VoxelSample[] = [];
   for (const claim of claims.values()) {
     claim.cell.voxel.rgb = claim.source.rgb;
     claim.cell.voxel.paletteRole = "faceFeature";
     claim.cell.voxel.featureKind = claim.source.featureKind;
+    changed.push(claim.cell.voxel);
   }
+  return changed;
 };
 
 const fillInterior = (surface: VoxelSample[]) => {
@@ -679,7 +1050,9 @@ const fillInterior = (surface: VoxelSample[]) => {
   const origin: Point = [min[0] - 1, min[1] - 1, min[2] - 1];
   const size: Point = [max[0] - min[0] + 3, max[1] - min[1] + 3, max[2] - min[2] + 3];
   const volume = size[0] * size[1] * size[2];
-  if (volume > MAX_FILLED_VOXEL_VOLUME) throw appError("error.solid.volumeTooLarge");
+  if (!Number.isSafeInteger(volume) || volume <= 0 || volume > 0x7fffffff) {
+    throw appError("error.solid.volumeTooLarge");
+  }
   const occupied = new Uint8Array(volume);
   const linear = (x: number, y: number, z: number) =>
     ((y - origin[1]) * size[2] + (z - origin[2])) * size[0] + (x - origin[0]);
@@ -840,6 +1213,60 @@ const directionAt = (mask: number, target: number) => {
   return 0;
 };
 
+const decorateAncientRuinsSamples = (
+  voxels: ChunkedVoxelSamples,
+  amount: number,
+) => {
+  const strength = Math.max(0, Math.min(1, amount / 100));
+  if (strength === 0 || voxels.size === 0) return 0;
+  const additions = new ChunkedVoxelSamples();
+  voxels.forEach((voxel) => {
+    const hash = ruinHash(voxel.x, voxel.y, voxel.z);
+    let exposedMask = 0;
+    let exposedCount = 0;
+    for (let directionIndex = 0; directionIndex < RUIN_DIRECTIONS.length; directionIndex += 1) {
+      const [dx, , dz] = RUIN_DIRECTIONS[directionIndex];
+      if (voxels.has(voxel.x + dx, voxel.y, voxel.z + dz)) continue;
+      exposedMask |= 1 << directionIndex;
+      exposedCount += 1;
+    }
+    if (exposedCount === 0) return;
+    if (!voxel.emissive && (hash & 0xffff) / 0xffff < strength * 0.22) {
+      voxel.fixedBlockId = hash % 4 === 0
+        ? "minecraft:moss_block"
+        : "minecraft:mossy_stone_bricks";
+      voxel.rgb = RUIN_COLORS[voxel.fixedBlockId];
+    }
+    if (((hash >>> 16) & 0xffff) / 0xffff >= strength * 0.16) return;
+    const [dx, , dz] = RUIN_DIRECTIONS[directionAt(exposedMask, hash % exposedCount)];
+    const x = voxel.x + dx;
+    const z = voxel.z + dz;
+    if (voxels.has(x, voxel.y, z) || additions.has(x, voxel.y, z)) return;
+    additions.set({
+      x,
+      y: voxel.y,
+      z,
+      rgb: hash % 5 === 0
+        ? RUIN_COLORS["minecraft:glow_lichen"]
+        : RUIN_COLORS["minecraft:vine"],
+      fixedBlockId: hash % 5 === 0
+        ? "minecraft:glow_lichen"
+        : "minecraft:vine",
+      paletteRole: "general",
+      faceBase: false,
+      emissive: false,
+      distanceSq: Infinity,
+    });
+  });
+  let addedCount = 0;
+  for (const addition of additions.values()) {
+    if (voxels.has(addition.x, addition.y, addition.z)) continue;
+    voxels.set(addition);
+    addedCount += 1;
+  }
+  return addedCount;
+};
+
 export const decorateSolidAncientRuins = (
   result: SolidVoxelResult,
   amount: number,
@@ -960,43 +1387,53 @@ export const generateSolidVoxels = (
   snapshot: MmdMeshSnapshot,
   options: SolidOptions,
   onProgress?: SolidProgress,
+  control: SolidVoxelGenerationControl = {},
 ): SolidVoxelResult => {
   const mesh = normalizeMesh(snapshot, options.targetHeight);
   const halfSize = 0.5 + Math.max(0, options.thicknessCompensation);
-  const voxelCodec = createVoxelKeyCodec(mesh.positions, halfSize + 1);
-  if (options.fillMode === "filled" && voxelCodec.volume > MAX_FILLED_VOXEL_VOLUME) {
-    throw appError("error.solid.volumeTooLarge");
-  }
-  const surface = new Map<number, VoxelSample>();
+  const surface = new ChunkedVoxelSamples();
   const skinMaterials = new Set(options.skinMaterialIndices);
   const emissiveMaterials = new Set(options.emissiveMaterialIndices);
   const featureKinds = options.faceDetail === "off"
     ? []
     : mesh.materials.map(materialFaceFeatureKind);
   const triangleCount = mesh.indices.length / 3;
+  const workEstimate = control.workEstimate ?? estimateNormalizedSolidVoxelWork(
+    mesh.positions,
+    mesh.indices,
+    halfSize,
+  );
+  if (workEstimate.triangleCandidateUpperBounds.length !== triangleCount) {
+    throw appError("error.solid.workloadTooLarge");
+  }
+  const weightedProgress = !workEstimate.saturated
+    && Number.isSafeInteger(workEstimate.totalCandidateUpperBound)
+    && workEstimate.totalCandidateUpperBound > 0;
+  const totalWork = weightedProgress
+    ? workEstimate.totalCandidateUpperBound
+    : Math.max(1, triangleCount);
+  let completedWork = 0;
+  let lastProgressWork = -VOXEL_CONTROL_INTERVAL;
+  const assertNotCancelled = () => {
+    if (control.isCancelled?.()) throw appError("error.snapshot.cancelled");
+  };
+  const reportVoxelProgress = (work: number) => {
+    if (work - lastProgressWork < VOXEL_CONTROL_INTERVAL && work < totalWork) return;
+    lastProgressWork = work;
+    onProgress?.("voxelizing", 0.08 + Math.min(1, work / totalWork) * 0.52);
+  };
   let triangleBoxTests = 0;
   let alphaRejected = 0;
 
   for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
-    if (triangleIndex % 128 === 0) {
-      onProgress?.("voxelizing", 0.08 + triangleIndex / triangleCount * 0.52);
-    }
+    assertNotCancelled();
+    reportVoxelProgress(completedWork);
     const aIndex = mesh.indices[triangleIndex * 3];
     const bIndex = mesh.indices[triangleIndex * 3 + 1];
     const cIndex = mesh.indices[triangleIndex * 3 + 2];
     const a = pointAt(mesh.positions, aIndex);
     const b = pointAt(mesh.positions, bIndex);
     const c = pointAt(mesh.positions, cIndex);
-    const minimum: Point = [
-      Math.ceil(Math.min(a[0], b[0], c[0]) - halfSize),
-      Math.ceil(Math.min(a[1], b[1], c[1]) - halfSize),
-      Math.ceil(Math.min(a[2], b[2], c[2]) - halfSize),
-    ];
-    const maximum: Point = [
-      Math.floor(Math.max(a[0], b[0], c[0]) + halfSize),
-      Math.floor(Math.max(a[1], b[1], c[1]) + halfSize),
-      Math.floor(Math.max(a[2], b[2], c[2]) + halfSize),
-    ];
     const materialIndex = mesh.triangleMaterials[triangleIndex] ?? 0;
     const faceBase = skinMaterials.has(materialIndex);
     const featureKind = featureKinds[materialIndex];
@@ -1011,116 +1448,120 @@ export const generateSolidVoxels = (
     const uvA = uvAt(mesh.uvs, aIndex);
     const uvB = uvAt(mesh.uvs, bIndex);
     const uvC = uvAt(mesh.uvs, cIndex);
-    for (let y = minimum[1]; y <= maximum[1]; y += 1) {
-      for (let z = minimum[2]; z <= maximum[2]; z += 1) {
-        for (let x = minimum[0]; x <= maximum[0]; x += 1) {
-          triangleBoxTests += 1;
-          const center: Point = [x, y, z];
-          if (!triangleIntersectsBox(a, b, c, center, halfSize)) continue;
-          const closest = closestBarycentric(center, a, b, c);
-          const uv: Uv = [
-            uvA[0] * closest.barycentric[0] + uvB[0] * closest.barycentric[1] + uvC[0] * closest.barycentric[2],
-            uvA[1] * closest.barycentric[0] + uvB[1] * closest.barycentric[1] + uvC[1] * closest.barycentric[2],
-          ];
-          const sampled = materialSample(mesh, materialIndex, uv);
-          if (sampled.alpha < options.alphaThreshold) {
-            alphaRejected += 1;
-            continue;
+    const triangleWork = weightedProgress
+      ? Math.max(1, workEstimate.triangleCandidateUpperBounds[triangleIndex])
+      : 1;
+    const scan = visitTriangleVoxelCandidates(a, b, c, halfSize, (x, y, z) => {
+      triangleBoxTests += 1;
+      const center: Point = [x, y, z];
+      if (!triangleIntersectsBox(a, b, c, center, halfSize)) return;
+      const closest = closestBarycentric(center, a, b, c);
+      const uv: Uv = [
+        uvA[0] * closest.barycentric[0] + uvB[0] * closest.barycentric[1] + uvC[0] * closest.barycentric[2],
+        uvA[1] * closest.barycentric[0] + uvB[1] * closest.barycentric[1] + uvC[1] * closest.barycentric[2],
+      ];
+      const sampled = materialSample(mesh, materialIndex, uv);
+      if (sampled.alpha < options.alphaThreshold) {
+        alphaRejected += 1;
+        return;
+      }
+      const delta = subtract(center, closest.point);
+      const distanceSq = lengthSq(delta);
+      const featurePriority = featureKind ? 1 : 0;
+      if (!surface.shouldReplace(x, y, z, featurePriority, distanceSq)) return;
+      surface.set({
+        x,
+        y,
+        z,
+        rgb: sampled.rgb,
+        paletteRole,
+        faceBase,
+        featureKind,
+        emissive,
+        distanceSq,
+      });
+    }, {
+      interval: VOXEL_CONTROL_INTERVAL,
+      onWork: (workUnits) => {
+        assertNotCancelled();
+        if (weightedProgress) {
+          reportVoxelProgress(completedWork + Math.min(triangleWork, workUnits));
+        }
+      },
+    });
+    if (!scan.completed) throw appError("error.snapshot.cancelled");
+    completedWork += triangleWork;
+  }
+  reportVoxelProgress(totalWork);
+  onProgress?.("texturing", 0.64);
+  if (surface.size === 0) throw appError("error.solid.empty");
+  const originalSurfaceCount = surface.size;
+  if (options.fillMode === "filled") {
+    const surfaceVoxels = Array.from(surface.stableValues());
+    for (const voxel of fillInterior(surfaceVoxels)) surface.set(voxel);
+  }
+  const faceChanges = enhanceFaceSurface(
+    () => surface.stableValues(),
+    mesh.faceFrame,
+    options.faceDetail,
+  );
+  for (const voxel of faceChanges) surface.set(voxel);
+  let ruinAdditionCount = 0;
+  if (options.materialTheme === "ancientRuins" && options.ruinDecoration > 0) {
+    ruinAdditionCount = decorateAncientRuinsSamples(surface, options.ruinDecoration);
+  }
+  onProgress?.("filling", 0.76);
+  const sourcePalette = createBlockPalette(options);
+  const paletteMatchCache = new SolidPaletteMatchCache(sourcePalette);
+  const compactPalette: SolidVoxelResult["palette"] = [];
+  const compactMap = new Map<string, number>();
+  const blockCount = surface.size;
+  const min: Point = [Infinity, Infinity, Infinity];
+  const max: Point = [-Infinity, -Infinity, -Infinity];
+  let skinBlockCount = 0;
+  if (options.dithering > 0) {
+    let ditherMinY = Infinity;
+    let ditherMaxY = -Infinity;
+    surface.forEach((voxel) => {
+      voxel.matchedSourceIndex = paletteMatchCache.match(voxel.rgb, voxel.paletteRole);
+      if (voxel.paletteRole === "general" && !voxel.emissive) {
+        ditherMinY = Math.min(ditherMinY, voxel.y);
+        ditherMaxY = Math.max(ditherMaxY, voxel.y);
+      }
+    });
+    if (Number.isFinite(ditherMinY) && Number.isFinite(ditherMaxY)) {
+      for (let y = ditherMinY; y <= ditherMaxY; y += 1) {
+        const layerVoxels: VoxelSample[] = [];
+        for (const voxel of surface.samplesInYRange(y, y)) {
+          if (voxel.paletteRole === "general" && !voxel.emissive) {
+            layerVoxels.push({ ...voxel, rgb: [...voxel.rgb] });
           }
-          const delta = subtract(center, closest.point);
-          const distanceSq = lengthSq(delta);
-          const key = voxelCodec.encode(x, y, z);
-          const existing = surface.get(key);
-          const featurePriority = featureKind ? 1 : 0;
-          const existingPriority = existing?.featureKind ? 1 : 0;
-          if (
-            existing
-            && (existingPriority > featurePriority
-              || (existingPriority === featurePriority && existing.distanceSq <= distanceSq))
-          ) continue;
-          surface.set(key, {
-            x,
-            y,
-            z,
-            rgb: sampled.rgb,
-            paletteRole,
-            faceBase,
-            featureKind,
-            emissive,
-            distanceSq,
-          });
+        }
+        if (layerVoxels.length === 0) continue;
+        const dithered = ditherPixels(
+          layerVoxels.map((voxel) => ({
+            x: voxel.x,
+            y: voxel.z,
+            color: voxel.rgb,
+          })),
+          sourcePalette.entries,
+          options.dithering,
+        );
+        for (let ditherIndex = 0; ditherIndex < layerVoxels.length; ditherIndex += 1) {
+          const voxel = layerVoxels[ditherIndex];
+          voxel.matchedSourceIndex = dithered.paletteIndices[ditherIndex];
+          surface.set(voxel);
         }
       }
     }
   }
-  onProgress?.("texturing", 0.64);
-  const surfaceVoxels = [...surface.values()];
-  if (surfaceVoxels.length === 0) throw appError("error.solid.empty");
-  const filledVoxels = options.fillMode === "filled" ? fillInterior(surfaceVoxels) : [];
-  enhanceFaceSurface(surfaceVoxels, mesh.faceFrame, options.faceDetail);
-  surface.clear();
-  onProgress?.("filling", 0.76);
-  const voxels = filledVoxels.length > 0 ? surfaceVoxels.concat(filledVoxels) : surfaceVoxels;
-  const sourcePalette = createBlockPalette(options);
-  const compactPalette: SolidVoxelResult["palette"] = [];
-  const compactMap = new Map<string, number>();
-  const positions = new Float32Array(voxels.length * 3);
-  const blockIndices = new Uint16Array(voxels.length);
-  const min: Point = [Infinity, Infinity, Infinity];
-  const max: Point = [-Infinity, -Infinity, -Infinity];
-  let skinBlockCount = 0;
-  let matchedSourceIndices: Uint16Array | undefined;
-  if (options.dithering > 0) {
-    matchedSourceIndices = new Uint16Array(voxels.length);
-    let ditherMinY = Infinity;
-    let ditherMaxY = -Infinity;
-    let ditherCount = 0;
-    voxels.forEach((voxel, index) => {
-      matchedSourceIndices![index] = matchBlockColor(voxel.rgb, sourcePalette, voxel.paletteRole);
-      if (voxel.paletteRole === "general" && !voxel.emissive) {
-        ditherMinY = Math.min(ditherMinY, voxel.y);
-        ditherMaxY = Math.max(ditherMaxY, voxel.y);
-        ditherCount += 1;
-      }
-    });
-    const layerCount = ditherCount > 0 ? ditherMaxY - ditherMinY + 1 : 0;
-    const counts = new Uint32Array(layerCount);
-    voxels.forEach((voxel) => {
-      if (voxel.paletteRole === "general" && !voxel.emissive) counts[voxel.y - ditherMinY] += 1;
-    });
-    const starts = new Uint32Array(layerCount + 1);
-    for (let index = 0; index < layerCount; index += 1) starts[index + 1] = starts[index] + counts[index];
-    const cursors = starts.slice(0, layerCount);
-    const groupedIndices = new Uint32Array(ditherCount);
-    voxels.forEach((voxel, index) => {
-      if (voxel.paletteRole !== "general" || voxel.emissive) return;
-      const layer = voxel.y - ditherMinY;
-      groupedIndices[cursors[layer]++] = index;
-    });
-    for (let layer = 0; layer < layerCount; layer += 1) {
-      const indices = groupedIndices.subarray(starts[layer], starts[layer + 1]);
-      if (indices.length === 0) continue;
-      const dithered = ditherPixels(
-        Array.from(indices, (index) => ({
-          x: voxels[index].x,
-          y: voxels[index].z,
-          color: voxels[index].rgb,
-        })),
-        sourcePalette.entries,
-        options.dithering,
-      );
-      for (let ditherIndex = 0; ditherIndex < indices.length; ditherIndex += 1) {
-        matchedSourceIndices[indices[ditherIndex]] = dithered.paletteIndices[ditherIndex];
-      }
-    }
-  }
-  voxels.forEach((voxel, index) => {
-    if (index % 2048 === 0) onProgress?.("matching", 0.78 + index / voxels.length * 0.2);
-    const matchedEntry = voxel.emissive
-      ? matchEmissiveBlock(voxel.rgb)
-      : sourcePalette.entries[matchedSourceIndices
-        ? matchedSourceIndices[index]
-        : matchBlockColor(voxel.rgb, sourcePalette, voxel.paletteRole)];
+  const matchVoxel = (voxel: VoxelSample) => {
+    const matchedEntry = voxel.fixedBlockId
+      ? { blockId: voxel.fixedBlockId, color: RUIN_COLORS[voxel.fixedBlockId] ?? voxel.rgb }
+      : voxel.emissive
+        ? paletteMatchCache.matchEmissive(voxel.rgb)
+        : sourcePalette.entries[voxel.matchedSourceIndex
+          ?? paletteMatchCache.match(voxel.rgb, voxel.paletteRole)];
     const compactKey = matchedEntry.blockId;
     let compactIndex = compactMap.get(compactKey);
     if (compactIndex === undefined) {
@@ -1128,10 +1569,6 @@ export const generateSolidVoxels = (
       compactMap.set(compactKey, compactIndex);
       compactPalette.push({ blockId: matchedEntry.blockId, color: [...matchedEntry.color] });
     }
-    positions[index * 3] = voxel.x;
-    positions[index * 3 + 1] = voxel.y;
-    positions[index * 3 + 2] = voxel.z;
-    blockIndices[index] = compactIndex;
     if (voxel.paletteRole === "skinBase") skinBlockCount += 1;
     min[0] = Math.min(min[0], voxel.x);
     min[1] = Math.min(min[1], voxel.y);
@@ -1139,7 +1576,47 @@ export const generateSolidVoxels = (
     max[0] = Math.max(max[0], voxel.x);
     max[1] = Math.max(max[1], voxel.y);
     max[2] = Math.max(max[2], voxel.z);
-  });
+    return compactIndex;
+  };
+
+  let positions = new Float32Array(0);
+  let blockIndices = new Uint16Array(0);
+  let chunks: SolidVoxelResult["chunks"];
+  const flatVoxelLimit = Math.max(
+    0,
+    Math.floor(control.flatVoxelLimit ?? MAX_FLAT_SOLID_VOXELS),
+  );
+  if (blockCount <= flatVoxelLimit) {
+    positions = new Float32Array(blockCount * 3);
+    blockIndices = new Uint16Array(blockCount);
+    let index = 0;
+    for (const voxel of surface.values()) {
+      if (index % 2048 === 0) onProgress?.("matching", 0.78 + index / blockCount * 0.2);
+      positions[index * 3] = voxel.x;
+      positions[index * 3 + 1] = voxel.y;
+      positions[index * 3 + 2] = voxel.z;
+      blockIndices[index] = matchVoxel(voxel);
+      index += 1;
+    }
+  } else {
+    let matchedCount = 0;
+    chunks = surface.orderedChunks().map((chunk) => {
+      const localPositions = chunk.sortedLocalIndices();
+      const localBlockIndices = new Uint16Array(localPositions.length);
+      chunk.forEachReadOnly((voxel, _localIndex, index) => {
+        if (matchedCount % 2048 === 0) {
+          onProgress?.("matching", 0.78 + matchedCount / blockCount * 0.2);
+        }
+        localBlockIndices[index] = matchVoxel(voxel);
+        matchedCount += 1;
+      });
+      return {
+        chunk: [chunk.x, chunk.y, chunk.z],
+        positions: localPositions,
+        blockIndices: localBlockIndices,
+      };
+    });
+  }
   const dimensions: [number, number, number] = [
     max[0] - min[0] + 1,
     max[1] - min[1] + 1,
@@ -1147,14 +1624,16 @@ export const generateSolidVoxels = (
   ];
   const result: SolidVoxelResult = {
     kind: "solid",
+    storage: chunks ? "chunked" : "flat",
     positions,
     blockIndices,
+    ...(chunks ? { chunks } : {}),
     palette: compactPalette,
     ...(mesh.faceFrame ? { faceFrame: mesh.faceFrame } : {}),
     stats: {
-      blockCount: voxels.length,
-      surfaceBlockCount: surfaceVoxels.length,
-      filledBlockCount: filledVoxels.length,
+      blockCount,
+      surfaceBlockCount: originalSurfaceCount + ruinAdditionCount,
+      filledBlockCount: blockCount - originalSurfaceCount - ruinAdditionCount,
       skinBlockCount,
       alphaRejected,
       triangleBoxTests,
@@ -1163,7 +1642,5 @@ export const generateSolidVoxels = (
     },
     bounds: { min, max },
   };
-  return options.materialTheme === "ancientRuins" && options.ruinDecoration > 0
-    ? decorateSolidAncientRuins(result, options.ruinDecoration)
-    : result;
+  return result;
 };

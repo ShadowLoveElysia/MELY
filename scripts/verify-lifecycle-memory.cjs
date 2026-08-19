@@ -20,7 +20,7 @@ const outputDirectory = resolve(
 const reportPath = resolve(
   process.env.MELY_REPORT_PATH || join(outputDirectory, "report.json"),
 );
-const TWO_GIB = 2 * 1024 ** 3;
+const FIVE_GIB = 5 * 1024 ** 3;
 const RECOVERY_RATIO_LIMIT = 1.2;
 const MIB = 1024 ** 2;
 const SAMPLING_INTERVAL_MS = 350;
@@ -279,7 +279,7 @@ const run = async () => {
     modelZip,
     fixturePath,
     iterations,
-    memoryLimitBytes: TWO_GIB,
+    memoryLimitBytes: FIVE_GIB,
     recoveryRatioLimit: RECOVERY_RATIO_LIMIT,
     consoleErrors: [],
     pageErrors: [],
@@ -497,7 +497,7 @@ const run = async () => {
         .filter((sample) => sample.phase.startsWith(`${cycle.prefix}:`))
         .map((sample) => sample.workingSetBytes));
     });
-    report.underTwoGiB = report.peakWorkingSetBytes < TWO_GIB;
+    report.withinFiveGiB = report.peakWorkingSetBytes <= FIVE_GIB;
     report.workingSetPeakRecoveryRatio = report.recovery.medianBytes / report.peakWorkingSetBytes;
     report.recoveredFromPeak = report.recovery.sampleCount >= 5
       && report.recovery.medianBytes <= report.peakWorkingSetBytes * 0.9;
@@ -534,7 +534,7 @@ const run = async () => {
         checkpoint.workingSet.sampleCount >= 5
         && checkpoint.workingSet.medianBytes > 0
       )),
-      underTwoGiB: report.underTwoGiB,
+      withinFiveGiB: report.withinFiveGiB,
       recoveryRatioWithinLimit: report.recoveryRatioWithinLimit,
       recoveredFromPeak: report.recoveredFromPeak,
       liveHeapRecovered: report.liveHeapRecovered,

@@ -98,6 +98,11 @@ test("release validation includes cancellation recovery and reachable 2032/4064 
   assert.doesNotMatch(workload, /expectedFailClosed|failClosedVerified/);
   assert.match(synthetic, /extended2032Reachable/);
   assert.match(synthetic, /extreme4064Reachable/);
+  assert.match(synthetic, /Large projection: resource-risk confirmation/);
+  assert.match(synthetic, /Generation resource risk is not a confirmation-only gate/);
+  assert.match(synthetic, /continuedToWorker/);
+  assert.match(synthetic, /generateFixture\(page, "narrow", 2032, 2032, true\)/);
+  assert.match(synthetic, /startFixtureGeneration\(page, true\)/);
   assert.match(synthetic, /2,032-layer Java export is not attemptable/);
   assert.match(synthetic, /bedrockDirectExports/);
   assert.match(synthetic, /isBedrockFormat/);

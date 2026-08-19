@@ -8,8 +8,12 @@ import {
   StepForward,
   Unlock,
 } from "lucide-react";
-import { useSyncExternalStore } from "react";
-import { formatMotionFrame, motionFrameStepState } from "../core/motionUi";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  formatMotionFrame,
+  motionFrameStepState,
+  parseMotionFrameInput,
+} from "../core/motionUi";
 import type {
   MotionPlaybackSource,
   MotionTimeSource,
@@ -57,8 +61,35 @@ export function MotionTimeline({
   const locked = lockedFrame !== null;
   const currentFrame = lockedFrame ?? frame;
   const stepState = motionFrameStepState(currentFrame, motion.maxFrame);
+  const displayedFrame = Math.min(motion.maxFrame, Math.round(currentFrame));
+  const [frameDraft, setFrameDraft] = useState(String(displayedFrame));
+  const [frameInputFocused, setFrameInputFocused] = useState(false);
+  const skipNextFrameInputBlurRef = useRef(false);
   const TrackIcon = kind === "dance" ? PersonStanding : Smile;
   const trackLabel = t(kind === "dance" ? "sidebar.motion.danceTrack" : "sidebar.motion.expressionTrack");
+
+  useEffect(() => {
+    if (!frameInputFocused) setFrameDraft(String(displayedFrame));
+  }, [displayedFrame, frameInputFocused]);
+
+  const cancelFrameInput = () => {
+    setFrameInputFocused(false);
+    setFrameDraft(String(displayedFrame));
+  };
+  const commitFrameInput = () => {
+    if (disabled) {
+      cancelFrameInput();
+      return;
+    }
+    setFrameInputFocused(false);
+    const target = parseMotionFrameInput(frameDraft, motion.maxFrame);
+    if (target === null || Math.abs(target - currentFrame) <= 1e-6) {
+      cancelFrameInput();
+      return;
+    }
+    setFrameDraft(String(target));
+    onFrameChange(target);
+  };
 
   return (
     <section
@@ -116,11 +147,47 @@ export function MotionTimeline({
           min={0}
           max={motion.maxFrame}
           step={1}
-          value={Math.min(motion.maxFrame, Math.round(currentFrame))}
+          value={displayedFrame}
           aria-label={t("sidebar.motion.trackFrame", { track: trackLabel })}
           disabled={locked || disabled}
           onChange={(event) => onFrameChange(Number(event.target.value))}
         />
+        <label className="viewport-motion__frame-input">
+          <span>{t("sidebar.motion.jumpFrame", { track: trackLabel })}</span>
+          <input
+            type="number"
+            min={0}
+            max={motion.maxFrame}
+            step={1}
+            value={frameDraft}
+            aria-label={t("sidebar.motion.jumpFrame", { track: trackLabel })}
+            disabled={disabled}
+            onFocus={() => {
+              skipNextFrameInputBlurRef.current = false;
+              setFrameInputFocused(true);
+            }}
+            onChange={(event) => setFrameDraft(event.currentTarget.value)}
+            onBlur={() => {
+              if (skipNextFrameInputBlurRef.current) {
+                skipNextFrameInputBlurRef.current = false;
+                return;
+              }
+              commitFrameInput();
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                event.currentTarget.blur();
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                skipNextFrameInputBlurRef.current = true;
+                cancelFrameInput();
+                event.currentTarget.blur();
+              }
+            }}
+          />
+        </label>
         <output>{t("sidebar.motion.frameCounter", {
           current: number(Number(currentFrame.toFixed(3))),
           total: number(motion.maxFrame),

@@ -46,6 +46,25 @@ test("the lifecycle release report includes recovery ratio in its hard assertion
   assert.match(source, /Object\.values\(report\.assertions\)\.every\(Boolean\)/);
 });
 
+test("release memory gates treat up to five GiB as safe", () => {
+  const lifecycle = readFileSync("scripts/verify-lifecycle-memory.cjs", "utf8");
+  const art = readFileSync("scripts/verify-art-e2e.cjs", "utf8");
+  const generation = readFileSync("scripts/verify-generation.cjs", "utf8");
+  const workload = readFileSync("scripts/verify-release-workload.cjs", "utf8");
+  const sources = [lifecycle, art, generation, workload];
+
+  for (const source of sources) {
+    assert.match(source, /const FIVE_GIB = 5 \* 1024 \*\* 3;/);
+    assert.doesNotMatch(source, /TWO_GIB|underTwoGiB|exceeded 2 GiB/);
+  }
+  assert.match(lifecycle, /memoryLimitBytes: FIVE_GIB/);
+  assert.match(lifecycle, /peakWorkingSetBytes <= FIVE_GIB/);
+  assert.match(lifecycle, /withinFiveGiB: report\.withinFiveGiB/);
+  assert.match(art, /peakWorkingSetBytes <= FIVE_GIB/);
+  assert.match(generation, /workingSet > FIVE_GIB/);
+  assert.match(workload, /peakWorkingSetBytes <= FIVE_GIB/);
+});
+
 test("measurement retries recover from bounded transient failures", async () => {
   const attempts: number[] = [];
   const delays: number[] = [];

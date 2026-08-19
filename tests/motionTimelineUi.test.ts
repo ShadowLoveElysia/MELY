@@ -34,3 +34,25 @@ test("renderer viewport forwards shared lifecycle callbacks to every backend", (
   assert.match(vanilla, /<Viewport3D \{\.\.\.defaults\} model=\{model\} \/>/);
   assert.match(moeru, /<Viewport3D \{\.\.\.defaults\} model=\{model\} \/>/);
 });
+
+test("motion timelines expose independently labelled typed frame controls", () => {
+  const source = readFileSync("src/components/MotionTimeline.tsx", "utf8");
+  const app = readFileSync("src/App.tsx", "utf8");
+
+  assert.match(source, /type="number"/);
+  assert.match(source, /sidebar\.motion\.jumpFrame/);
+  assert.match(source, /parseMotionFrameInput\(frameDraft, motion\.maxFrame\)/);
+  assert.match(source, /Math\.abs\(target - currentFrame\) <= 1e-6/);
+  assert.match(source, /type="range"[\s\S]*disabled=\{locked \|\| disabled\}/);
+  assert.match(source, /const commitFrameInput = \(\) => \{\s*if \(disabled\) \{\s*cancelFrameInput\(\);\s*return;/);
+  assert.match(source, /skipNextFrameInputBlurRef\.current[\s\S]*commitFrameInput\(\)/);
+  assert.match(source, /onFocus=\{\(\) => \{\s*skipNextFrameInputBlurRef\.current = false;\s*setFrameInputFocused\(true\);/);
+  assert.match(source, /event\.key === "Enter"/);
+  assert.match(source, /event\.key === "Escape"[\s\S]*skipNextFrameInputBlurRef\.current = true[\s\S]*cancelFrameInput\(\)/);
+  assert.doesNotMatch(source, /type="number"[\s\S]{0,420}?disabled=\{locked \|\| disabled\}/);
+  assert.match(source, /type="number"[\s\S]{0,420}?disabled=\{disabled\}/);
+  assert.match(app, /disabled=\{processing \|\| modelLoading \|\| physicsLoading \|\| backendOperationBusy\}/);
+  assert.match(app, /const setMotionFrame = \(kind: MmdMotionTrackKind, frame: number\) => \{\s*if \(backendOperationRef\.current\) return;\s*if \(!Number\.isFinite\(frame\)\) return;/);
+  assert.match(app, /const currentFrame = runtime\.seconds \* motion\.frameRate;\s*if \(Math\.abs\(clampedFrame - currentFrame\) <= 1e-6\) return;/);
+  assert.match(app, /MOTION_TRACK_KINDS\.map\(\(kind\)[\s\S]*onFrameChange=\{\(frame\) => setMotionFrame\(kind, frame\)\}/);
+});

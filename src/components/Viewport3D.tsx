@@ -8,10 +8,21 @@ import type { LoadedMmdModel, ThreeMmdViewportSource } from "../core/mmdRuntime"
 import { createMmdFaceFrameSnapshot } from "../core/mmdSnapshot";
 import {
   createThreeMmdOutlinePass,
+  createThreeMmdSelectionOutlinePass,
   readThreeMmdOutlineParameters,
   syncThreeMmdOutlineMaterials,
   type ThreeMmdOutlinePass,
+  type ThreeMmdSelectionOutlinePass,
 } from "../core/threeMmdOutline";
+import {
+  collectThreeMmdMaterialPickMeshes,
+  completesThreeMaterialPointerClick,
+  createThreeMaterialPointerCandidate,
+  materialListForThreeMmdMesh,
+  resolveThreeMmdMaterialHit,
+  updateThreeMaterialPointerCandidate,
+  type ThreeMaterialPointerCandidate,
+} from "../core/threeModelPartSelection";
 import {
   MMD_PREVIEW_VERTICAL_FOV_DEGREES,
   perspectiveFrameDistance,
@@ -19,7 +30,15 @@ import {
 import { applyThreePreviewDisplayProfile } from "../core/threePreviewDisplayProfiles";
 import { useI18n } from "../i18n/I18nProvider";
 import type { CameraMode, MmdMotionTimes, PreviewMode, ProjectionResult } from "../types";
-import type { RendererViewportBinding } from "./rendererViewportTypes";
+import {
+  createProjectionPreviewSamplePlan,
+  createSolidPreviewSource,
+  type SolidPreviewPoint,
+} from "./projectionPreviewLod";
+import type {
+  RendererMaterialSelection,
+  RendererViewportBinding,
+} from "./rendererViewportTypes";
 
 export interface Viewport3DProps {
   result: ProjectionResult | null;
@@ -41,6 +60,10 @@ export interface Viewport3DProps {
   poseEditing: boolean;
   selectedBoneIndex: number | null;
   onBoneSelected: (index: number | null) => void;
+  selectedMaterialIndex: number | null;
+  hiddenMaterialIndices: readonly number[];
+  materialSelectionRequestId: number;
+  onMaterialSelected: (selection: RendererMaterialSelection | null) => void;
   onPoseCommitted: () => void;
   onBeforeRender?: (now: number) => MmdMotionTimes | null;
   onAfterRender?: (now: number, evaluatedMotionTimes: MmdMotionTimes | null, gpuSynchronized: boolean) => void;
@@ -74,6 +97,7 @@ interface ViewportRuntime {
   rimLight: THREE.DirectionalLight;
   hemisphereLight: THREE.HemisphereLight;
   mmdOutlinePass: ThreeMmdOutlinePass | null;
+  mmdSelectionOutlinePass: ThreeMmdSelectionOutlinePass | null;
   animationFrame: number;
 }
 
@@ -566,6 +590,10 @@ export function Viewport3D({
   poseEditing,
   selectedBoneIndex,
   onBoneSelected,
+  selectedMaterialIndex,
+  hiddenMaterialIndices,
+  materialSelectionRequestId: _materialSelectionRequestId,
+  onMaterialSelected,
   onPoseCommitted,
   onBeforeRender,
   onAfterRender,
@@ -581,10 +609,15 @@ export function Viewport3D({
   const runtimeRef = useRef<ViewportRuntime | null>(null);
   const modelRef = useRef(model);
   const attachedModelRef = useRef<ViewportThreeModel | null>(null);
+  const framedModelIdRef = useRef<string | null>(null);
   const resultRef = useRef(result);
+  const modelLoadingRef = useRef(modelLoading);
   const poseEditingRef = useRef(poseEditing);
   const selectedBoneIndexRef = useRef(selectedBoneIndex);
+  const selectedMaterialIndexRef = useRef(selectedMaterialIndex);
+  const hiddenMaterialIndexSetRef = useRef(new Set(hiddenMaterialIndices));
   const onBoneSelectedRef = useRef(onBoneSelected);
+  const onMaterialSelectedRef = useRef(onMaterialSelected);
   const onPoseCommittedRef = useRef(onPoseCommitted);
   const onBeforeRenderRef = useRef(onBeforeRender);
   const onAfterRenderRef = useRef(onAfterRender);
@@ -594,12 +627,20 @@ export function Viewport3D({
   const backendBusyRef = useRef(backendBusy);
   const fallbackTimeRef = useRef(0);
   const previousNowRef = useRef<number | null>(null);
+  const hiddenMaterialIndicesValueRef = useRef(hiddenMaterialIndices);
 
   modelRef.current = model;
   resultRef.current = result;
+  modelLoadingRef.current = modelLoading;
   poseEditingRef.current = poseEditing;
   selectedBoneIndexRef.current = selectedBoneIndex;
+  selectedMaterialIndexRef.current = selectedMaterialIndex;
+  if (hiddenMaterialIndicesValueRef.current !== hiddenMaterialIndices) {
+    hiddenMaterialIndicesValueRef.current = hiddenMaterialIndices;
+    hiddenMaterialIndexSetRef.current = new Set(hiddenMaterialIndices);
+  }
   onBoneSelectedRef.current = onBoneSelected;
+  onMaterialSelectedRef.current = onMaterialSelected;
   onPoseCommittedRef.current = onPoseCommitted;
   onBeforeRenderRef.current = onBeforeRender;
   onAfterRenderRef.current = onAfterRender;
@@ -619,7 +660,11 @@ export function Viewport3D({
     const instanceBinding = lifecycleBinding;
 
     const scene = new THREE.Scene();
-    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      powerPreference: "high-performance",
+      stencil: true,
+    });
     updateRendererSize(renderer, mount.clientWidth, mount.clientHeight);
     mount.appendChild(renderer.domElement);
 
@@ -694,6 +739,7 @@ export function Viewport3D({
       rimLight,
       hemisphereLight,
       mmdOutlinePass: null,
+      mmdSelectionOutlinePass: null,
       animationFrame: 0,
     };
     runtimeRef.current = runtime;
@@ -703,6 +749,8 @@ export function Viewport3D({
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
+    const materialPointerDocument = renderer.domElement.ownerDocument;
+    let materialPointerCandidate: ThreeMaterialPointerCandidate | null = null;
     const updatePointer = (event: PointerEvent) => {
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.set(
@@ -710,17 +758,66 @@ export function Viewport3D({
         -((event.clientY - rect.top) / Math.max(rect.height, 1)) * 2 + 1,
       );
     };
-    const selectBoneAtPointer = (event: PointerEvent) => {
-      if (event.button !== 0 || transformControls.dragging || transformControls.axis) return;
-      if (backendBusyRef.current) return;
-      const activeModel = modelRef.current;
-      if (!poseEditingRef.current || runtime.activeMode !== "source" || !activeModel || !runtime.boneMarkers) return;
+    const pickBoneAtPointer = (event: PointerEvent) => {
+      if (!runtime.boneMarkers) return null;
       updatePointer(event);
       raycaster.setFromCamera(pointer, controls.object as THREE.Camera);
       const hit = raycaster.intersectObject(runtime.boneMarkers, false)[0];
       const markerIndex = hit?.instanceId;
-      const boneIndex = markerIndex === undefined ? null : runtime.markerBoneIndices[markerIndex] ?? null;
-      onBoneSelectedRef.current(boneIndex);
+      return markerIndex === undefined ? null : runtime.markerBoneIndices[markerIndex] ?? null;
+    };
+    const beginMaterialPointer = (event: PointerEvent) => {
+      materialPointerCandidate = null;
+      if (
+        transformControls.dragging
+        || transformControls.axis
+        || backendBusyRef.current
+        || modelLoadingRef.current
+      ) return;
+      const activeModel = modelRef.current;
+      if (!activeModel || runtime.activeMode !== "source") return;
+      materialPointerCandidate = createThreeMaterialPointerCandidate(event, activeModel.id);
+    };
+    const moveMaterialPointer = (event: PointerEvent) => {
+      if (!materialPointerCandidate) return;
+      materialPointerCandidate = updateThreeMaterialPointerCandidate(materialPointerCandidate, event);
+    };
+    const finishMaterialPointer = (event: PointerEvent) => {
+      const candidate = materialPointerCandidate;
+      if (!candidate || candidate.pointerId !== event.pointerId) return;
+      materialPointerCandidate = null;
+      if (!completesThreeMaterialPointerClick(candidate, event)) return;
+      if (
+        transformControls.dragging
+        || transformControls.axis
+        || backendBusyRef.current
+        || modelLoadingRef.current
+      ) return;
+      const activeModel = modelRef.current;
+      if (!activeModel || activeModel.id !== candidate?.modelId || runtime.activeMode !== "source") return;
+
+      // 姿态编辑时保持骨骼域独占单击，避免一次交互同时改变骨骼和材质选择。
+      if (poseEditingRef.current) {
+        onBoneSelectedRef.current(pickBoneAtPointer(event));
+        return;
+      }
+
+      updatePointer(event);
+      raycaster.setFromCamera(pointer, controls.object as THREE.Camera);
+      const pickMeshes = collectThreeMmdMaterialPickMeshes(activeModel.root, activeModel.mesh);
+      const intersections = raycaster.intersectObjects(pickMeshes, false);
+      const materialIndex = resolveThreeMmdMaterialHit(
+        intersections,
+        materialListForThreeMmdMesh(activeModel.mesh),
+        hiddenMaterialIndexSetRef.current,
+      );
+      onMaterialSelectedRef.current(materialIndex === null ? null : {
+        modelId: candidate.modelId,
+        materialIndex,
+      });
+    };
+    const cancelMaterialPointer = (event: PointerEvent) => {
+      if (materialPointerCandidate?.pointerId === event.pointerId) materialPointerCandidate = null;
     };
     const beginTransform = () => {
       if (backendBusyRef.current) return;
@@ -750,7 +847,13 @@ export function Viewport3D({
       if (!activeModel || boneIndex === null) return;
       if (activeModel.endBoneEdit(boneIndex)) onPoseCommittedRef.current();
     };
-    renderer.domElement.addEventListener("pointerdown", selectBoneAtPointer);
+    renderer.domElement.addEventListener("pointerdown", beginMaterialPointer);
+    // Capture before TransformControls can release pointer capture on the
+    // canvas, otherwise a bone click may be cleared by lostpointercapture.
+    materialPointerDocument.addEventListener("pointermove", moveMaterialPointer, true);
+    materialPointerDocument.addEventListener("pointerup", finishMaterialPointer, true);
+    materialPointerDocument.addEventListener("pointercancel", cancelMaterialPointer, true);
+    renderer.domElement.addEventListener("lostpointercapture", cancelMaterialPointer);
     transformControls.addEventListener("mouseDown", beginTransform);
     transformControls.addEventListener("objectChange", updateTransform);
     transformControls.addEventListener("mouseUp", commitTransform);
@@ -824,6 +927,15 @@ export function Viewport3D({
       }).__MELY_E2E_DISABLE_MMD_OUTLINE__);
       if (runtime.activeMode === "source" && !outlineDisabledForE2e) {
         runtime.mmdOutlinePass?.render(renderer, scene, activeCamera);
+      }
+      if (runtime.activeMode === "source") {
+        runtime.mmdSelectionOutlinePass?.render(
+          renderer,
+          scene,
+          activeCamera,
+          selectedMaterialIndexRef.current,
+          hiddenMaterialIndexSetRef.current,
+        );
       }
       if (!materialProbeComplete) {
         materialProbeComplete = publishThreeMaterialProbe(renderer, modelRef.current);
@@ -920,7 +1032,11 @@ export function Viewport3D({
       try {
         attempt(() => resizeObserver.disconnect());
         attempt(() => cancelAnimationFrame(runtime.animationFrame));
-        attempt(() => renderer.domElement.removeEventListener("pointerdown", selectBoneAtPointer));
+        attempt(() => renderer.domElement.removeEventListener("pointerdown", beginMaterialPointer));
+        attempt(() => materialPointerDocument.removeEventListener("pointermove", moveMaterialPointer, true));
+        attempt(() => materialPointerDocument.removeEventListener("pointerup", finishMaterialPointer, true));
+        attempt(() => materialPointerDocument.removeEventListener("pointercancel", cancelMaterialPointer, true));
+        attempt(() => renderer.domElement.removeEventListener("lostpointercapture", cancelMaterialPointer));
         attempt(() => transformControls.removeEventListener("mouseDown", beginTransform));
         attempt(() => transformControls.removeEventListener("objectChange", updateTransform));
         attempt(() => transformControls.removeEventListener("mouseUp", commitTransform));
@@ -928,6 +1044,8 @@ export function Viewport3D({
         attempt(() => disposePoseHelpers(runtime));
         attempt(() => runtime.mmdOutlinePass?.dispose());
         runtime.mmdOutlinePass = null;
+        attempt(() => runtime.mmdSelectionOutlinePass?.dispose());
+        runtime.mmdSelectionOutlinePass = null;
         attempt(() => scene.remove(transformControls.getHelper()));
         attempt(() => transformControls.dispose());
         attempt(() => controls.dispose());
@@ -1011,21 +1129,33 @@ export function Viewport3D({
     const runtime = runtimeRef.current;
     if (!runtime) return;
 
-    if (attachedModelRef.current !== model) runtime.renderer.renderLists.dispose();
+    if (attachedModelRef.current !== model) {
+      runtime.renderer.renderLists.dispose();
+      framedModelIdRef.current = null;
+    }
     attachedModelRef.current = model;
     runtime.mmdOutlinePass?.dispose();
     runtime.mmdOutlinePass = null;
+    runtime.mmdSelectionOutlinePass?.dispose();
+    runtime.mmdSelectionOutlinePass = null;
     runtime.sourceContent.clear();
     runtime.sourceBounds.makeEmpty();
     if (!model) return;
 
     runtime.sourceContent.add(model.root);
     runtime.mmdOutlinePass = createThreeMmdOutlinePass(model.mesh);
+    runtime.mmdSelectionOutlinePass = createThreeMmdSelectionOutlinePass(
+      collectThreeMmdMaterialPickMeshes(model.root, model.mesh),
+    );
 
     return () => {
       if (runtime.mmdOutlinePass?.mesh === model.mesh) {
         runtime.mmdOutlinePass.dispose();
         runtime.mmdOutlinePass = null;
+      }
+      if (runtime.mmdSelectionOutlinePass?.meshes.includes(model.mesh)) {
+        runtime.mmdSelectionOutlinePass.dispose();
+        runtime.mmdSelectionOutlinePass = null;
       }
       if (model.root.parent === runtime.sourceContent) runtime.sourceContent.remove(model.root);
     };
@@ -1035,8 +1165,9 @@ export function Viewport3D({
     const runtime = runtimeRef.current;
     if (!runtime) return;
     if (!model || model.root.parent !== runtime.sourceContent) {
+      framedModelIdRef.current = null;
       runtime.sourceBounds.makeEmpty();
-      refreshActiveScene(runtime, previewMode, showBounds, previewMode === "source");
+      refreshActiveScene(runtime, previewMode, showBounds, false);
       return;
     }
 
@@ -1047,12 +1178,16 @@ export function Viewport3D({
     const rawBounds = model.visibleBounds();
     if (rawBounds.isEmpty()) {
       runtime.sourceBounds.makeEmpty();
-      refreshActiveScene(runtime, previewMode, showBounds, previewMode === "source");
+      framedModelIdRef.current = model.id;
+      refreshActiveScene(runtime, previewMode, showBounds, false);
       return;
     }
     runtime.sourceContent.updateMatrixWorld(true);
     runtime.sourceBounds.copy(rawBounds).applyMatrix4(model.root.matrixWorld);
-    refreshActiveScene(runtime, previewMode, showBounds, previewMode === "source");
+    const shouldFrameModel = framedModelIdRef.current !== model.id && previewMode === "source";
+    framedModelIdRef.current = model.id;
+    // 初次挂载仍需构图；后续材质可见性变化只刷新边界，不重置用户镜头。
+    refreshActiveScene(runtime, previewMode, showBounds, shouldFrameModel);
   }, [model, partsRevision, previewMode, showBounds]);
 
   useEffect(() => {
@@ -1140,11 +1275,17 @@ export function Viewport3D({
 
     if (result.kind === "solid") {
       const blockGeometry = new THREE.BoxGeometry(0.94, 0.94, 0.94);
+      const previewSource = createSolidPreviewSource(result);
+      const previewPoint: SolidPreviewPoint = { x: 0, y: 0, z: 0, paletteIndex: 0 };
+      const samplePlan = createProjectionPreviewSamplePlan(previewSource.pointCount);
       const counts = new Uint32Array(result.palette.length);
-      result.blockIndices.forEach((paletteIndex) => {
+      for (let sampleIndex = 0; sampleIndex < samplePlan.samplePointCount; sampleIndex += 1) {
+        const sourceIndex = samplePlan.sourceIndexAt(sampleIndex);
+        const paletteIndex = previewSource.pointAt(sourceIndex, previewPoint).paletteIndex;
         if (paletteIndex < counts.length) counts[paletteIndex] += 1;
-      });
+      }
       const meshes = result.palette.map((entry, paletteIndex) => {
+        if (counts[paletteIndex] === 0) return null;
         const [red, green, blue] = entry.color;
         const material = new THREE.MeshStandardMaterial({
           color: new THREE.Color().setRGB(
@@ -1171,16 +1312,19 @@ export function Viewport3D({
       const position = new THREE.Vector3();
       const quaternion = new THREE.Quaternion();
       const scale = new THREE.Vector3(1, 1, 1);
-      for (let index = 0; index < result.blockIndices.length; index += 1) {
-        const paletteIndex = result.blockIndices[index];
+      for (let sampleIndex = 0; sampleIndex < samplePlan.samplePointCount; sampleIndex += 1) {
+        const sourceIndex = samplePlan.sourceIndexAt(sampleIndex);
+        previewSource.pointAt(sourceIndex, previewPoint);
+        const paletteIndex = previewPoint.paletteIndex;
         const mesh = meshes[paletteIndex];
         if (!mesh) continue;
-        position.fromArray(result.positions, index * 3);
+        position.set(previewPoint.x, previewPoint.y, previewPoint.z);
         transform.compose(position, quaternion, scale);
         mesh.setMatrixAt(offsets[paletteIndex], transform);
         offsets[paletteIndex] += 1;
       }
       meshes.forEach((mesh) => {
+        if (!mesh) return;
         mesh.instanceMatrix.needsUpdate = true;
         hologramContent.add(mesh);
       });
@@ -1223,26 +1367,41 @@ export function Viewport3D({
     tagProjectionMaterial(capMaterial, { role: "endRodCap", lightLevel: 14 });
     tagProjectionMaterial(paneMaterial, { role: "pane" });
 
-    const endRods = new THREE.InstancedMesh(endRodGeometry, endRodMaterial, result.stats.endRodCount);
-    const caps = new THREE.InstancedMesh(capGeometry, capMaterial, result.stats.endRodCount);
-    const panes = new THREE.InstancedMesh(paneGeometry, paneMaterial, result.stats.paneCount);
+    const sourcePointCount = Math.min(
+      result.materials.length,
+      Math.floor(result.positions.length / 3),
+    );
+    // 末地烛在 Three 预览中需要主体和端盖两个实例，按最坏成本统一预留。
+    const samplePlan = createProjectionPreviewSamplePlan(sourcePointCount, 2);
+    let sampledEndRodCount = 0;
+    let sampledPaneCount = 0;
+    for (let sampleIndex = 0; sampleIndex < samplePlan.samplePointCount; sampleIndex += 1) {
+      const sourceIndex = samplePlan.sourceIndexAt(sampleIndex);
+      if (result.materials[sourceIndex] === 0) sampledEndRodCount += 1;
+      else sampledPaneCount += 1;
+    }
+    const endRods = new THREE.InstancedMesh(endRodGeometry, endRodMaterial, sampledEndRodCount);
+    const caps = new THREE.InstancedMesh(capGeometry, capMaterial, sampledEndRodCount);
+    const panes = new THREE.InstancedMesh(paneGeometry, paneMaterial, sampledPaneCount);
     const transform = new THREE.Matrix4();
     const capTransform = new THREE.Matrix4();
     const position = new THREE.Vector3();
+    const capPosition = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
     const scale = new THREE.Vector3(1, 1, 1);
     const capOffset = new THREE.Vector3(0, 0.47, 0);
     let endRodIndex = 0;
     let paneIndex = 0;
 
-    for (let index = 0; index < result.materials.length; index += 1) {
-      position.fromArray(result.positions, index * 3);
-      const quaternion = new THREE.Quaternion();
+    for (let sampleIndex = 0; sampleIndex < samplePlan.samplePointCount; sampleIndex += 1) {
+      const sourceIndex = samplePlan.sourceIndexAt(sampleIndex);
+      position.fromArray(result.positions, sourceIndex * 3);
       transform.compose(position, quaternion, scale);
 
-      if (result.materials[index] === 0) {
+      if (result.materials[sourceIndex] === 0) {
         endRods.setMatrixAt(endRodIndex, transform);
-        const offset = capOffset.clone().applyQuaternion(quaternion).add(position);
-        capTransform.compose(offset, quaternion, scale);
+        capPosition.copy(capOffset).applyQuaternion(quaternion).add(position);
+        capTransform.compose(capPosition, quaternion, scale);
         caps.setMatrixAt(endRodIndex, capTransform);
         endRodIndex += 1;
       } else {

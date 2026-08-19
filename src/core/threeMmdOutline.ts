@@ -1,6 +1,9 @@
 import * as THREE from "three";
 
 export const THREE_MMD_OUTLINE_LAYER = 31;
+export const THREE_MMD_SELECTION_OUTLINE_LAYER = 30;
+export const THREE_MMD_SELECTION_OUTLINE_THICKNESS = 0.005;
+export const THREE_MMD_SELECTION_OUTLINE_COLOR = [1, 0.58, 0.12] as const;
 
 export interface ThreeMmdOutlineParameters {
   thickness: number;
@@ -426,11 +429,18 @@ const createOutlineMaterial = (
   return material;
 };
 
-export const updateThreeMmdOutlineMaterial = (
+interface ThreeOutlineStyle {
+  thickness: number;
+  color: readonly [number, number, number];
+  alpha: number;
+  visible: boolean;
+}
+
+const applyThreeOutlineMaterialSurface = (
   target: ThreeMmdOutlineMaterial,
   source: MaterialWithMmdOutline,
+  style: ThreeOutlineStyle,
 ) => {
-  const parameters = readThreeMmdOutlineParameters(source);
   const mapUsesAlpha = textureUsesAlpha(source.map);
   const previousProgramState = [
     Boolean(target.map),
@@ -442,20 +452,19 @@ export const updateThreeMmdOutlineMaterial = (
     target.premultipliedAlpha,
     target.transparent,
   ].join(":");
-  const outlineVisible = Boolean(
-    source.visible
-    && parameters?.visible
-    && parameters.thickness > OUTLINE_EPSILON
-    && parameters.alpha > OUTLINE_EPSILON
+  target.visible = Boolean(
+    style.visible
+    && style.thickness > OUTLINE_EPSILON
+    && style.alpha > OUTLINE_EPSILON
+    && source.visible
     && source.opacity > OUTLINE_EPSILON
     && source.depthTest
     && source.wireframe !== true
   );
-  target.visible = outlineVisible;
   target.transparent = Boolean(
     source.transparent
     || source.opacity < 1
-    || (parameters?.alpha ?? 1) < 1
+    || style.alpha < 1
     || mapUsesAlpha
   );
   target.depthTest = source.depthTest;
@@ -476,9 +485,9 @@ export const updateThreeMmdOutlineMaterial = (
   target.alphaMap = source.alphaMap ?? null;
   target.alphaTest = source.alphaTest;
   target.displacementMap = source.displacementMap ?? null;
-  target.uniforms.outlineThickness.value = parameters?.thickness ?? 0;
-  target.uniforms.outlineColor.value.fromArray(parameters?.color ?? [0, 0, 0]);
-  target.uniforms.outlineAlpha.value = (parameters?.alpha ?? 0) * source.opacity;
+  target.uniforms.outlineThickness.value = style.thickness;
+  target.uniforms.outlineColor.value.fromArray(style.color);
+  target.uniforms.outlineAlpha.value = style.alpha * source.opacity;
   target.uniforms.opacity.value = source.opacity;
   target.uniforms.map.value = target.map;
   target.uniforms.alphaMap.value = target.alphaMap;
@@ -512,6 +521,32 @@ export const updateThreeMmdOutlineMaterial = (
   target.uniformsNeedUpdate = true;
 };
 
+export const updateThreeMmdOutlineMaterial = (
+  target: ThreeMmdOutlineMaterial,
+  source: MaterialWithMmdOutline,
+) => {
+  const parameters = readThreeMmdOutlineParameters(source);
+  applyThreeOutlineMaterialSurface(target, source, {
+    thickness: parameters?.thickness ?? 0,
+    color: parameters?.color ?? [0, 0, 0],
+    alpha: parameters?.alpha ?? 0,
+    visible: parameters?.visible === true,
+  });
+};
+
+export const updateThreeMmdSelectionOutlineMaterial = (
+  target: ThreeMmdOutlineMaterial,
+  source: THREE.Material,
+  selected: boolean,
+) => {
+  applyThreeOutlineMaterialSurface(target, source as MaterialWithMmdOutline, {
+    thickness: THREE_MMD_SELECTION_OUTLINE_THICKNESS,
+    color: THREE_MMD_SELECTION_OUTLINE_COLOR,
+    alpha: 1,
+    visible: selected,
+  });
+};
+
 export const syncThreeMmdOutlineMaterials = (
   targets: readonly ThreeMmdOutlineMaterial[],
   sources: readonly THREE.Material[],
@@ -537,6 +572,275 @@ export interface ThreeMmdOutlinePass {
     sourceCamera: THREE.Camera,
   ) => void;
 }
+
+export interface ThreeMmdSelectionOutlinePass {
+  readonly meshes: readonly THREE.SkinnedMesh[];
+  readonly outlineMeshes: readonly THREE.SkinnedMesh[];
+  readonly maskMeshes: readonly THREE.SkinnedMesh[];
+  readonly materials: readonly ThreeMmdOutlineMaterial[];
+  readonly maskMaterials: readonly ThreeMmdOutlineMaterial[];
+  readonly sdefVertexCount: number;
+  readonly sdefAttributeContracts: readonly (ThreeMmdSdefAttributeContract | null)[];
+  dispose: () => void;
+  render: (
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    sourceCamera: THREE.Camera,
+    selectedMaterialIndex: number | null,
+    hiddenMaterialIndices?: ReadonlySet<number>,
+  ) => void;
+}
+
+interface ThreeSelectionOutlineEntry {
+  sourceMesh: THREE.SkinnedMesh;
+  sourceMaterials: MaterialWithMmdOutline[];
+  canonicalMaterialIndices: readonly (number | null)[];
+  outlineMesh: THREE.SkinnedMesh;
+  outlineMaterials: ThreeMmdOutlineMaterial[];
+  maskMesh: THREE.SkinnedMesh;
+  maskMaterials: ThreeMmdOutlineMaterial[];
+  sdefAttributeContract: ThreeMmdSdefAttributeContract | null;
+  sdefVertexCount: number;
+}
+
+const isSkinnedMesh = (value: unknown): value is THREE.SkinnedMesh => Boolean(
+  value
+  && typeof value === "object"
+  && (value as { isSkinnedMesh?: boolean }).isSkinnedMesh,
+);
+
+const selectionCanonicalMaterialIndices = (
+  mesh: THREE.SkinnedMesh,
+  materialCount: number,
+) => {
+  const splitIndex = mesh.userData.mmdMorphSplitBody?.materialIndex;
+  const proxyIndex = mesh.userData.mmdMaterialRenderProxy?.materialIndex;
+  const override = Number.isInteger(splitIndex)
+    ? splitIndex as number
+    : Number.isInteger(proxyIndex)
+      ? proxyIndex as number
+      : null;
+  return Array.from({ length: materialCount }, (_, index) => override ?? index);
+};
+
+const createSelectionOutlineEntry = (mesh: THREE.SkinnedMesh): ThreeSelectionOutlineEntry => {
+  const sourceMaterials = materialList(mesh);
+  const sdefAttributes = inspectSdefAttributes(mesh);
+  const sdefAttributeContract = sdefAttributes.vertexCount > 0 ? sdefAttributes.contract : null;
+  const outlineMaterials = sourceMaterials.map((source) => (
+    createOutlineMaterial(source, sdefAttributeContract)
+  ));
+  const maskMaterials = sourceMaterials.map((source) => (
+    createOutlineMaterial(source, sdefAttributeContract)
+  ));
+  const outlineMesh = new THREE.SkinnedMesh(mesh.geometry, outlineMaterials);
+  outlineMesh.name = "MELY MMD selection outline";
+  outlineMesh.userData.melyMmdSelectionOutlineProxy = true;
+  outlineMesh.bindMode = mesh.bindMode;
+  outlineMesh.bind(mesh.skeleton, mesh.bindMatrix);
+  outlineMesh.bindMatrixInverse.copy(mesh.bindMatrixInverse);
+  outlineMesh.morphTargetInfluences = mesh.morphTargetInfluences;
+  outlineMesh.morphTargetDictionary = mesh.morphTargetDictionary;
+  outlineMesh.frustumCulled = mesh.frustumCulled;
+  outlineMesh.matrixAutoUpdate = false;
+  outlineMesh.matrixWorldAutoUpdate = false;
+  outlineMesh.layers.set(THREE_MMD_SELECTION_OUTLINE_LAYER);
+  const maskMesh = new THREE.SkinnedMesh(mesh.geometry, maskMaterials);
+  maskMesh.name = "MELY MMD selection stencil mask";
+  maskMesh.userData.melyMmdSelectionOutlineProxy = true;
+  maskMesh.bindMode = mesh.bindMode;
+  maskMesh.bind(mesh.skeleton, mesh.bindMatrix);
+  maskMesh.bindMatrixInverse.copy(mesh.bindMatrixInverse);
+  maskMesh.morphTargetInfluences = mesh.morphTargetInfluences;
+  maskMesh.morphTargetDictionary = mesh.morphTargetDictionary;
+  maskMesh.frustumCulled = mesh.frustumCulled;
+  maskMesh.matrixAutoUpdate = false;
+  maskMesh.matrixWorldAutoUpdate = false;
+  maskMesh.layers.set(THREE_MMD_SELECTION_OUTLINE_LAYER);
+  return {
+    sourceMesh: mesh,
+    sourceMaterials,
+    canonicalMaterialIndices: selectionCanonicalMaterialIndices(mesh, sourceMaterials.length),
+    outlineMesh,
+    outlineMaterials,
+    maskMesh,
+    maskMaterials,
+    sdefAttributeContract,
+    sdefVertexCount: sdefAttributes.vertexCount,
+  };
+};
+
+const copyOutlineCamera = (
+  previous: THREE.Camera | null,
+  source: THREE.Camera,
+  layer: number,
+) => {
+  const camera = !previous || previous.type !== source.type ? source.clone() : previous;
+  if (camera === previous) camera.copy(source, false);
+  camera.layers.set(layer);
+  camera.matrixWorld.copy(source.matrixWorld);
+  camera.matrixWorldInverse.copy(source.matrixWorldInverse);
+  camera.projectionMatrix.copy(source.projectionMatrix);
+  camera.projectionMatrixInverse.copy(source.projectionMatrixInverse);
+  return camera;
+};
+
+const hierarchyIsVisible = (object: THREE.Object3D) => {
+  let current: THREE.Object3D | null = object;
+  while (current) {
+    if (!current.visible) return false;
+    current = current.parent;
+  }
+  return true;
+};
+
+/**
+ * Creates a selection-only hull pass without touching source mesh layers. It
+ * can coexist with the native MMD outline and has an independent lifecycle.
+ */
+export const createThreeMmdSelectionOutlinePass = (
+  meshes: readonly THREE.SkinnedMesh[],
+): ThreeMmdSelectionOutlinePass => {
+  const uniqueMeshes = [...new Map(
+    meshes.filter(isSkinnedMesh).map((mesh) => [mesh.uuid, mesh]),
+  ).values()];
+  const entries = uniqueMeshes.map(createSelectionOutlineEntry);
+  const outlineScene = new THREE.Scene();
+  outlineScene.matrixWorldAutoUpdate = false;
+  entries.forEach((entry) => outlineScene.add(entry.outlineMesh));
+  const maskScene = new THREE.Scene();
+  maskScene.matrixWorldAutoUpdate = false;
+  entries.forEach((entry) => maskScene.add(entry.maskMesh));
+  let outlineCamera: THREE.Camera | null = null;
+  let disposed = false;
+
+  return {
+    meshes: uniqueMeshes,
+    outlineMeshes: entries.map((entry) => entry.outlineMesh),
+    maskMeshes: entries.map((entry) => entry.maskMesh),
+    materials: entries.flatMap((entry) => entry.outlineMaterials),
+    maskMaterials: entries.flatMap((entry) => entry.maskMaterials),
+    sdefVertexCount: entries.reduce((count, entry) => count + entry.sdefVertexCount, 0),
+    sdefAttributeContracts: entries.map((entry) => entry.sdefAttributeContract),
+    render: (
+      renderer,
+      scene,
+      sourceCamera,
+      selectedMaterialIndex,
+      hiddenMaterialIndices = new Set<number>(),
+    ) => {
+      if (disposed) return;
+      if (selectedMaterialIndex === null || hiddenMaterialIndices.has(selectedMaterialIndex)) {
+        entries.forEach((entry) => {
+          entry.outlineMaterials.forEach((material) => {
+            material.visible = false;
+          });
+          entry.maskMaterials.forEach((material) => {
+            material.visible = false;
+          });
+        });
+        return;
+      }
+      let hasVisibleSelection = false;
+      entries.forEach((entry) => {
+        const {
+          sourceMesh,
+          sourceMaterials,
+          outlineMesh,
+          outlineMaterials,
+          maskMesh,
+          maskMaterials,
+        } = entry;
+        const hierarchyVisible = Boolean(sourceMesh.parent) && hierarchyIsVisible(sourceMesh);
+        outlineMaterials.forEach((material, index) => {
+          const selected = hierarchyVisible
+            && entry.canonicalMaterialIndices[index] === selectedMaterialIndex;
+          updateThreeMmdSelectionOutlineMaterial(material, sourceMaterials[index], selected);
+          material.side = THREE.DoubleSide;
+          material.depthWrite = false;
+          material.stencilWrite = true;
+          material.stencilWriteMask = 0;
+          material.stencilFunc = THREE.NotEqualStencilFunc;
+          material.stencilRef = 1;
+          material.stencilFuncMask = 0xff;
+          material.stencilFail = THREE.KeepStencilOp;
+          material.stencilZFail = THREE.KeepStencilOp;
+          material.stencilZPass = THREE.KeepStencilOp;
+
+          const maskMaterial = maskMaterials[index];
+          updateThreeMmdSelectionOutlineMaterial(maskMaterial, sourceMaterials[index], selected);
+          maskMaterial.uniforms.outlineThickness.value = 0;
+          maskMaterial.side = THREE.DoubleSide;
+          maskMaterial.colorWrite = false;
+          maskMaterial.depthWrite = false;
+          maskMaterial.stencilWrite = true;
+          maskMaterial.stencilWriteMask = 0xff;
+          maskMaterial.stencilFunc = THREE.AlwaysStencilFunc;
+          maskMaterial.stencilRef = 1;
+          maskMaterial.stencilFuncMask = 0xff;
+          maskMaterial.stencilFail = THREE.KeepStencilOp;
+          maskMaterial.stencilZFail = THREE.KeepStencilOp;
+          maskMaterial.stencilZPass = THREE.ReplaceStencilOp;
+          hasVisibleSelection ||= material.visible;
+        });
+        outlineMesh.matrixWorld.copy(sourceMesh.matrixWorld);
+        outlineMesh.bindMatrix.copy(sourceMesh.bindMatrix);
+        outlineMesh.bindMatrixInverse.copy(sourceMesh.bindMatrixInverse);
+        outlineMesh.morphTargetInfluences = sourceMesh.morphTargetInfluences;
+        outlineMesh.visible = hierarchyVisible;
+        maskMesh.matrixWorld.copy(sourceMesh.matrixWorld);
+        maskMesh.bindMatrix.copy(sourceMesh.bindMatrix);
+        maskMesh.bindMatrixInverse.copy(sourceMesh.bindMatrixInverse);
+        maskMesh.morphTargetInfluences = sourceMesh.morphTargetInfluences;
+        maskMesh.visible = hierarchyVisible;
+      });
+      if (!hasVisibleSelection) return;
+
+      outlineCamera = copyOutlineCamera(
+        outlineCamera,
+        sourceCamera,
+        THREE_MMD_SELECTION_OUTLINE_LAYER,
+      );
+      const previousAutoClear = renderer.autoClear;
+      const previousBackground = outlineScene.background;
+      const previousMaskBackground = maskScene.background;
+      const previousFog = outlineScene.fog;
+      const previousMaskFog = maskScene.fog;
+      const previousShadowMap = renderer.shadowMap.enabled;
+      outlineScene.background = null;
+      maskScene.background = null;
+      outlineScene.fog = scene.fog;
+      maskScene.fog = scene.fog;
+      renderer.autoClear = false;
+      renderer.shadowMap.enabled = false;
+      try {
+        renderer.clearStencil();
+        renderer.render(maskScene, outlineCamera);
+        renderer.render(outlineScene, outlineCamera);
+        renderer.clearStencil();
+      } finally {
+        renderer.shadowMap.enabled = previousShadowMap;
+        renderer.autoClear = previousAutoClear;
+        outlineScene.background = previousBackground;
+        maskScene.background = previousMaskBackground;
+        outlineScene.fog = previousFog;
+        maskScene.fog = previousMaskFog;
+      }
+    },
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      entries.forEach((entry) => {
+        outlineScene.remove(entry.outlineMesh);
+        maskScene.remove(entry.maskMesh);
+        entry.outlineMaterials.forEach((material) => material.dispose());
+        entry.maskMaterials.forEach((material) => material.dispose());
+        entry.outlineMesh.material = [];
+        entry.maskMesh.material = [];
+      });
+    },
+  };
+};
 
 export const createThreeMmdOutlinePass = (
   mesh: THREE.SkinnedMesh,

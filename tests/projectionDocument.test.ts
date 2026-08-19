@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   PROJECTION_CHUNK_SIZE,
   countProjectionMaterials,
+  assertProjectionDocumentIntegrity,
   createProjectionDocument,
   createProjectionDocumentFromHologram,
   createProjectionDocumentFromSolid,
@@ -100,6 +101,86 @@ test("solid and hologram results convert without losing positions or block state
     "0,0,0:1",
     "32,0,-1:1",
   ]);
+});
+
+test("chunked solid results become projection chunks without flattening or copying", () => {
+  const positions = new Uint16Array([0, 31 + 32 * (4 + 32 * 5)]);
+  const blockIndices = new Uint16Array([1, 0]);
+  const solid: SolidVoxelResult = {
+    kind: "solid",
+    storage: "chunked",
+    positions: new Float32Array(0),
+    blockIndices: new Uint16Array(0),
+    chunks: [{ chunk: [-1, 2, 3], positions, blockIndices }],
+    palette: [
+      { blockId: "minecraft:white_concrete", color: [207, 213, 214] },
+      { blockId: "minecraft:black_concrete", color: [8, 10, 15] },
+    ],
+    stats: {
+      blockCount: 2,
+      surfaceBlockCount: 2,
+      filledBlockCount: 0,
+      skinBlockCount: 0,
+      alphaRejected: 0,
+      triangleBoxTests: 2,
+      paletteSize: 2,
+      dimensions: [32, 6, 5],
+    },
+    bounds: { min: [-32, 64, 96], max: [-1, 69, 100] },
+  };
+
+  const document = createProjectionDocumentFromSolid(solid);
+
+  assert.equal(document.chunks[0].positions, positions);
+  assert.equal(document.chunks[0].paletteIndices, blockIndices);
+  assert.deepEqual([...iterateProjectionBlocks(document)].map(blockKey), [
+    "-32,64,96:1",
+    "-1,69,100:0",
+  ]);
+  assert.deepEqual(document.bounds, {
+    min: [-32, 64, 96],
+    max: [-1, 69, 100],
+    dimensions: [32, 6, 5],
+  });
+  assert.doesNotThrow(() => assertProjectionDocumentIntegrity(document));
+});
+
+test("chunked document integrity rejects structural corruption without resource limits", () => {
+  const createChunked = (positions: number[]) => createProjectionDocumentFromSolid({
+    kind: "solid",
+    storage: "chunked",
+    positions: new Float32Array(0),
+    blockIndices: new Uint16Array(0),
+    chunks: [{
+      chunk: [0, 0, 0],
+      positions: new Uint16Array(positions),
+      blockIndices: new Uint16Array(positions.length),
+    }],
+    palette: [{ blockId: "minecraft:stone", color: [125, 125, 125] }],
+    stats: {
+      blockCount: positions.length,
+      surfaceBlockCount: positions.length,
+      filledBlockCount: 0,
+      skinBlockCount: 0,
+      alphaRejected: 0,
+      triangleBoxTests: positions.length,
+      paletteSize: 1,
+      dimensions: [1, 1, positions.length],
+    },
+    bounds: { min: [0, 0, 0], max: [0, 0, positions.length - 1] },
+  });
+
+  assert.throws(() => createChunked([1, 1]), /strictly increasing|unique/i);
+  assert.throws(() => createChunked([2, 1]), /strictly increasing/i);
+
+  const duplicatedChunk = createChunked([1]);
+  duplicatedChunk.chunks.push({
+    chunk: [0, 0, 0],
+    positions: new Uint16Array([2]),
+    paletteIndices: new Uint16Array([0]),
+  });
+  duplicatedChunk.blockCount += 1;
+  assert.throws(() => assertProjectionDocumentIntegrity(duplicatedChunk), /duplicate chunk/i);
 });
 
 test("hologram document conversion and final assertion reject mixed six-way neighbours", () => {

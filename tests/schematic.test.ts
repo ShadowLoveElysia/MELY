@@ -65,7 +65,23 @@ test("Sponge schematic v3 is gzip-compressed canonical NBT with sparse blocks", 
   assert.deepEqual(root.Entities, []);
 });
 
-test("Sponge schematic rejects empty and oversized dense bounds", () => {
+test("Sponge schematic supplies the Buffer runtime required by nbt-ts", () => {
+  const runtime = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
+  const previousBuffer = runtime.Buffer;
+  Reflect.deleteProperty(runtime, "Buffer");
+  try {
+    const document = createProjectionDocument([
+      { position: [0, 0, 0], paletteIndex: 0 },
+    ], [{ blockId: "minecraft:stone" }]);
+    const exported = createSchematic(document);
+    assert.ok(exported.bytes.byteLength > 0);
+    assert.equal(runtime.Buffer, undefined);
+  } finally {
+    if (previousBuffer !== undefined) runtime.Buffer = previousBuffer;
+  }
+});
+
+test("Sponge schematic treats maxVolume as a warning threshold, not a serializer gate", () => {
   assert.throws(
     () => createSchematic(createProjectionDocument([], [{ blockId: "minecraft:stone" }])),
     /empty/i,
@@ -74,7 +90,12 @@ test("Sponge schematic rejects empty and oversized dense bounds", () => {
     { position: [0, 0, 0], paletteIndex: 0 },
     { position: [100, 100, 100], paletteIndex: 0 },
   ], [{ blockId: "minecraft:stone" }]);
-  assert.throws(() => createSchematic(sparse, { maxVolume: 1000 }), /exceeds limit/i);
+  const exported = createSchematic(sparse, { maxVolume: 1000 });
+  assert.equal(exported.summary.volume, 1_030_301);
+  assert.throws(
+    () => createSchematic(sparse, { maxVolume: 0 }),
+    /warning threshold must be a positive safe integer/i,
+  );
 });
 
 test("Sponge serializer uses compatibility metadata for untested registered versions", async () => {

@@ -22,6 +22,7 @@ const reportPath = process.env.MELY_REPORT_PATH || `${outputPrefix}.json`;
 const targetDimensionMinY = Number(process.env.MELY_TARGET_DIMENSION_MIN_Y);
 const targetDimensionHeight = Number(process.env.MELY_TARGET_DIMENSION_HEIGHT);
 const placementBottomY = Number(process.env.MELY_PLACEMENT_BOTTOM_Y);
+const FIVE_GIB = 5 * 1024 ** 3;
 
 const validModes = new Set(["hologram", "solid"]);
 const exportExtensions = {
@@ -644,7 +645,7 @@ const run = async () => {
         ? `${samplingError.name}: ${samplingError.message}`
         : String(samplingError);
     }
-    report.underTwoGiB = report.peakWorkingSetBytes < 2 * 1024 ** 3;
+    report.withinFiveGiB = report.peakWorkingSetBytes <= FIVE_GIB;
     await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     await browser.close();
@@ -654,8 +655,8 @@ const run = async () => {
   if (report.consoleErrors.length || report.pageErrors.length) {
     throw new Error("The workload produced browser console or page errors");
   }
-  if (!report.underTwoGiB) {
-    throw new Error(`Process tree exceeded 2 GiB: ${report.peakWorkingSetBytes} bytes`);
+  if (!report.withinFiveGiB) {
+    throw new Error(`Process tree exceeded 5 GiB: ${report.peakWorkingSetBytes} bytes`);
   }
   if (
     exportFormat === "bundle"

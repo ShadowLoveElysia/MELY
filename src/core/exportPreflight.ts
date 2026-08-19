@@ -33,6 +33,7 @@ export interface ExportPreflightOptions {
 export interface ExportPreflightResult {
   format: ExportPreflightFormat;
   allowed: boolean;
+  requiresConfirmation: boolean;
   reason: ExportPreflightReason | null;
   dimensions: [number, number, number] | null;
   volume: number | null;
@@ -46,6 +47,7 @@ export interface HeightAwareExportPreflightResult extends Omit<ExportPreflightRe
   reason: HeightAwareExportPreflightReason | null;
   heightErrorCode: HeightSafetyErrorCode | null;
   requiredHeight: number;
+  confirmationHeight: number;
   actualHeight: number;
   placementMinY: number;
   placementMaxY: number;
@@ -68,8 +70,12 @@ export interface JavaProjectionExportSafetyInput extends Partial<
 
 export const DEFAULT_DENSE_EXPORT_VOLUME_LIMIT = 64 * 1024 * 1024;
 export const SCHEMATIC_DIMENSION_LIMIT = 0x7fff;
+export const DENSE_NBT_ARRAY_LENGTH_LIMIT = 0x7fff_ffff;
 
 const denseFormats = new Set<ExportPreflightFormat>(["schematic", "mcstructure"]);
+
+const exceedsSignedInt32 = (value: number) =>
+  !Number.isInteger(value) || value < -0x8000_0000 || value > 0x7fff_ffff;
 
 const validatedVolumeLimit = (options: ExportPreflightOptions) => {
   const limit = options.volumeLimit ?? options.maxVolume ?? DEFAULT_DENSE_EXPORT_VOLUME_LIMIT;
@@ -102,6 +108,7 @@ export const preflightProjectionExport = (
     return {
       format,
       allowed: false,
+      requiresConfirmation: false,
       reason: "empty",
       dimensions: null,
       volume: null,
@@ -115,12 +122,41 @@ export const preflightProjectionExport = (
   const dimensionLimit = format === "schematic" ? SCHEMATIC_DIMENSION_LIMIT : null;
   const volumeLimit = denseFormats.has(format) ? validatedVolumeLimit(options) : null;
 
+  if (format === "mcstructure" && (
+    dimensions.some(exceedsSignedInt32) || document.bounds.min.some(exceedsSignedInt32)
+  )) {
+    return {
+      format,
+      allowed: false,
+      requiresConfirmation: false,
+      reason: "dimensionLimit",
+      dimensions,
+      volume: measured.volume,
+      volumeLimit,
+      dimensionLimit: 0x7fff_ffff,
+    };
+  }
+
+  if (format === "schematic" && document.bounds.min.some(exceedsSignedInt32)) {
+    return {
+      format,
+      allowed: false,
+      requiresConfirmation: false,
+      reason: "dimensionLimit",
+      dimensions,
+      volume: measured.volume,
+      volumeLimit,
+      dimensionLimit: 0x7fff_ffff,
+    };
+  }
+
   if (dimensionLimit !== null && dimensions.some((dimension) => (
     !Number.isSafeInteger(dimension) || dimension <= 0 || dimension > dimensionLimit
   ))) {
     return {
       format,
       allowed: false,
+      requiresConfirmation: false,
       reason: "dimensionLimit",
       dimensions,
       volume: measured.volume,
@@ -129,10 +165,28 @@ export const preflightProjectionExport = (
     };
   }
 
-  if (volumeLimit !== null && (!measured.safe || measured.volume > volumeLimit)) {
+  // Sponge BlockData 与 Bedrock block_indices 都使用 NBT 有符号 32 位数组长度。
+  // 这是格式可表示性边界，不能通过用户确认绕过。
+  if (denseFormats.has(format) && (
+    !measured.safe || measured.volume > DENSE_NBT_ARRAY_LENGTH_LIMIT
+  )) {
     return {
       format,
       allowed: false,
+      requiresConfirmation: false,
+      reason: "unsafeVolume",
+      dimensions,
+      volume: measured.volume,
+      volumeLimit: DENSE_NBT_ARRAY_LENGTH_LIMIT,
+      dimensionLimit,
+    };
+  }
+
+  if (volumeLimit !== null && measured.volume > volumeLimit) {
+    return {
+      format,
+      allowed: true,
+      requiresConfirmation: true,
       reason: "unsafeVolume",
       dimensions,
       volume: measured.volume,
@@ -144,6 +198,7 @@ export const preflightProjectionExport = (
   return {
     format,
     allowed: true,
+    requiresConfirmation: false,
     reason: null,
     dimensions,
     volume: measured.volume,
@@ -304,6 +359,7 @@ export const preflightProjectionHeightExport = (
       ...structural,
       heightErrorCode: null,
       requiredHeight: input.targetHeight,
+      confirmationHeight: input.targetHeight,
       actualHeight: document.bounds?.dimensions[1] ?? 0,
       placementMinY: input.placementBottomY,
       placementMaxY: input.placementBottomY + Math.max(0, (document.bounds?.dimensions[1] ?? 0) - 1),
@@ -317,6 +373,7 @@ export const preflightProjectionHeightExport = (
   const common = {
     ...structural,
     requiredHeight: height.requiredHeight,
+    confirmationHeight: height.confirmationHeight,
     actualHeight: height.actualHeight,
     placementMinY: height.placementMinY,
     placementMaxY: height.placementMaxY,

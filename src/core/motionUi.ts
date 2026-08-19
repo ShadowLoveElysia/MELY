@@ -40,6 +40,16 @@ export const normalizeMotionFrame = (frame: number, maxFrame: number) => {
   return Math.max(0, Math.min(maximum, rounded));
 };
 
+export const parseMotionFrameInput = (
+  value: string,
+  maxFrame: number,
+): number | null => {
+  const normalized = value.trim();
+  if (!normalized) return null;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? normalizeMotionFrame(parsed, maxFrame) : null;
+};
+
 export const getAdjacentMotionFrame = (
   frame: number,
   maxFrame: number,

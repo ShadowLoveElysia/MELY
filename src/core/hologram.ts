@@ -16,7 +16,6 @@ import {
   validFaceFrame,
   type FaceFeatureKind,
 } from "./faceFeatures";
-import { assertSixWayIsolated } from "./hologramIsolation";
 
 type Point = [number, number, number];
 type FeatureKind = "outline" | "garment" | "face" | "depth" | "slice";
@@ -56,6 +55,164 @@ interface Sample {
   priority: number;
   tier: SampleTier;
   stableScore: number;
+}
+
+const SAMPLE_BUFFER_INITIAL_CAPACITY = 16_384;
+const SAMPLE_BUFFER_MAX_LENGTH = Math.floor(0xffff_ffff / 3);
+const HOLOGRAM_OCCUPANCY_CHUNK_SIZE = 16;
+const HOLOGRAM_OCCUPANCY_CHUNK_VOLUME = HOLOGRAM_OCCUPANCY_CHUNK_SIZE ** 3;
+const HOLOGRAM_OCCUPANCY_WORDS = HOLOGRAM_OCCUPANCY_CHUNK_VOLUME / 32;
+
+/**
+ * 候选量在用户确认资源风险后可以超过建议阈值，因此使用连续 typed buffer，
+ * 避免每个候选都长期持有 JS 对象和三元数组。
+ */
+class SampleBuffer {
+  private capacity = 0;
+  private positions = new Int32Array(0);
+  private facings = new Uint8Array(0);
+  private materials = new Uint8Array(0);
+  private priorities = new Float64Array(0);
+  private tiers = new Uint8Array(0);
+  private stableScores = new Uint32Array(0);
+
+  length = 0;
+
+  push(sample: Sample) {
+    this.append(
+      sample.position,
+      sample.facing,
+      sample.material,
+      sample.priority,
+      TIER_PRIORITY[sample.tier],
+      sample.stableScore,
+    );
+  }
+
+  append(
+    position: Point,
+    facing: number,
+    material: number,
+    priority: number,
+    tier: number,
+    stableScore: number,
+  ) {
+    assertStoragePoint(position);
+    this.ensureCapacity(this.length + 1);
+    const offset = this.length * 3;
+    this.positions[offset] = position[0];
+    this.positions[offset + 1] = position[1];
+    this.positions[offset + 2] = position[2];
+    this.facings[this.length] = facing;
+    this.materials[this.length] = material;
+    this.priorities[this.length] = priority;
+    this.tiers[this.length] = tier;
+    this.stableScores[this.length] = stableScore;
+    this.length += 1;
+  }
+
+  appendFrom(source: SampleBuffer, index: number) {
+    this.append(
+      source.point(index),
+      source.facing(index),
+      source.material(index),
+      source.priority(index),
+      source.tier(index),
+      source.stableScore(index),
+    );
+  }
+
+  point(index: number): Point {
+    const offset = index * 3;
+    return [
+      this.positions[offset],
+      this.positions[offset + 1],
+      this.positions[offset + 2],
+    ];
+  }
+
+  facing(index: number) {
+    return this.facings[index];
+  }
+
+  material(index: number) {
+    return this.materials[index];
+  }
+
+  priority(index: number) {
+    return this.priorities[index];
+  }
+
+  tier(index: number) {
+    return this.tiers[index];
+  }
+
+  stableScore(index: number) {
+    return this.stableScores[index];
+  }
+
+  sortedIndices() {
+    const indices = new Uint32Array(this.length);
+    for (let index = 0; index < this.length; index += 1) indices[index] = index;
+    indices.sort((left, right) => compareBufferedSamples(this, left, right));
+    return indices;
+  }
+
+  private ensureCapacity(required: number) {
+    if (required <= this.capacity) return;
+    if (!Number.isSafeInteger(required) || required > SAMPLE_BUFFER_MAX_LENGTH) {
+      throw new RangeError("Hologram candidate count exceeds the addressable buffer range");
+    }
+    let nextCapacity = Math.max(SAMPLE_BUFFER_INITIAL_CAPACITY, this.capacity || 1);
+    while (nextCapacity < required) {
+      nextCapacity = Math.min(SAMPLE_BUFFER_MAX_LENGTH, nextCapacity * 2);
+      if (nextCapacity < required && nextCapacity === SAMPLE_BUFFER_MAX_LENGTH) {
+        throw new RangeError("Hologram candidate count exceeds the addressable buffer range");
+      }
+    }
+    const positions = new Int32Array(nextCapacity * 3);
+    const facings = new Uint8Array(nextCapacity);
+    const materials = new Uint8Array(nextCapacity);
+    const priorities = new Float64Array(nextCapacity);
+    const tiers = new Uint8Array(nextCapacity);
+    const stableScores = new Uint32Array(nextCapacity);
+    positions.set(this.positions.subarray(0, this.length * 3));
+    facings.set(this.facings.subarray(0, this.length));
+    materials.set(this.materials.subarray(0, this.length));
+    priorities.set(this.priorities.subarray(0, this.length));
+    tiers.set(this.tiers.subarray(0, this.length));
+    stableScores.set(this.stableScores.subarray(0, this.length));
+    this.positions = positions;
+    this.facings = facings;
+    this.materials = materials;
+    this.priorities = priorities;
+    this.tiers = tiers;
+    this.stableScores = stableScores;
+    this.capacity = nextCapacity;
+  }
+}
+
+/** 每个 16x16x16 区块只分配 512 字节，占用查询不再为每个方块创建字符串。 */
+class ChunkedOccupancy {
+  private readonly chunks = new Map<string, Uint32Array>();
+
+  has(point: Point) {
+    const location = occupancyLocation(point);
+    const chunk = this.chunks.get(location.chunkKey);
+    return chunk !== undefined && (chunk[location.word] & location.mask) !== 0;
+  }
+
+  add(point: Point) {
+    const location = occupancyLocation(point);
+    let chunk = this.chunks.get(location.chunkKey);
+    if (!chunk) {
+      chunk = new Uint32Array(HOLOGRAM_OCCUPANCY_WORDS);
+      this.chunks.set(location.chunkKey, chunk);
+    }
+    const duplicate = (chunk[location.word] & location.mask) !== 0;
+    chunk[location.word] |= location.mask;
+    return !duplicate;
+  }
 }
 
 interface FeatureSegment {
@@ -114,7 +271,7 @@ interface TriangleIntersectionEntry {
 }
 
 interface InteriorSampling {
-  samples: Sample[];
+  samples: SampleBuffer;
   mode: InteriorMode;
   candidateCount: number;
   selectedCount: number;
@@ -328,6 +485,29 @@ const TIER_PRIORITY: Record<SampleTier, number> = {
   critical: 3,
 };
 
+const assertStoragePoint = (point: Point) => {
+  if (!point.every((value) => Number.isSafeInteger(value) && value >= -0x8000_0000 && value <= 0x7fff_ffff)) {
+    throw new RangeError(`Hologram coordinates must be signed 32-bit integers: ${point.join(",")}`);
+  }
+};
+
+const occupancyLocation = ([x, y, z]: Point) => {
+  assertStoragePoint([x, y, z]);
+  const chunkX = Math.floor(x / HOLOGRAM_OCCUPANCY_CHUNK_SIZE);
+  const chunkY = Math.floor(y / HOLOGRAM_OCCUPANCY_CHUNK_SIZE);
+  const chunkZ = Math.floor(z / HOLOGRAM_OCCUPANCY_CHUNK_SIZE);
+  const localX = x - chunkX * HOLOGRAM_OCCUPANCY_CHUNK_SIZE;
+  const localY = y - chunkY * HOLOGRAM_OCCUPANCY_CHUNK_SIZE;
+  const localZ = z - chunkZ * HOLOGRAM_OCCUPANCY_CHUNK_SIZE;
+  const localIndex = (localY * HOLOGRAM_OCCUPANCY_CHUNK_SIZE + localZ)
+    * HOLOGRAM_OCCUPANCY_CHUNK_SIZE + localX;
+  return {
+    chunkKey: `${chunkX},${chunkY},${chunkZ}`,
+    word: localIndex >>> 5,
+    mask: (1 << (localIndex & 31)) >>> 0,
+  };
+};
+
 const hashString = (value: string) => {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {
@@ -362,8 +542,6 @@ const materialForFeature = (material: HologramMaterial, kind: FeatureKind) => {
 
 const quantize = (point: Point): Point => [Math.round(point[0]), Math.round(point[1]), Math.round(point[2])];
 
-const pointKey = ([x, y, z]: Point) => `${x},${y},${z}`;
-
 const neighboursOf = ([x, y, z]: Point): Point[] => [
   [x + 1, y, z],
   [x - 1, y, z],
@@ -373,24 +551,29 @@ const neighboursOf = ([x, y, z]: Point): Point[] => [
   [x, y, z - 1],
 ];
 
-const hasIsolationConflict = (sample: Sample, accepted: Map<string, Sample>) => {
-  const [x, y, z] = sample.position;
-  return neighboursOf([x, y, z]).some((position) => accepted.has(pointKey(position)));
-};
+const hasIsolationConflict = (position: Point, accepted: ChunkedOccupancy) => (
+  neighboursOf(position).some((neighbour) => accepted.has(neighbour))
+);
 
-const compareSamples = (left: Sample, right: Sample) => {
-  const positionOrder = left.position[1] - right.position[1]
-    || left.position[2] - right.position[2]
-    || left.position[0] - right.position[0];
-  return TIER_PRIORITY[right.tier] - TIER_PRIORITY[left.tier]
-    || right.priority - left.priority
-    || left.material - right.material
-    || (left.tier === "interior" ? left.stableScore - right.stableScore : positionOrder)
-    || (left.tier === "interior" ? positionOrder : left.stableScore - right.stableScore);
+const compareBufferedSamples = (samples: SampleBuffer, left: number, right: number) => {
+  const leftPosition = samples.point(left);
+  const rightPosition = samples.point(right);
+  const positionOrder = leftPosition[1] - rightPosition[1]
+    || leftPosition[2] - rightPosition[2]
+    || leftPosition[0] - rightPosition[0];
+  const tierOrder = samples.tier(right) - samples.tier(left);
+  const priorityOrder = samples.priority(right) - samples.priority(left);
+  const materialOrder = samples.material(left) - samples.material(right);
+  const stableScoreOrder = samples.stableScore(left) - samples.stableScore(right);
+  return tierOrder
+    || priorityOrder
+    || materialOrder
+    || (samples.tier(left) === TIER_PRIORITY.interior ? stableScoreOrder : positionOrder)
+    || (samples.tier(left) === TIER_PRIORITY.interior ? positionOrder : stableScoreOrder);
 };
 
 const emptyInteriorSampling = (): InteriorSampling => ({
-  samples: [],
+  samples: new SampleBuffer(),
   mode: "disabled",
   candidateCount: 0,
   selectedCount: 0,
@@ -399,58 +582,53 @@ const emptyInteriorSampling = (): InteriorSampling => ({
 });
 
 const finalizeSamples = (
-  rawSamples: Sample[],
+  rawSamples: SampleBuffer,
   options: HologramDensityOptions,
   interior: InteriorSampling = emptyInteriorSampling(),
 ): HologramDensityResult => {
-  rawSamples.sort(compareSamples);
-  const accepted = new Map<string, Sample>();
+  const order = rawSamples.sortedIndices();
+  const accepted = new SampleBuffer();
+  const occupied = new ChunkedOccupancy();
   let removedConflicts = 0;
   let interiorBlockCount = 0;
 
-  for (const sample of rawSamples) {
-    const key = pointKey(sample.position);
-    if (accepted.has(key)) continue;
-
-    if (hasIsolationConflict(sample, accepted)) {
+  for (const sampleIndex of order) {
+    const position = rawSamples.point(sampleIndex);
+    if (occupied.has(position)) continue;
+    if (hasIsolationConflict(position, occupied)) {
       removedConflicts += 1;
       continue;
     }
-
-    accepted.set(key, sample);
-    if (sample.tier === "interior") interiorBlockCount += 1;
+    occupied.add(position);
+    accepted.appendFrom(rawSamples, sampleIndex);
+    if (rawSamples.tier(sampleIndex) === TIER_PRIORITY.interior) interiorBlockCount += 1;
   }
 
-  const samples = [...accepted.values()];
-  if (samples.length === 0) throw appError("error.hologram.empty");
-  if (samples.length > MAX_HOLOGRAM_BLOCKS) {
-    throw new RangeError(
-      `Hologram blocks ${samples.length} exceed the safe limit ${MAX_HOLOGRAM_BLOCKS}`,
-    );
-  }
-  assertSixWayIsolated(samples.map((sample) => sample.position), "Generated hologram");
+  if (accepted.length === 0) throw appError("error.hologram.empty");
 
-  const positions = new Float32Array(samples.length * 3);
-  const facings = new Uint8Array(samples.length);
-  const materials = new Uint8Array(samples.length);
+  const positions = new Float32Array(accepted.length * 3);
+  const facings = new Uint8Array(accepted.length);
+  const materials = new Uint8Array(accepted.length);
   const min: Point = [Infinity, Infinity, Infinity];
   const max: Point = [-Infinity, -Infinity, -Infinity];
   let endRodCount = 0;
   let paneCount = 0;
 
-  samples.forEach((sample, index) => {
-    positions.set(sample.position, index * 3);
-    facings[index] = sample.facing;
-    materials[index] = sample.material;
+  for (let index = 0; index < accepted.length; index += 1) {
+    const position = accepted.point(index);
+    const material = accepted.material(index);
+    positions.set(position, index * 3);
+    facings[index] = accepted.facing(index);
+    materials[index] = material;
 
-    if (sample.material === 0) endRodCount += 1;
+    if (material === 0) endRodCount += 1;
     else paneCount += 1;
 
     for (let axis = 0; axis < 3; axis += 1) {
-      min[axis] = Math.min(min[axis], sample.position[axis]);
-      max[axis] = Math.max(max[axis], sample.position[axis]);
+      min[axis] = Math.min(min[axis], position[axis]);
+      max[axis] = Math.max(max[axis], position[axis]);
     }
-  });
+  }
 
   const dimensions: [number, number, number] = [
     max[0] - min[0] + 1,
@@ -463,7 +641,7 @@ const finalizeSamples = (
     facings,
     materials,
     stats: {
-      blockCount: samples.length,
+      blockCount: accepted.length,
       endRodCount,
       paneCount,
       removedConflicts,
@@ -1037,19 +1215,14 @@ const collectSliceSegments = (geometry: MeshGeometry, options: HologramOptions) 
 const appendSegmentSamples = (
   segments: FeatureSegment[],
   options: HologramOptions,
-  budget: number,
-  rawSamples: Sample[],
+  rawSamples: SampleBuffer,
 ) => {
   segments.sort((left, right) => right.priority - left.priority);
-  let appended = 0;
   for (const segment of segments) {
     const segmentLength = distance(segment.start, segment.end);
     const step = Math.max(0.75, options.sampleSpacing * segment.stepMultiplier);
     const sampleCount = Math.max(1, Math.ceil(segmentLength / step));
     for (let sampleIndex = 0; sampleIndex <= sampleCount; sampleIndex += 1) {
-      if (appended >= budget) {
-        throw new RangeError(`Hologram contour candidates exceed the allocated limit ${budget}`);
-      }
       const t = sampleIndex / sampleCount;
       const position: Point = [
         segment.start[0] + (segment.end[0] - segment.start[0]) * t,
@@ -1064,7 +1237,6 @@ const appendSegmentSamples = (
         tier: sampleTierForFeature(segment.kind),
         stableScore: 0,
       });
-      appended += 1;
     }
   }
 };
@@ -1072,14 +1244,11 @@ const appendSegmentSamples = (
 const appendSurfaceAnchors = (
   geometry: MeshGeometry,
   options: HologramOptions,
-  budget: number,
-  rawSamples: Sample[],
+  rawSamples: SampleBuffer,
 ) => {
   const occupied = new Set<string>();
   const baseCellSize = Math.max(3, options.sampleSpacing * 3.2);
   const triangleCount = geometry.indices.length / 3;
-  let appended = 0;
-
   const appendPass = (featureOnly: boolean) => {
     for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
       const a = pointFromBuffer(geometry.positions, geometry.indices[triangleIndex * 3]);
@@ -1101,9 +1270,6 @@ const appendSurfaceAnchors = (
           : baseCellSize;
       const key = `${Math.round(center[0] / cellSize)},${Math.round(center[1] / cellSize)},${Math.round(center[2] / cellSize)}`;
       if (occupied.has(key)) continue;
-      if (appended >= budget) {
-        throw new RangeError(`Hologram surface candidates exceed the allocated limit ${budget}`);
-      }
       occupied.add(key);
       rawSamples.push({
         position: quantize(center),
@@ -1113,7 +1279,6 @@ const appendSurfaceAnchors = (
         tier: isFeature ? "critical" : face.inside ? "outline" : "surface",
         stableScore: 0,
       });
-      appended += 1;
     }
   };
 
@@ -1235,6 +1400,7 @@ const volumeOfBounds = (min: Point, max: Point) => Math.max(0, max[0] - min[0] +
   * Math.max(0, max[1] - min[1] + 1)
   * Math.max(0, max[2] - min[2] + 1);
 
+// 该阈值只控制默认稀疏采样步长，不再作为生成拒绝条件。
 const interiorSamplingStride = (geometry: MeshGeometry) => {
   const { min, max } = samplingBounds(geometry);
   const volume = volumeOfBounds(min, max);
@@ -1243,7 +1409,7 @@ const interiorSamplingStride = (geometry: MeshGeometry) => {
 };
 
 const appendInteriorCandidate = (
-  samples: Sample[],
+  samples: SampleBuffer,
   position: Point,
   options: HologramDensityOptions,
   seed: number,
@@ -1266,7 +1432,7 @@ const collectClosedInteriorCandidates = (
   stride: number,
 ) => {
   const { min, max } = samplingBounds(geometry);
-  const samples: Sample[] = [];
+  const samples = new SampleBuffer();
   const layers = buildScanlineLayerIndex(geometry, min[1], max[1], stride);
   let layerIndex = 0;
   for (let y = min[1]; y <= max[1]; y += stride, layerIndex += 1) {
@@ -1277,11 +1443,6 @@ const collectClosedInteriorCandidates = (
         const lastX = Math.min(max[0], rangeEnd);
         for (let x = firstX; x <= lastX; x += stride) {
           appendInteriorCandidate(samples, [x, y, z], options, seed);
-          if (samples.length > MAX_HOLOGRAM_CANDIDATES) {
-            throw new RangeError(
-              `Hologram interior candidates exceed the safe limit ${MAX_HOLOGRAM_CANDIDATES}`,
-            );
-          }
         }
       }
     }
@@ -1294,8 +1455,8 @@ const collectShellFallbackCandidates = (
   options: HologramDensityOptions,
   seed: number,
 ) => {
-  const samples: Sample[] = [];
-  const seen = new Set<string>();
+  const samples = new SampleBuffer();
+  const seen = new ChunkedOccupancy();
   const triangleCount = geometry.indices.length / 3;
   const shellDepth = Math.max(1, Math.min(3, Math.round(options.sampleSpacing)));
   for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
@@ -1306,15 +1467,8 @@ const collectShellFallbackCandidates = (
       const forward = quantize(subtract(center, multiply(normal, depth)));
       const reverse = quantize(add(center, multiply(normal, depth)));
       const position = hashCoordinate(forward, seed) <= hashCoordinate(reverse, seed) ? forward : reverse;
-      const key = pointKey(position);
-      if (seen.has(key)) continue;
-      seen.add(key);
+      if (!seen.add(position)) continue;
       appendInteriorCandidate(samples, position, options, seed);
-      if (samples.length > MAX_HOLOGRAM_CANDIDATES) {
-        throw new RangeError(
-          `Hologram shell candidates exceed the safe limit ${MAX_HOLOGRAM_CANDIDATES}`,
-        );
-      }
     }
   }
   return samples;
@@ -1333,25 +1487,21 @@ const collectInteriorSamples = (
   const candidates = topology.closed
     ? collectClosedInteriorCandidates(geometry, options, seed, stride)
     : collectShellFallbackCandidates(geometry, options, seed);
-  if (candidates.length > MAX_HOLOGRAM_CANDIDATES) {
-    throw new RangeError(
-      `Hologram interior candidates ${candidates.length} exceed the safe limit ${MAX_HOLOGRAM_CANDIDATES}`,
-    );
-  }
 
   const threshold = density >= 100 ? HASH_RANGE : Math.floor(HASH_RANGE * density / 100);
   // 先在密度无关的全候选集上做固定隔离，再用阈值截取，
   // 保证密度增大时只会增加内部坐标，不会重新排列并抢占旧点。
-  candidates.sort(compareSamples);
-  const acceptedUniverse = new Map<string, Sample>();
-  for (const candidate of candidates) {
-    if (!acceptedUniverse.has(pointKey(candidate.position))
-      && !hasIsolationConflict(candidate, acceptedUniverse)) {
-      acceptedUniverse.set(pointKey(candidate.position), candidate);
+  const order = candidates.sortedIndices();
+  const acceptedUniverse = new ChunkedOccupancy();
+  const selected = new SampleBuffer();
+  for (const candidateIndex of order) {
+    const position = candidates.point(candidateIndex);
+    if (acceptedUniverse.has(position) || hasIsolationConflict(position, acceptedUniverse)) continue;
+    acceptedUniverse.add(position);
+    if (candidates.stableScore(candidateIndex) < threshold) {
+      selected.appendFrom(candidates, candidateIndex);
     }
   }
-  const selected = [...acceptedUniverse.values()]
-    .filter((candidate) => candidate.stableScore < threshold);
   return {
     samples: selected,
     mode: topology.closed ? "closed-volume" : "shell-fallback",
@@ -1378,20 +1528,13 @@ export const generateMeshHologram = (
   const sliceSegments = collectSliceSegments(geometry, options);
   onProgress?.("sampling", 0.55);
 
-  const rawSamples: Sample[] = [];
-  const totalBudget = Math.max(
-    12_000,
-    Math.min(320_000, Math.round(options.targetHeight ** 2 * (11 / Math.max(1, options.sampleSpacing)))),
-  );
-  appendSegmentSamples(edgeSegments, options, Math.round(totalBudget * 0.68), rawSamples);
-  appendSegmentSamples(sliceSegments, options, Math.round(totalBudget * 0.25), rawSamples);
-  appendSurfaceAnchors(geometry, options, Math.round(totalBudget * 0.07), rawSamples);
+  const rawSamples = new SampleBuffer();
+  appendSegmentSamples(edgeSegments, options, rawSamples);
+  appendSegmentSamples(sliceSegments, options, rawSamples);
+  appendSurfaceAnchors(geometry, options, rawSamples);
   const interior = collectInteriorSamples(geometry, options, topology);
-  for (const sample of interior.samples) rawSamples.push(sample);
-  if (rawSamples.length > MAX_HOLOGRAM_CANDIDATES) {
-    throw new RangeError(
-      `Hologram candidates ${rawSamples.length} exceed the safe limit ${MAX_HOLOGRAM_CANDIDATES}`,
-    );
+  for (let sampleIndex = 0; sampleIndex < interior.samples.length; sampleIndex += 1) {
+    rawSamples.appendFrom(interior.samples, sampleIndex);
   }
   onProgress?.("sampling", 0.78);
   const result = finalizeSamples(rawSamples, options, interior);
@@ -1406,7 +1549,7 @@ export const generateHologram = (
   options: HologramDensityOptions,
 ): HologramDensityResult => {
   const features = buildDemoFeatures(options.preserveFace);
-  const rawSamples: Sample[] = [];
+  const rawSamples = new SampleBuffer();
   const scale = Math.max(1, Math.round(options.targetHeight) - 1);
   const step = Math.max(1, options.sampleSpacing);
 

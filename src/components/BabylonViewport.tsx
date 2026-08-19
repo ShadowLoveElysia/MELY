@@ -20,7 +20,23 @@ import {
 } from "../core/babylonCameraControls";
 import { babylonToThreePosition, reflectMmdQuaternionZ } from "../core/mmdCoordinates";
 import { perspectiveFrameDistance, transformFrameBounds } from "../core/perspectiveFraming";
+import {
+  babylonMaterialPointerMovedPastThreshold,
+  createBabylonVisibleMaterialTrianglePredicate,
+  resolveBabylonMaterialPick,
+  type BabylonMaterialPointerCandidate,
+} from "../core/babylonMaterialSelection";
+import {
+  createBabylonSelectionOutline,
+  type BabylonSelectionOutline,
+} from "../core/babylonSelectionOutline";
+import { useI18n } from "../i18n/I18nProvider";
 import type { MmdMotionTimes, ProjectionResult } from "../types";
+import {
+  createProjectionPreviewSamplePlan,
+  createSolidPreviewSource,
+  type SolidPreviewPoint,
+} from "./projectionPreviewLod";
 import type { RendererViewportBinding, RendererViewportProps } from "./rendererViewportTypes";
 
 interface BabylonEngineLike {
@@ -64,7 +80,10 @@ interface BabylonSceneRuntime {
   frameRadius: number;
   frameSize: Vector3;
   frameAspect: number;
+  framedPreviewMode: RendererViewportProps["previewMode"] | null;
+  framedResult: ProjectionResult | null;
   modelId: string;
+  selectionOutline: BabylonSelectionOutline;
 }
 
 interface BabylonCanvasViewportProps extends RendererViewportProps {
@@ -128,9 +147,10 @@ const createThinInstanceMesh = (
   name: string,
   color: Color3,
   size: Vector3,
-  positions: readonly Vector3[],
+  sourcePositions: ArrayLike<number>,
+  sourceIndices: readonly number[],
 ) => {
-  if (!positions.length) return;
+  if (!sourceIndices.length) return;
   const mesh = MeshBuilder.CreateBox(name, {
     width: size.x,
     height: size.y,
@@ -141,11 +161,43 @@ const createThinInstanceMesh = (
   material.diffuseColor = color;
   material.specularColor = Color3.Black();
   mesh.material = material;
-  const matrices = new Float32Array(positions.length * 16);
+  const matrices = new Float32Array(sourceIndices.length * 16);
   const matrix = Matrix.Identity();
-  positions.forEach((position, index) => {
-    Matrix.TranslationToRef(position.x, position.y, position.z, matrix);
-    matrix.copyToArray(matrices, index * 16);
+  sourceIndices.forEach((sourceIndex, previewIndex) => {
+    const offset = sourceIndex * 3;
+    Matrix.TranslationToRef(
+      sourcePositions[offset] ?? 0,
+      sourcePositions[offset + 1] ?? 0,
+      -(sourcePositions[offset + 2] ?? 0),
+      matrix,
+    );
+    matrix.copyToArray(matrices, previewIndex * 16);
+  });
+  mesh.thinInstanceSetBuffer("matrix", matrices, 16, true);
+};
+
+const createSolidThinInstanceMesh = (
+  scene: Scene,
+  root: TransformNode,
+  name: string,
+  color: Color3,
+  source: ReturnType<typeof createSolidPreviewSource>,
+  sourceIndices: readonly number[],
+) => {
+  if (!sourceIndices.length) return;
+  const mesh = MeshBuilder.CreateBox(name, { size: 0.94 }, scene);
+  mesh.parent = root;
+  const material = new StandardMaterial(`${name}-material`, scene);
+  material.diffuseColor = color;
+  material.specularColor = Color3.Black();
+  mesh.material = material;
+  const matrices = new Float32Array(sourceIndices.length * 16);
+  const matrix = Matrix.Identity();
+  const point: SolidPreviewPoint = { x: 0, y: 0, z: 0, paletteIndex: 0 };
+  sourceIndices.forEach((sourceIndex, previewIndex) => {
+    source.pointAt(sourceIndex, point);
+    Matrix.TranslationToRef(point.x, point.y, -point.z, matrix);
+    matrix.copyToArray(matrices, previewIndex * 16);
   });
   mesh.thinInstanceSetBuffer("matrix", matrices, 16, true);
 };
@@ -158,41 +210,48 @@ const rebuildGeneratedProjection = (
   if (!result) return;
   const scene = runtime.scene;
   if (result.kind === "solid") {
-    const grouped = new Map<number, Vector3[]>();
-    result.blockIndices.forEach((paletteIndex, index) => {
-      const position = new Vector3(
-        result.positions[index * 3] ?? 0,
-        result.positions[index * 3 + 1] ?? 0,
-        -(result.positions[index * 3 + 2] ?? 0),
-      );
+    const previewSource = createSolidPreviewSource(result);
+    const previewPoint: SolidPreviewPoint = { x: 0, y: 0, z: 0, paletteIndex: 0 };
+    const samplePlan = createProjectionPreviewSamplePlan(previewSource.pointCount);
+    const grouped = new Map<number, number[]>();
+    for (let sampleIndex = 0; sampleIndex < samplePlan.samplePointCount; sampleIndex += 1) {
+      const sourceIndex = samplePlan.sourceIndexAt(sampleIndex);
+      const paletteIndex = previewSource.pointAt(sourceIndex, previewPoint).paletteIndex;
       const values = grouped.get(paletteIndex) ?? [];
-      values.push(position);
+      values.push(sourceIndex);
       grouped.set(paletteIndex, values);
-    });
-    grouped.forEach((positions, paletteIndex) => {
+    }
+    grouped.forEach((sourceIndices, paletteIndex) => {
       const entry = result.palette[paletteIndex];
       const color = entry
         ? Color3.FromInts(entry.color[0], entry.color[1], entry.color[2]).toLinearSpace(true)
         : new Color3(0.7, 0.7, 0.7);
-      createThinInstanceMesh(scene, runtime.generatedRoot, `mely-solid-${paletteIndex}`, color, new Vector3(0.94, 0.94, 0.94), positions);
+      createSolidThinInstanceMesh(
+        scene,
+        runtime.generatedRoot,
+        `mely-solid-${paletteIndex}`,
+        color,
+        previewSource,
+        sourceIndices,
+      );
     });
     return;
   }
 
-  const grouped = new Map<number, Vector3[]>();
-  result.positions.forEach((_value, index) => {
-    if (index % 3 !== 0) return;
-    const pointIndex = index / 3;
-    const materialIndex = result.materials[pointIndex] ?? 0;
+  const sourcePointCount = Math.min(
+    result.materials.length,
+    Math.floor(result.positions.length / 3),
+  );
+  const samplePlan = createProjectionPreviewSamplePlan(sourcePointCount, 2);
+  const grouped = new Map<number, number[]>();
+  for (let sampleIndex = 0; sampleIndex < samplePlan.samplePointCount; sampleIndex += 1) {
+    const sourceIndex = samplePlan.sourceIndexAt(sampleIndex);
+    const materialIndex = result.materials[sourceIndex] ?? 0;
     const values = grouped.get(materialIndex) ?? [];
-    values.push(new Vector3(
-      result.positions[index] ?? 0,
-      result.positions[index + 1] ?? 0,
-      -(result.positions[index + 2] ?? 0),
-    ));
+    values.push(sourceIndex);
     grouped.set(materialIndex, values);
-  });
-  grouped.forEach((positions, materialIndex) => {
+  }
+  grouped.forEach((sourceIndices, materialIndex) => {
     const isRod = materialIndex === 0;
     createThinInstanceMesh(
       scene,
@@ -200,7 +259,8 @@ const rebuildGeneratedProjection = (
       `mely-hologram-${materialIndex}`,
       isRod ? new Color3(0.72, 0.92, 0.88) : new Color3(0.72, 0.86, 0.92),
       isRod ? new Vector3(0.18, 0.94, 0.18) : new Vector3(0.14, 0.98, 0.14),
-      positions,
+      result.positions,
+      sourceIndices,
     );
   });
 };
@@ -212,6 +272,10 @@ const rebuildGeneratedProjection = (
  * renderer transaction in the parent.
  */
 export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewportProps) {
+  const { t } = useI18n();
+  const viewportAriaLabel = t(
+    props.previewMode === "hologram" ? "viewport.aria.projection" : "viewport.aria.source",
+  );
   const mountRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef(props.model);
   const activeRef = useRef(active);
@@ -222,6 +286,12 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
   const onAfterRenderRef = useRef(props.onAfterRender);
   const onReadyRef = useRef(props.onReady);
   const onUnmountRef = useRef(props.onUnmount);
+  const backendBusyRef = useRef(Boolean(props.backendBusy));
+  const modelLoadingRef = useRef(Boolean(props.modelLoading));
+  const previewModeRef = useRef(props.previewMode ?? "source");
+  const poseEditingRef = useRef(Boolean(props.poseEditing));
+  const hiddenMaterialIndicesRef = useRef(props.hiddenMaterialIndices ?? []);
+  const onMaterialSelectedRef = useRef(props.onMaterialSelected);
   const fallbackTimeRef = useRef(0);
   const previousNowRef = useRef<number | null>(null);
 
@@ -232,6 +302,12 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
   onAfterRenderRef.current = props.onAfterRender;
   onReadyRef.current = props.onReady;
   onUnmountRef.current = props.onUnmount;
+  backendBusyRef.current = Boolean(props.backendBusy);
+  modelLoadingRef.current = Boolean(props.modelLoading);
+  previewModeRef.current = props.previewMode ?? "source";
+  poseEditingRef.current = Boolean(props.poseEditing);
+  hiddenMaterialIndicesRef.current = props.hiddenMaterialIndices ?? [];
+  onMaterialSelectedRef.current = props.onMaterialSelected;
 
   useEffect(() => {
     const model = props.model ?? null;
@@ -254,6 +330,7 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
     const camera = viewport.camera as BabylonCameraLike;
     const babylonScene = scene as unknown as Scene;
     const generatedRoot = new TransformNode("mely-generated-projection", babylonScene);
+    const selectionOutline = createBabylonSelectionOutline(babylonScene, viewport);
     const sourceTransform = {
       scaling: sourceRoot.scaling?.clone?.() ?? Vector3.One(),
       position: sourceRoot.position?.clone?.() ?? Vector3.Zero(),
@@ -271,16 +348,95 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
       frameRadius: camera.radius,
       frameSize: Vector3.Zero(),
       frameAspect: 1,
+      framedPreviewMode: null,
+      framedResult: null,
       modelId: model.id,
+      selectionOutline,
     };
 
     if (canvas.parentElement !== mount) mount.appendChild(canvas);
     canvas.style.display = "block";
     canvas.style.width = "100%";
     canvas.style.height = "100%";
-    canvas.setAttribute("aria-label", "Babylon.js MMD viewport");
+    canvas.setAttribute("aria-label", viewportAriaLabel);
     const preventContextMenu = (event: MouseEvent) => event.preventDefault();
     canvas.addEventListener("contextmenu", preventContextMenu);
+    let materialPointerCandidate: BabylonMaterialPointerCandidate | null = null;
+    const materialSelectionEnabled = () => (
+      activeRef.current
+      && previewModeRef.current === "source"
+      && !backendBusyRef.current
+      && !modelLoadingRef.current
+      && !poseEditingRef.current
+    );
+    const selectMaterialAtPointer = (event: PointerEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      const hiddenMaterialIndices = new Set(hiddenMaterialIndicesRef.current);
+      const picks = viewport.sourceMeshes.flatMap((sourceMesh) => (
+        babylonScene.multiPick(
+          event.clientX - rect.left,
+          event.clientY - rect.top,
+          (mesh) => mesh === sourceMesh,
+          babylonScene.activeCamera ?? undefined,
+          createBabylonVisibleMaterialTrianglePredicate(
+            sourceMesh as never,
+            viewport,
+            model.materials.length,
+            hiddenMaterialIndices,
+          ) ?? undefined,
+        ) ?? []
+      ));
+      const materialIndex = resolveBabylonMaterialPick(
+        picks,
+        viewport,
+        model.materials.length,
+        hiddenMaterialIndices,
+      );
+      onMaterialSelectedRef.current?.(materialIndex === null
+        ? null
+        : { modelId: model.id, materialIndex });
+    };
+    const onMaterialPointerDown = (event: PointerEvent) => {
+      if (!event.isPrimary || event.button !== 0 || !materialSelectionEnabled()) {
+        materialPointerCandidate = null;
+        return;
+      }
+      materialPointerCandidate = {
+        pointerId: event.pointerId,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        dragged: false,
+      };
+    };
+    const onMaterialPointerMove = (event: PointerEvent) => {
+      const candidate = materialPointerCandidate;
+      if (!candidate || candidate.pointerId !== event.pointerId || candidate.dragged) return;
+      candidate.dragged = babylonMaterialPointerMovedPastThreshold(candidate, event);
+    };
+    const onMaterialPointerUp = (event: PointerEvent) => {
+      const candidate = materialPointerCandidate;
+      materialPointerCandidate = null;
+      if (
+        !candidate
+        || candidate.pointerId !== event.pointerId
+        || candidate.dragged
+        || babylonMaterialPointerMovedPastThreshold(candidate, event)
+        || event.button !== 0
+        || !materialSelectionEnabled()
+      ) return;
+      window.setTimeout(() => {
+        if (!materialSelectionEnabled() || modelRef.current?.id !== model.id) return;
+        selectMaterialAtPointer(event);
+      }, 0);
+    };
+    const cancelMaterialPointer = (event: PointerEvent) => {
+      if (materialPointerCandidate?.pointerId === event.pointerId) materialPointerCandidate = null;
+    };
+    canvas.addEventListener("pointerdown", onMaterialPointerDown);
+    canvas.addEventListener("pointermove", onMaterialPointerMove);
+    canvas.addEventListener("pointerup", onMaterialPointerUp);
+    canvas.addEventListener("pointercancel", cancelMaterialPointer);
+    canvas.addEventListener("lostpointercapture", cancelMaterialPointer);
     const probeWindow = window as Window & { __MELY_E2E_VIEW_PROBE__?: boolean };
     const applyE2eView = (event: Event) => {
       if (!probeWindow.__MELY_E2E_VIEW_PROBE__) return;
@@ -335,11 +491,16 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
         modelRef.current.updatePreviewPose(evaluated);
       }
       syncBabylonCameraPanningSensibility(camera);
+      sceneRuntimeRef.current?.selectionOutline.sync();
       scene.render();
       publishBabylonCameraProbe(camera, sourceRoot);
       const gpuSynchronized = Boolean((window as Window & {
         __MELY_E2E_GPU_PROBE__?: boolean;
       }).__MELY_E2E_GPU_PROBE__);
+      if (gpuSynchronized) {
+        const gl = canvas.getContext("webgl2") ?? canvas.getContext("webgl");
+        gl?.finish();
+      }
       if (!readyNotified) {
         readyNotified = true;
         try {
@@ -393,9 +554,15 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
         });
         attempt(() => resizeObserver?.disconnect());
         attempt(() => canvas.removeEventListener("contextmenu", preventContextMenu));
+        attempt(() => canvas.removeEventListener("pointerdown", onMaterialPointerDown));
+        attempt(() => canvas.removeEventListener("pointermove", onMaterialPointerMove));
+        attempt(() => canvas.removeEventListener("pointerup", onMaterialPointerUp));
+        attempt(() => canvas.removeEventListener("pointercancel", cancelMaterialPointer));
+        attempt(() => canvas.removeEventListener("lostpointercapture", cancelMaterialPointer));
         attempt(() => window.removeEventListener("mely:e2e-set-view", applyE2eView));
         attempt(() => {
           if (sceneRuntimeRef.current?.modelId === model.id) {
+            sceneRuntimeRef.current.selectionOutline.dispose();
             disposeGeneratedProjection(sceneRuntimeRef.current.generatedRoot);
             sceneRuntimeRef.current.generatedRoot.dispose();
             sceneRuntimeRef.current = null;
@@ -423,7 +590,7 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
   }, [props.model]);
 
   useEffect(() => {
-    const model = props.model;
+    const model = props.model ?? null;
     const runtime = sceneRuntimeRef.current;
     if (!runtime || !model || runtime.modelId !== model.id) return;
     const source = runtime.sourceRoot;
@@ -483,6 +650,12 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
     const aspect = mountRef.current?.clientWidth
       ? mountRef.current.clientWidth / Math.max(1, mountRef.current.clientHeight)
       : 1;
+    const shouldFrame = runtime.framedPreviewMode === null
+      || runtime.framedPreviewMode !== props.previewMode
+      || (
+        props.previewMode === "hologram"
+        && runtime.framedResult !== (props.result ?? null)
+      );
     runtime.frameTarget.copyFrom(center);
     runtime.frameSize.copyFrom(size);
     runtime.frameAspect = aspect;
@@ -491,19 +664,48 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
       height: size.y,
       depth: size.z,
     }, aspect, camera.fov);
-    camera.target?.copyFrom?.(center);
-    camera.radius = runtime.frameRadius;
-    syncBabylonCameraPanningSensibility(camera);
+    runtime.framedPreviewMode = props.previewMode;
+    runtime.framedResult = props.result ?? null;
+    if (shouldFrame) {
+      camera.target?.copyFrom?.(center);
+      camera.radius = runtime.frameRadius;
+      syncBabylonCameraPanningSensibility(camera);
+    }
     runtime.generatedRoot.setEnabled(props.previewMode === "hologram");
     source.setEnabled(props.previewMode !== "hologram");
     rebuildGeneratedProjection(runtime, props.result ?? null);
-  }, [props.model, props.previewMode, props.result]);
+  }, [props.model, props.partsRevision, props.previewMode, props.result]);
+
+  useEffect(() => {
+    const model = props.model ?? null;
+    if (!isBabylonSource(model)) return;
+    model.viewport.canvas.setAttribute("aria-label", viewportAriaLabel);
+  }, [props.model, viewportAriaLabel]);
 
   useEffect(() => {
     const runtime = sceneRuntimeRef.current;
     if (!runtime) return;
     resetBabylonCameraView(runtime.camera, runtime.frameTarget, runtime.frameRadius);
   }, [props.resetToken]);
+
+  useEffect(() => {
+    const runtime = sceneRuntimeRef.current;
+    const model = props.model;
+    if (!runtime || !model || runtime.modelId !== model.id) return;
+    const selectedMaterialIndex = props.selectedMaterialIndex ?? null;
+    const hidden = selectedMaterialIndex !== null
+      && (props.hiddenMaterialIndices ?? []).includes(selectedMaterialIndex);
+    runtime.selectionOutline.setSelection(
+      selectedMaterialIndex,
+      active && props.previewMode !== "hologram" && !hidden,
+    );
+  }, [
+    active,
+    props.hiddenMaterialIndices,
+    props.model,
+    props.previewMode,
+    props.selectedMaterialIndex,
+  ]);
 
   useEffect(() => {
     activeRef.current = active;
@@ -518,5 +720,11 @@ export function BabylonViewport({ active = true, ...props }: BabylonCanvasViewpo
     previousNowRef.current = null;
   }, [props.isPlaying]);
 
-  return <div ref={mountRef} className="viewport-canvas viewport-canvas--babylon" aria-busy={props.modelLoading ?? false} />;
+  return (
+    <div
+      ref={mountRef}
+      className="viewport-canvas viewport-canvas--babylon"
+      aria-busy={props.modelLoading ?? false}
+    />
+  );
 }

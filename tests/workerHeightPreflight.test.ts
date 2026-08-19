@@ -90,6 +90,41 @@ test("Worker permits 4064 only after the configuration-bound environment confirm
   assert.doesNotThrow(() => assertWorkerResultHeight(extreme, result(4064)));
 });
 
+test("Worker treats a 4064 dimension as extreme even when target height is 2032", () => {
+  const extremeWorld = command();
+  const configurationFingerprint = "sha256:short-extreme-world";
+  extremeWorld.heightMode = "extended_2032";
+  extremeWorld.options.targetHeight = 2032;
+  extremeWorld.datapackAcknowledged = true;
+  extremeWorld.targetDimension = { minY: -2032, height: 4064 };
+  extremeWorld.placementBottomY = -2032;
+
+  assert.throws(
+    () => assertWorkerGenerationHeight(extremeWorld),
+    /HEIGHT_EXTREME_CONFIRMATION_REQUIRED/,
+  );
+
+  extremeWorld.heightMode = "experimental_4064";
+  extremeWorld.configurationFingerprint = configurationFingerprint;
+  extremeWorld.confirmations = confirmExtremeEnvironment(
+    confirmExtremeUnlock(
+      createExtremeHeightConfirmationState(),
+      configurationFingerprint,
+      "unlock",
+      1,
+    ),
+    configurationFingerprint,
+    "environment",
+    2,
+  );
+  const generation = assertWorkerGenerationHeight(extremeWorld);
+  const projection = assertWorkerResultHeight(extremeWorld, result(2032));
+  assert.equal(generation.requiredHeight, 2032);
+  assert.equal(generation.confirmationHeight, 4064);
+  assert.equal(projection.requiredHeight, 2032);
+  assert.equal(projection.confirmationHeight, 4064);
+});
+
 test("Worker rejects an invalid placement even when generation height is safe", () => {
   const misplaced = command();
   misplaced.placementBottomY = -63;

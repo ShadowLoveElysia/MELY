@@ -4,11 +4,16 @@ import * as THREE from "three";
 import {
   adaptMoeruMmdOutlineParameters,
   createThreeMmdOutlinePass,
+  createThreeMmdSelectionOutlinePass,
   MELY_MMD_OUTLINE_VERTEX_SHADER,
   readThreeMmdOutlineParameters,
   syncThreeMmdOutlineMaterials,
   THREE_MMD_OUTLINE_LAYER,
+  THREE_MMD_SELECTION_OUTLINE_COLOR,
+  THREE_MMD_SELECTION_OUTLINE_LAYER,
+  THREE_MMD_SELECTION_OUTLINE_THICKNESS,
   updateThreeMmdOutlineMaterial,
+  updateThreeMmdSelectionOutlineMaterial,
   validateThreeMmdOutlineShaderChunks,
 } from "../src/core/threeMmdOutline.ts";
 
@@ -263,4 +268,180 @@ test("outline samples an opaque material map when the loader detected PNG alpha"
   assert.equal(pass.materials[0].depthWrite, false);
   assert.equal(pass.materials[0].uniforms.map.value, alphaMap);
   pass.dispose();
+});
+
+test("selection outline uses fixed semantic styling without changing source outline state", () => {
+  const source = new THREE.MeshPhongMaterial();
+  source.userData.outlineParameters = {
+    thickness: 0.002,
+    color: [0.1, 0.2, 0.3],
+    alpha: 0.4,
+    visible: false,
+  };
+  const nativePass = createThreeMmdOutlinePass(createSkinnedMesh(source));
+  const target = nativePass.materials[0];
+
+  updateThreeMmdSelectionOutlineMaterial(target, source, true);
+
+  assert.equal(target.visible, true);
+  assert.equal(target.uniforms.outlineThickness.value, THREE_MMD_SELECTION_OUTLINE_THICKNESS);
+  assert.deepEqual(target.uniforms.outlineColor.value.toArray(), [...THREE_MMD_SELECTION_OUTLINE_COLOR]);
+  assert.deepEqual(readThreeMmdOutlineParameters(source), {
+    thickness: 0.002,
+    color: [0.1, 0.2, 0.3],
+    alpha: 0.4,
+    visible: false,
+  });
+
+  source.visible = false;
+  updateThreeMmdSelectionOutlineMaterial(target, source, true);
+  assert.equal(target.visible, false);
+  nativePass.dispose();
+});
+
+test("selection pass has an independent layer, follows morph-split identity and disposes symmetrically", () => {
+  const sourceMaterials = [
+    new THREE.MeshPhongMaterial(),
+    new THREE.MeshPhongMaterial(),
+  ];
+  const primary = createSkinnedMesh(sourceMaterials[0]);
+  const split = createSkinnedMesh(sourceMaterials[1]);
+  split.material = sourceMaterials;
+  split.userData.mmdMorphSplitBody = { materialIndex: 1 };
+  split.morphTargetInfluences = [0.25];
+  const root = new THREE.Group();
+  root.add(primary, split);
+  const primaryMask = primary.layers.mask;
+  const splitMask = split.layers.mask;
+
+  const selectionPass = createThreeMmdSelectionOutlinePass([primary, split]);
+
+  assert.equal(primary.layers.mask, primaryMask);
+  assert.equal(split.layers.mask, splitMask);
+  assert.equal(selectionPass.outlineMeshes.length, 2);
+  selectionPass.outlineMeshes.forEach((outline) => {
+    assert.equal(outline.layers.isEnabled(THREE_MMD_SELECTION_OUTLINE_LAYER), true);
+    assert.equal(outline.layers.isEnabled(THREE_MMD_OUTLINE_LAYER), false);
+    assert.equal(outline.userData.melyMmdSelectionOutlineProxy, true);
+  });
+  selectionPass.maskMeshes.forEach((mask) => {
+    assert.equal(mask.layers.isEnabled(THREE_MMD_SELECTION_OUTLINE_LAYER), true);
+    assert.equal(mask.userData.melyMmdSelectionOutlineProxy, true);
+  });
+  assert.equal(selectionPass.outlineMeshes[1].skeleton, split.skeleton);
+  assert.equal(selectionPass.outlineMeshes[1].morphTargetInfluences, split.morphTargetInfluences);
+
+  selectionPass.dispose();
+  assert.equal(primary.layers.mask, primaryMask);
+  assert.equal(split.layers.mask, splitMask);
+  selectionPass.outlineMeshes.forEach((outline) => assert.deepEqual(outline.material, []));
+  selectionPass.maskMeshes.forEach((mask) => assert.deepEqual(mask.material, []));
+});
+
+test("morph-split selection renders its canonical slot through mask then outline", () => {
+  const sourceMaterials = [
+    new THREE.MeshPhongMaterial(),
+    new THREE.MeshPhongMaterial(),
+  ];
+  const primary = createSkinnedMesh(sourceMaterials[0]);
+  primary.material = sourceMaterials;
+  primary.geometry.clearGroups();
+  primary.geometry.addGroup(0, 3, 0);
+  primary.geometry.addGroup(0, 3, 1);
+  primary.geometry.setDrawRange(0, 0);
+
+  const split = createSkinnedMesh(sourceMaterials[1]);
+  split.geometry.clearGroups();
+  split.geometry.addGroup(0, 3, 0);
+  split.userData.mmdMorphSplitBody = { materialIndex: 1 };
+  const root = new THREE.Group();
+  root.add(primary, split);
+
+  const selectionPass = createThreeMmdSelectionOutlinePass([primary, split]);
+  const calls: string[] = [];
+  const renderedScenes: THREE.Scene[] = [];
+  const renderedFogs: Array<THREE.Fog | THREE.FogExp2 | null> = [];
+  const renderer = {
+    autoClear: true,
+    shadowMap: { enabled: true },
+    clearStencil: () => calls.push("clearStencil"),
+    render: (renderScene: THREE.Scene) => {
+      const isMask = renderScene.children.every(
+        (child) => child.name === "MELY MMD selection stencil mask",
+      );
+      const isOutline = renderScene.children.every(
+        (child) => child.name === "MELY MMD selection outline",
+      );
+      assert.notEqual(isMask, isOutline);
+      calls.push(isMask ? "render:mask" : "render:outline");
+      renderedScenes.push(renderScene);
+      renderedFogs.push(renderScene.fog);
+      assert.equal(renderer.autoClear, false);
+      assert.equal(renderer.shadowMap.enabled, false);
+    },
+  } as unknown as THREE.WebGLRenderer;
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0x101820, 1, 10);
+
+  selectionPass.render(renderer, scene, new THREE.PerspectiveCamera(), 1);
+
+  assert.deepEqual(calls, [
+    "clearStencil",
+    "render:mask",
+    "render:outline",
+    "clearStencil",
+  ]);
+  assert.deepEqual(selectionPass.materials.map((material) => material.visible), [false, true, true]);
+  assert.deepEqual(selectionPass.maskMaterials.map((material) => material.visible), [false, true, true]);
+  assert.equal(selectionPass.outlineMeshes[0].geometry.drawRange.count, 0);
+  assert.equal(selectionPass.maskMeshes[0].geometry.drawRange.count, 0);
+  assert.equal(selectionPass.outlineMeshes[1].material.length, 1);
+  assert.equal(selectionPass.maskMeshes[1].material.length, 1);
+  assert.deepEqual(selectionPass.outlineMeshes[1].geometry.groups, [
+    { start: 0, count: 3, materialIndex: 0 },
+  ]);
+  assert.deepEqual(renderedFogs, [scene.fog, scene.fog]);
+  assert.equal(renderedScenes.every((renderedScene) => renderedScene.fog === null), true);
+  assert.equal(renderer.autoClear, true);
+  assert.equal(renderer.shadowMap.enabled, true);
+
+  selectionPass.dispose();
+});
+
+test("selection rendering enables only the requested slot and hidden state clears it", () => {
+  const sources = [new THREE.MeshPhongMaterial(), new THREE.MeshPhongMaterial()];
+  const mesh = createSkinnedMesh(sources[0]);
+  mesh.material = sources;
+  const root = new THREE.Group();
+  root.add(mesh);
+  const sourceMask = mesh.layers.mask;
+  const nativePass = createThreeMmdOutlinePass(mesh);
+  const nativeMask = mesh.layers.mask;
+  const selectionPass = createThreeMmdSelectionOutlinePass([mesh]);
+  const renderer = {
+    autoClear: true,
+    shadowMap: { enabled: true },
+    clearStencil: () => undefined,
+    render: () => undefined,
+  } as unknown as THREE.WebGLRenderer;
+
+  selectionPass.render(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), 1);
+  assert.equal(selectionPass.materials[0].visible, false);
+  assert.equal(selectionPass.materials[1].visible, true);
+  assert.equal(selectionPass.maskMaterials[0].visible, false);
+  assert.equal(selectionPass.maskMaterials[1].visible, true);
+  assert.equal(selectionPass.materials[1].stencilFunc, THREE.NotEqualStencilFunc);
+  assert.equal(selectionPass.materials[1].depthWrite, false);
+  assert.equal(selectionPass.maskMaterials[1].stencilFunc, THREE.AlwaysStencilFunc);
+  assert.equal(selectionPass.maskMaterials[1].stencilZPass, THREE.ReplaceStencilOp);
+  assert.equal(selectionPass.maskMaterials[1].colorWrite, false);
+  assert.equal(selectionPass.maskMaterials[1].uniforms.outlineThickness.value, 0);
+
+  selectionPass.render(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), 1, new Set([1]));
+  assert.equal(selectionPass.materials.every((material) => !material.visible), true);
+
+  selectionPass.dispose();
+  assert.equal(mesh.layers.mask, nativeMask);
+  nativePass.dispose();
+  assert.equal(mesh.layers.mask, sourceMask);
 });

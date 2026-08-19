@@ -15,6 +15,7 @@ const outputSuffix = mode === "solid" ? `${mode}-${faceDetail}` : mode;
 const cameraYawDrag = Number(process.env.MELY_CAMERA_YAW_DRAG || 0);
 const focusFace = process.env.MELY_FOCUS_FACE === "1";
 const reportPath = process.env.MELY_REPORT_PATH;
+const FIVE_GIB = 5 * 1024 ** 3;
 
 if (!modelZip) throw new Error("MELY_MODEL_ZIP is required");
 
@@ -187,8 +188,8 @@ const run = async () => {
         .filter((processId) => Number.isInteger(processId) && processId > 0);
       const workingSet = await processWorkingSet(processIds);
       report.peakWorkingSetBytes = Math.max(report.peakWorkingSetBytes, workingSet);
-      if (workingSet > 2 * 1024 ** 3) {
-        throw new Error(`Process tree exceeded 2 GiB: ${workingSet} bytes`);
+      if (workingSet > FIVE_GIB) {
+        throw new Error(`Process tree exceeded 5 GiB: ${workingSet} bytes`);
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }

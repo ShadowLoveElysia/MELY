@@ -115,6 +115,7 @@ export interface GenerationHeightPreflightInput {
   versionId: string;
   heightMode: HeightModeInput;
   targetHeight: number;
+  targetDimension?: HeightDimension;
   datapackAcknowledged?: boolean;
   confirmations?: ExtremeHeightConfirmationState | null;
   configurationFingerprint?: string | null;
@@ -125,7 +126,6 @@ export interface GenerationHeightPreflightInput {
 export interface ProjectionHeightPreflightInput extends GenerationHeightPreflightInput {
   bounds: ProjectionHeightBounds | null;
   placementBottomY: number;
-  targetDimension?: HeightDimension;
   exportFingerprint?: string | null;
   /** Worker 结果复核尚未进入第三关；最终导出入口不得关闭此检查。 */
   requireExtremeExportConfirmation?: boolean;
@@ -140,6 +140,7 @@ export interface GenerationHeightPreflightResult {
   requiredMode: HeightMode;
   targetHeight: number;
   requiredHeight: number;
+  confirmationHeight: number;
   maximumHeight: number;
   dimension: HeightDimension | null;
 }
@@ -173,6 +174,16 @@ const requiredModeForHeight = (height: number, defaultHeight: number): HeightMod
   if (height <= defaultHeight) return "default";
   if (height <= EXTENDED_WORLD_HEIGHT) return "extended_2032";
   return "experimental_4064";
+};
+
+const confirmationHeightFor = (
+  requiredHeight: number,
+  targetDimension?: HeightDimension,
+) => {
+  const declaredHeight = targetDimension?.height;
+  return Number.isSafeInteger(declaredHeight) && (declaredHeight ?? 0) > 0
+    ? Math.max(requiredHeight, declaredHeight!)
+    : requiredHeight;
 };
 
 const modeRank = (mode: HeightMode) => {
@@ -211,7 +222,7 @@ const dimensionForProfile = (profile: HeightSafetyProfile): HeightDimension => (
 const warningsForProfile = (
   profile: HeightSafetyProfile,
   requiredMode: HeightMode,
-  targetHeight: number,
+  confirmationHeight: number,
 ): readonly HeightSafetyWarningCode[] => {
   const warnings: HeightSafetyWarningCode[] = [];
   if (profile.releaseStatus !== "verified" || !profile.verification) {
@@ -222,7 +233,10 @@ const warningsForProfile = (
   }
   if (
     requiredMode !== "default"
-    && (profile.maximumVerifiedHeight === null || targetHeight > profile.maximumVerifiedHeight)
+    && (
+      profile.maximumVerifiedHeight === null
+      || confirmationHeight > profile.maximumVerifiedHeight
+    )
   ) {
     warnings.push("HEIGHT_EXTENSION_UNTESTED_FOR_VERSION");
   }
@@ -234,6 +248,7 @@ const failedGenerationPreflight = (
   errorCode: HeightSafetyErrorCode,
   profile: HeightSafetyProfile | null,
   targetHeight: number,
+  confirmationHeight: number,
   requiredMode: HeightMode,
   warnings: readonly HeightSafetyWarningCode[] = [],
 ): GenerationHeightPreflightResult => ({
@@ -245,6 +260,7 @@ const failedGenerationPreflight = (
   requiredMode,
   targetHeight,
   requiredHeight: targetHeight,
+  confirmationHeight,
   maximumHeight: profile
     ? maximumForMode(normalizeHeightMode(input.heightMode), dimensionForProfile(profile).height)
     : 0,
@@ -484,8 +500,9 @@ export const preflightGenerationHeight = (
   const profile = profileForInput(input);
   const targetHeight = input.targetHeight;
   const defaultDimension = profile ? dimensionForProfile(profile) : COMPATIBILITY_DEFAULT_DIMENSION;
+  const confirmationHeight = confirmationHeightFor(targetHeight, input.targetDimension);
   const requiredMode = requiredModeForHeight(
-    Number.isSafeInteger(targetHeight) && targetHeight > 0 ? targetHeight : 1,
+    Number.isSafeInteger(confirmationHeight) && confirmationHeight > 0 ? confirmationHeight : 1,
     defaultDimension.height,
   );
 
@@ -495,6 +512,7 @@ export const preflightGenerationHeight = (
       "HEIGHT_MODE_INVALID",
       profile,
       targetHeight,
+      confirmationHeight,
       requiredMode,
     );
   }
@@ -504,6 +522,7 @@ export const preflightGenerationHeight = (
       "HEIGHT_TARGET_INVALID",
       profile,
       targetHeight,
+      confirmationHeight,
       requiredMode,
     );
   }
@@ -514,6 +533,7 @@ export const preflightGenerationHeight = (
       "HEIGHT_EXCEEDS_4064",
       profile,
       targetHeight,
+      confirmationHeight,
       requiredMode,
     );
   }
@@ -523,13 +543,25 @@ export const preflightGenerationHeight = (
       "JAVA_VERSION_PROFILE_UNKNOWN",
       profile,
       targetHeight,
+      confirmationHeight,
+      requiredMode,
+    );
+  }
+
+  if (input.targetDimension !== undefined && !validDimension(input.targetDimension)) {
+    return failedGenerationPreflight(
+      input,
+      "TARGET_DIMENSION_DECLARATION_REQUIRED",
+      profile,
+      targetHeight,
+      confirmationHeight,
       requiredMode,
     );
   }
 
   const mode = normalizeHeightMode(input.heightMode);
-  const actualRequiredMode = requiredModeForHeight(targetHeight, defaultDimension.height);
-  const warnings = warningsForProfile(profile, actualRequiredMode, targetHeight);
+  const actualRequiredMode = requiredModeForHeight(confirmationHeight, defaultDimension.height);
+  const warnings = warningsForProfile(profile, actualRequiredMode, confirmationHeight);
   if (actualRequiredMode !== "default") {
     if (modeRank(mode) < modeRank(actualRequiredMode)) {
       return failedGenerationPreflight(
@@ -539,6 +571,7 @@ export const preflightGenerationHeight = (
           : "HEIGHT_DATAPACK_ACK_REQUIRED",
         profile,
         targetHeight,
+        confirmationHeight,
         actualRequiredMode,
         warnings,
       );
@@ -549,6 +582,7 @@ export const preflightGenerationHeight = (
         "HEIGHT_DATAPACK_ACK_REQUIRED",
         profile,
         targetHeight,
+        confirmationHeight,
         actualRequiredMode,
         warnings,
       );
@@ -565,6 +599,7 @@ export const preflightGenerationHeight = (
         "HEIGHT_EXTREME_CONFIRMATION_REQUIRED",
         profile,
         targetHeight,
+        confirmationHeight,
         actualRequiredMode,
         warnings,
       );
@@ -580,14 +615,15 @@ export const preflightGenerationHeight = (
     requiredMode: actualRequiredMode,
     targetHeight,
     requiredHeight: targetHeight,
+    confirmationHeight,
     maximumHeight: maximumForMode(mode, defaultDimension.height),
     dimension: defaultDimension,
   };
 };
 
 /**
- * 核心和序列化器共用同一检查：实际模型高度不能低于 UI 声明，
- * 放置后的绝对 Y 范围也必须完整落在目标维度内。
+ * 核心和序列化器共用同一检查：requiredHeight 表示投影几何需求，
+ * confirmationHeight 还纳入显式世界容量，避免短投影绕过 4064 世界授权。
  */
 export const preflightProjectionHeight = (
   input: ProjectionHeightPreflightInput,

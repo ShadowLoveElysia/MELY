@@ -33,8 +33,8 @@ import {
   MmdAnimation,
   MmdBufferKind,
   MmdModelAnimationContainer,
-  MmdStandardMaterialBuilder,
   MmdStandardMaterialProxy,
+  MmdStandardMaterialBuilder,
   MmdWasmPhysics,
   MmdWasmRuntime,
   SdefInjector,
@@ -81,6 +81,13 @@ import { applyBabylonCameraPanningProfile } from "./babylonCameraControls";
 import { isSuggestedEmissiveMaterial, isSuggestedSkinMaterial } from "./mmdModel";
 import { MMD_PREVIEW_VERTICAL_FOV_RADIANS } from "./perspectiveFraming";
 import { createRetryableAsyncSingleton } from "./retryableAsyncSingleton";
+import {
+  createBabylonMaterialIndexResolver,
+  createBabylonMaterialVisibilityController,
+  createBabylonVisibilityMaterialProxy,
+  resolveCanonicalBabylonMaterials,
+  type BabylonMaterialVisibilityController,
+} from "./babylonMaterialVisibility";
 
 type BabylonModel = MmdWasmModel;
 
@@ -232,14 +239,18 @@ const materialIndexForSubMesh = (
   mesh: AbstractMesh,
   subMeshMaterialIndex: number,
   materials: readonly Material[],
-) => {
+) : number | null => {
   const value = mesh.material;
   const slots = Array.isArray(value)
-    ? value.filter((material): material is Material => Boolean(material))
-    : materialSubMaterials(value);
-  const candidate = slots[subMeshMaterialIndex] ?? slots[0] ?? (!Array.isArray(value) ? value : null);
+    ? value
+    : (value as { subMaterials?: readonly (Material | null)[] } | null)?.subMaterials ?? [];
+  const candidate = slots.length
+    ? slots[subMeshMaterialIndex] ?? null
+    : subMeshMaterialIndex === 0 && value && !Array.isArray(value)
+      ? value as Material
+      : null;
   const identityIndex = candidate ? materials.indexOf(candidate) : -1;
-  return identityIndex >= 0 ? identityIndex : Math.max(0, subMeshMaterialIndex);
+  return identityIndex >= 0 ? identityIndex : null;
 };
 
 const clamp01 = (value: number) => Math.max(0, Math.min(1, value));
@@ -418,12 +429,6 @@ const materialTexture = (material: Material) => {
   return candidate.diffuseTexture ?? null;
 };
 
-const materialIsVisible = (material: Material | undefined) => {
-  if (!material) return false;
-  const alpha = (material as Material & { alpha?: number }).alpha;
-  return Number.isFinite(alpha) ? (alpha as number) > 0.01 : true;
-};
-
 const captureTexture = async (
   texture: BaseTexture,
   maxEdge: number,
@@ -447,6 +452,7 @@ const captureTexture = async (
 
 const createBabylonMaterialSnapshots = async (
   materials: readonly Material[],
+  visibility: BabylonMaterialVisibilityController,
   options: MmdSnapshotOptions,
 ) => {
   const maxEdge = Math.max(1, Math.floor(options.textureMaxEdge ?? 512));
@@ -460,7 +466,7 @@ const createBabylonMaterialSnapshots = async (
     const color = materialColor(material);
     const texture = materialTexture(material);
     let textureIndex = -1;
-    if (texture && materialIsVisible(material)) {
+    if (texture && visibility.isRuntimeVisible(index)) {
       textureIndex = textureIndices.get(texture) ?? -1;
       if (textureIndex < 0 && capturedTextureBytes < budget) {
         const captured = await captureTexture(texture, maxEdge, budget - capturedTextureBytes);
@@ -473,7 +479,7 @@ const createBabylonMaterialSnapshots = async (
       }
     }
     const named = `${material.name ?? ""}`;
-    if (texture && materialIsVisible(material) && textureIndex < 0) {
+    if (texture && visibility.isRuntimeVisible(index) && textureIndex < 0) {
       throw appError("error.snapshot.textureCaptureFailed", { material: named || index });
     }
     const candidate = material as Material & {
@@ -682,6 +688,7 @@ const createBabylonSnapshot = async (
   rootMesh: Mesh,
   sourceMeshes: readonly Mesh[],
   materials: readonly Material[],
+  visibility: BabylonMaterialVisibilityController,
   skinMatrices: Float32Array,
   options: MmdSnapshotOptions,
 ): Promise<MmdMeshSnapshot> => {
@@ -726,8 +733,9 @@ const createBabylonSnapshot = async (
     // the final normalization even though those triangles are not exported.
     const visibleGroups = groups.filter((group) => {
       const material = group.material;
+      if (material === null) return false;
       const candidate = materials[material] as (Material & { isDisposed?: () => boolean }) | undefined;
-      return !candidate?.isDisposed?.() && materialIsVisible(candidate);
+      return !candidate?.isDisposed?.() && visibility.isRuntimeVisible(material);
     });
     const vertexMap = new Map<number, number>();
     const emitVertex = (sourceIndex: number) => {
@@ -754,6 +762,7 @@ const createBabylonSnapshot = async (
     };
     visibleGroups.forEach((group) => {
       const material = group.material;
+      if (material === null) return;
       const end = Math.min(sourceIndices.length, group.start + group.count);
       for (let cursor = group.start; cursor + 2 < end; cursor += 3) {
         indices.push(
@@ -761,7 +770,7 @@ const createBabylonSnapshot = async (
           emitVertex(sourceIndices[cursor + 1] ?? 0),
           emitVertex(sourceIndices[cursor + 2] ?? 0),
         );
-        triangleMaterials.push(Math.max(0, material));
+        triangleMaterials.push(material);
       }
     });
   }
@@ -769,7 +778,7 @@ const createBabylonSnapshot = async (
   options.onProgress?.(0.86);
   const materialData = options.includeTextures === false
     ? {}
-    : await createBabylonMaterialSnapshots(materials, options);
+    : await createBabylonMaterialSnapshots(materials, visibility, options);
   options.onProgress?.(1);
   return {
     positions: Float32Array.from(positions),
@@ -785,6 +794,7 @@ const computeBabylonVisibleBounds = (
   rootMesh: Mesh,
   sourceMeshes: readonly Mesh[],
   materials: readonly Material[],
+  visibility: BabylonMaterialVisibilityController,
   skinMatrices: Float32Array,
   target: Box3,
 ) => {
@@ -810,8 +820,8 @@ const computeBabylonVisibleBounds = (
           material: materialIndexForSubMesh(mesh, 0, materials),
         }];
     groups.forEach((group) => {
-      const material = materials[group.material];
-      if (!materialIsVisible(material)) return;
+      if (group.material === null) return;
+      if (!materials[group.material] || !visibility.isRuntimeVisible(group.material)) return;
       const end = Math.min(sourceIndices.length, group.start + group.count);
       for (let cursor = group.start; cursor < end; cursor += 1) {
         const sourceIndex = sourceIndices[cursor] ?? 0;
@@ -894,6 +904,16 @@ export const loadBabylonMmdModel = async (
     loadedContainer.addAllToScene();
     rootMesh = getRootMesh(loadedContainer);
     sourceMeshes = getModelMeshes(rootMesh);
+    const loadedMetadata = (rootMesh.metadata ?? {}) as {
+      materials?: readonly Material[];
+    };
+    const fallbackMaterials = sourceMeshes.flatMap(materialArray);
+    const materials = resolveCanonicalBabylonMaterials(loadedMetadata, fallbackMaterials);
+    const materialVisibility = createBabylonMaterialVisibilityController(materials);
+    const VisibilityMaterialProxy = createBabylonVisibilityMaterialProxy(
+      materialVisibility,
+      MmdStandardMaterialProxy,
+    );
     loadStage = "load-wasm-runtime";
     wasmInstance = await getBabylonMmdWasmInstance();
     const physicsClock: MutablePhysicsClock = {
@@ -907,7 +927,7 @@ export const loadBabylonMmdModel = async (
     const physicsAvailable = Boolean((rootMesh.metadata as { rigidBodies?: readonly unknown[] } | null)?.rigidBodies?.length);
     loadStage = "create-mmd-runtime-model";
     mmdModel = mmdRuntime.createMmdModel(rootMesh as never, {
-      materialProxyConstructor: MmdStandardMaterialProxy,
+      materialProxyConstructor: VisibilityMaterialProxy,
       buildPhysics: physicsAvailable,
       trimMetadata: false,
     });
@@ -926,6 +946,8 @@ export const loadBabylonMmdModel = async (
       header?: { modelName?: string; englishModelName?: string };
       bones?: readonly { name: string; englishName: string; parentBoneIndex: number; ik?: unknown }[];
       morphs?: readonly { name: string; englishName: string }[];
+      materials?: readonly Material[];
+      materialsMetadata?: readonly { englishName?: string }[];
       rigidBodies?: readonly unknown[];
       joints?: readonly unknown[];
     };
@@ -955,36 +977,28 @@ export const loadBabylonMmdModel = async (
         runtimeMorphs[index] ? [morph.name, morph.englishName] : []
       )),
     ])).filter((name): name is string => Boolean(name));
-    const materials = [...new Set(sourceMeshes.flatMap(materialArray))];
     const textureNameMap = (rootMesh.metadata as {
       textureNameMap?: Map<BaseTexture, string>;
     } | null)?.textureNameMap;
     textureNameMap?.forEach((path, texture) => {
       if (texture.loadingError) textureWarnings.push(path || texture.name);
     });
-    // Keep the loader-provided alpha separate from the application visibility
-    // toggle. A hide/show cycle must not turn an originally translucent MMD
-    // material into an opaque one.
-    const materialBaseAlpha = new Map<Material, number>();
-    materials.forEach((material) => {
-      const alpha = (material as Material & { alpha?: number }).alpha;
-      materialBaseAlpha.set(material, Number.isFinite(alpha) ? Number(alpha) : 1);
-    });
     const materialInfo: MmdMaterialInfo[] = materials.map((material, index) => {
       const color = materialColor(material);
       const name = material.name || `material_${index}`;
+      const englishName = metadata.materialsMetadata?.[index]?.englishName ?? "";
       const texture = materialTexture(material);
       return {
         index,
         name,
-        englishName: "",
-        displayName: name,
+        englishName,
+        displayName: englishName || name,
         color: [color[0], color[1], color[2]],
         opacity: color[3],
         hasTexture: Boolean(texture),
-        suggestedSkin: isSuggestedSkinMaterial(name, ""),
+        suggestedSkin: isSuggestedSkinMaterial(name, englishName),
         ambient: [0, 0, 0],
-        suggestedEmissive: isSuggestedEmissiveMaterial(name, "", undefined),
+        suggestedEmissive: isSuggestedEmissiveMaterial(name, englishName, undefined),
       };
     });
     const restBones: BabylonBoneState[] = babylonBones.map((bone) => ({
@@ -1127,6 +1141,7 @@ export const loadBabylonMmdModel = async (
       physicsClock.deltaSeconds = physicsDelta;
       mmdRuntime.beforePhysics(physicsDelta * 1000);
       mmdRuntime.afterPhysics();
+      materialVisibility.applyAll();
       // A VMD property track can rewrite rigidBodyStates during animation.
       // The operation-level switch remains authoritative for preview and
       // snapshot generation, so force the disabled state back after evaluation.
@@ -1198,6 +1213,7 @@ export const loadBabylonMmdModel = async (
       camera,
       sourceRoot: rootMesh,
       sourceMeshes,
+      resolveMaterialIndex: createBabylonMaterialIndexResolver(sourceMeshes, materials),
     };
     const stats: MmdModelStats = {
       name: metadata.header?.englishModelName || metadata.header?.modelName || modelFile.name,
@@ -1219,6 +1235,7 @@ export const loadBabylonMmdModel = async (
         rootMesh!,
         sourceMeshes,
         materials,
+        materialVisibility,
         matrices,
         target ?? new Box3(),
       );
@@ -1343,30 +1360,30 @@ export const loadBabylonMmdModel = async (
         evaluate(motionTimes, physicsEnabledState);
       },
       setMaterialVisible: (index, visible) => {
-        const material = materials[index];
-        if (!material) throw new RangeError(`MMD material index is out of range: ${index}`);
-        (material as Material & { alpha?: number }).alpha = visible
-          ? materialBaseAlpha.get(material) ?? 1
-          : 0;
+        materialVisibility.setVisible(index, visible);
       },
       visibleBounds,
       visibleTriangleCount: () => sourceMeshes.reduce((sum, mesh) => {
         if (!mesh.isVisible || mesh.visibility <= 0) return sum;
         if (!mesh.subMeshes?.length) {
-          return sum + (materialArray(mesh).some(materialIsVisible)
+          return sum + (materialArray(mesh).some((material) => {
+            const index = materials.indexOf(material);
+            return index >= 0 && materialVisibility.isRuntimeVisible(index);
+          })
             ? Math.floor(mesh.getTotalIndices() / 3)
             : 0);
         }
-        return sum + mesh.subMeshes.reduce((meshSum, subMesh) => (
-          materialIsVisible(materials[materialIndexForSubMesh(mesh, subMesh.materialIndex, materials)])
+        return sum + mesh.subMeshes.reduce((meshSum, subMesh) => {
+          const materialIndex = materialIndexForSubMesh(mesh, subMesh.materialIndex, materials);
+          return materialIndex !== null && materialVisibility.isRuntimeVisible(materialIndex)
             ? meshSum + Math.floor(subMesh.indexCount / 3)
-            : meshSum
-        ), 0);
+            : meshSum;
+        }, 0);
       }, 0),
       textureByteEstimate: () => {
         const seenTextures = new Set<BaseTexture>();
-        return materials.reduce((sum, material) => {
-          if (!materialIsVisible(material)) return sum;
+        return materials.reduce((sum, material, index) => {
+          if (!materialVisibility.isRuntimeVisible(index)) return sum;
           const texture = materialTexture(material);
           if (!texture || seenTextures.has(texture)) return sum;
           seenTextures.add(texture);
@@ -1404,7 +1421,14 @@ export const loadBabylonMmdModel = async (
         const runtime = mmdRuntime;
         if (!runtimeModel || !runtime) throw new Error("Babylon MMD model is unavailable");
         const skinMatrices = createBabylonSkinMatrices(runtimeModel.worldTransformMatrices, babylonBones);
-        return createBabylonSnapshot(rootMesh!, sourceMeshes, materials, skinMatrices, options);
+        return createBabylonSnapshot(
+          rootMesh!,
+          sourceMeshes,
+          materials,
+          materialVisibility,
+          skinMatrices,
+          options,
+        );
       },
       clearMotion: (kind) => {
         if (!kind || kind === "dance") {

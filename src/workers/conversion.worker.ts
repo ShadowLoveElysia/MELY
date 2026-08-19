@@ -2,8 +2,9 @@
 
 import { generateHologram, generateMeshHologram } from "../core/hologram";
 import { generateSolidVoxels } from "../core/solidVoxelizer";
-import { errorDescriptor } from "../core/appError";
+import { workerErrorDescriptor } from "../core/appError";
 import { assertWorkerResources } from "../core/workerResourcePreflight";
+import { projectionResultTransferables } from "../core/workerResultTransfer";
 import { assertWorkerGenerationHeight, assertWorkerResultHeight } from "../core/workerHeightPreflight";
 import type { MmdMeshSnapshot, WorkerCommand, WorkerEvent, WorkerStage } from "../types";
 
@@ -30,13 +31,15 @@ self.onmessage = (message: MessageEvent<WorkerCommand>) => {
 
   try {
     assertWorkerGenerationHeight(command);
-    assertWorkerResources(command);
+    const resources = assertWorkerResources(command);
     const progress = (stage: WorkerStage, value: number) => {
       send({ type: "PROGRESS", jobId: command.jobId, stage, progress: value });
     };
     let result;
     if (command.type === "GENERATE_SOLID") {
-      result = generateSolidVoxels(command.source.mesh, command.options, progress);
+      result = generateSolidVoxels(command.source.mesh, command.options, progress, {
+        workEstimate: resources.solidWorkEstimate,
+      });
     } else if (command.source.kind === "mesh") {
       if (
         !command.generationSeed
@@ -59,16 +62,14 @@ self.onmessage = (message: MessageEvent<WorkerCommand>) => {
     send({ type: "PROGRESS", jobId: command.jobId, stage: "complete", progress: 1 });
     send(
       { type: "RESULT", jobId: command.jobId, result },
-      result.kind === "solid"
-        ? [result.positions.buffer, result.blockIndices.buffer]
-        : [result.positions.buffer, result.facings.buffer, result.materials.buffer],
+      projectionResultTransferables(result),
     );
   } catch (error) {
-    const descriptor = errorDescriptor(error);
+    const descriptor = workerErrorDescriptor(error);
     send({
       type: "ERROR",
       jobId: command.jobId,
-      code: descriptor.code === "error.unknown" ? "error.worker.unknown" : descriptor.code,
+      code: descriptor.code,
       params: descriptor.params,
     });
   } finally {

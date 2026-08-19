@@ -8,6 +8,7 @@ import {
   isMotionReadyForGeneration,
   motionFrameStepState,
   normalizeMotionFrame,
+  parseMotionFrameInput,
   shouldIgnoreMotionShortcut,
 } from "../src/core/motionUi";
 import {
@@ -87,6 +88,16 @@ test("single-frame navigation rounds the displayed frame and clamps both ends", 
     canStepBackward: true,
     canStepForward: false,
   });
+});
+
+test("typed motion frame input rejects empty values and clamps finite numbers", () => {
+  assert.equal(parseMotionFrameInput("", 30), null);
+  assert.equal(parseMotionFrameInput("   ", 30), null);
+  assert.equal(parseMotionFrameInput("not-a-frame", 30), null);
+  assert.equal(parseMotionFrameInput("Infinity", 30), null);
+  assert.equal(parseMotionFrameInput("12.5", 30), 13);
+  assert.equal(parseMotionFrameInput("-8", 30), 0);
+  assert.equal(parseMotionFrameInput("80", 30), 30);
 });
 
 test("motion frame formatting keeps fractional lock positions compact", () => {

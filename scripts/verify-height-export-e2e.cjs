@@ -120,6 +120,18 @@ const injectFixtureWorker = () => {
     postMessage(command) {
       if (this.terminated) return;
       const targetHeight = Math.max(1, Math.round(command.options?.targetHeight || 1));
+      record("worker-command", {
+        commandType: command.type,
+        targetHeight,
+        heightMode: command.heightMode ?? null,
+        targetDimension: command.targetDimension
+          ? {
+              minY: command.targetDimension.minY,
+              height: command.targetDimension.height,
+            }
+          : null,
+        placementBottomY: command.placementBottomY ?? null,
+      });
       const height = Math.max(
         1,
         Math.round(window.__MELY_HEIGHT_FIXTURE_ACTUAL_HEIGHT || targetHeight),
@@ -319,13 +331,92 @@ const setHeight = async (page, height) => {
   }
 };
 
-const generateFixture = async (page, profile, targetHeight, actualHeight = targetHeight) => {
+const workerCommands = (page) => page.evaluate(() => (
+  window.__MELY_E2E_EVENTS?.filter((event) => event.type === "worker-command") ?? []
+));
+
+const startFixtureGeneration = async (page, expectResourceRisk = false) => {
+  const trigger = page.getByRole("button", { name: "Generate hologram" });
+  const generationButtonDisabled = await trigger.isDisabled();
+  if (generationButtonDisabled) {
+    throw new Error("Large projection generation is hard-disabled instead of confirmable");
+  }
+  const commandsBefore = (await workerCommands(page)).length;
+  await trigger.click();
+
+  let resourceRisk = null;
+  if (expectResourceRisk) {
+    const dialog = page.getByRole("dialog", {
+      name: "Large projection: resource-risk confirmation",
+    });
+    await dialog.waitFor({ state: "visible" });
+    const warningText = (await dialog.innerText()).trim();
+    const advisoryCopyPresent = warningText.includes("not hard limits");
+    const commandsWhileAwaitingConfirmation = (await workerCommands(page)).length;
+    const confirm = dialog.getByRole("button", {
+      name: "Confirm and start generation",
+      exact: true,
+    });
+    const confirmDisabledInitially = await confirm.isDisabled();
+    const acknowledgement = dialog.locator('.risk-acknowledgement input[type="checkbox"]');
+    const acknowledgementCount = await acknowledgement.count();
+    if (acknowledgementCount !== 1) {
+      throw new Error(`Expected one generation resource acknowledgement, found ${acknowledgementCount}`);
+    }
+    await acknowledgement.check();
+    const confirmEnabledAfterAcknowledgement = await confirm.isEnabled();
+    if (!advisoryCopyPresent
+      || commandsWhileAwaitingConfirmation !== commandsBefore
+      || !confirmDisabledInitially
+      || !confirmEnabledAfterAcknowledgement) {
+      throw new Error(`Generation resource risk is not a confirmation-only gate: ${JSON.stringify({
+        advisoryCopyPresent,
+        commandsBefore,
+        commandsWhileAwaitingConfirmation,
+        confirmDisabledInitially,
+        confirmEnabledAfterAcknowledgement,
+      })}`);
+    }
+    await confirm.click();
+    await dialog.waitFor({ state: "hidden" });
+    resourceRisk = {
+      dialogReached: true,
+      generationButtonDisabled,
+      advisoryCopyPresent,
+      warningText,
+      commandsBefore,
+      commandsWhileAwaitingConfirmation,
+      confirmDisabledInitially,
+      confirmEnabledAfterAcknowledgement,
+    };
+  }
+
+  await page.waitForFunction((previousCount) => (
+    (window.__MELY_E2E_EVENTS
+      ?.filter((event) => event.type === "worker-command").length ?? 0) > previousCount
+  ), commandsBefore, { timeout: 120_000 });
+  const commandsAfterConfirmation = await workerCommands(page);
+  const workerCommand = commandsAfterConfirmation.at(-1) ?? null;
+  if (resourceRisk) {
+    resourceRisk.commandsAfterConfirmation = commandsAfterConfirmation.length;
+    resourceRisk.continuedToWorker = commandsAfterConfirmation.length > commandsBefore;
+  }
+  return { resourceRisk, workerCommand };
+};
+
+const generateFixture = async (
+  page,
+  profile,
+  targetHeight,
+  actualHeight = targetHeight,
+  expectResourceRisk = false,
+) => {
   await page.evaluate(({ profile: value, actualHeight: resultHeight }) => {
     window.__MELY_HEIGHT_FIXTURE_PROFILE = value;
     window.__MELY_HEIGHT_FIXTURE_ACTUAL_HEIGHT = resultHeight;
   }, { profile, actualHeight });
   await setHeight(page, targetHeight);
-  await page.getByRole("button", { name: "Generate hologram" }).click();
+  const generation = await startFixtureGeneration(page, expectResourceRisk);
   await page.locator(".export-button").waitFor({ state: "visible", timeout: 120_000 });
   await page.waitForFunction(
     () => {
@@ -339,6 +430,7 @@ const generateFixture = async (page, profile, targetHeight, actualHeight = targe
       `Export did not become available for ${profile} target ${targetHeight}, actual ${actualHeight}`,
     );
   });
+  return generation;
 };
 
 const openExportCenter = async (page) => {
@@ -452,13 +544,14 @@ const unlockExtendedHeight = async (page) => {
   };
 };
 
-const reachExtremeHeight = async (page, report) => {
-  const button = page.getByRole("button", {
-    name: "Unlock experimental limit (4,064 layers)",
+const completeExtremeHeightConfirmation = async (page, triggerName) => {
+  const trigger = page.getByRole("button", {
+    name: triggerName,
     exact: true,
   });
-  if (await button.isDisabled()) throw new Error("The 4,064-layer unlock is disabled");
-  await button.click();
+  await trigger.waitFor({ state: "visible" });
+  if (await trigger.isDisabled()) throw new Error(`The 4,064-layer confirmation is disabled: ${triggerName}`);
+  await trigger.click();
 
   const unlockDialog = page.getByRole("dialog", {
     name: "Experimental 4,064 layers: unlock",
@@ -474,8 +567,9 @@ const reachExtremeHeight = async (page, report) => {
   });
   await environmentDialog.waitFor({ state: "visible" });
   const checks = environmentDialog.locator('input[type="checkbox"]');
-  if (await checks.count() !== 3) {
-    throw new Error(`Expected three 4,064-layer environment notices, found ${await checks.count()}`);
+  const environmentNoticeCount = await checks.count();
+  if (environmentNoticeCount !== 3) {
+    throw new Error(`Expected three 4,064-layer environment notices, found ${environmentNoticeCount}`);
   }
   for (let index = 0; index < 3; index += 1) await checks.nth(index).check();
   await environmentDialog.getByRole("button", {
@@ -483,6 +577,14 @@ const reachExtremeHeight = async (page, report) => {
     exact: true,
   }).click();
   await environmentDialog.waitFor({ state: "hidden" });
+  return { environmentNoticeCount };
+};
+
+const reachExtremeHeight = async (page, report) => {
+  const initialConfirmation = await completeExtremeHeightConfirmation(
+    page,
+    "Unlock experimental limit (4,064 layers)",
+  );
 
   const declaration = page.locator(".dimension-declaration").locator('input[type="number"]');
   const targetHeight = Number(await targetHeightInput(page).inputValue());
@@ -491,16 +593,68 @@ const reachExtremeHeight = async (page, report) => {
     throw new Error(`4,064-layer state did not activate: ${JSON.stringify({ targetHeight, values })}`);
   }
 
+  const interiorDensityInput = page.locator(".field-row")
+    .filter({ hasText: "Interior projection density" })
+    .locator('.slider-number input[type="number"]');
+  const previousInteriorDensity = Number(await interiorDensityInput.inputValue());
+  const nextInteriorDensity = previousInteriorDensity >= 100
+    ? previousInteriorDensity - 1
+    : previousInteriorDensity + 1;
+  await interiorDensityInput.fill(String(nextInteriorDensity));
+
+  const reconfirm = page.getByRole("button", {
+    name: "Reconfirm experimental limit (4,064 layers)",
+    exact: true,
+  });
+  await reconfirm.waitFor({ state: "visible" });
+  const postMutationState = {
+    targetHeight: Number(await targetHeightInput(page).inputValue()),
+    declaration: await declaration.evaluateAll((elements) => elements.map((element) => Number(element.value))),
+    interiorDensity: Number(await interiorDensityInput.inputValue()),
+    reconfirmVisible: await reconfirm.isVisible(),
+  };
+  if (postMutationState.targetHeight !== 4064
+    || !dimensionsEqual(postMutationState.declaration, [-2032, 4064, -2032])
+    || postMutationState.interiorDensity !== nextInteriorDensity
+    || !postMutationState.reconfirmVisible) {
+    throw new Error(`4,064-layer state changed after invalidating its confirmation: ${JSON.stringify(postMutationState)}`);
+  }
+
+  const repeatedConfirmation = await completeExtremeHeightConfirmation(
+    page,
+    "Reconfirm experimental limit (4,064 layers)",
+  );
+  const postReconfirmationState = {
+    targetHeight: Number(await targetHeightInput(page).inputValue()),
+    declaration: await declaration.evaluateAll((elements) => elements.map((element) => Number(element.value))),
+  };
+  if (postReconfirmationState.targetHeight !== 4064
+    || !dimensionsEqual(postReconfirmationState.declaration, [-2032, 4064, -2032])) {
+    throw new Error(`4,064-layer state changed during reconfirmation: ${JSON.stringify(postReconfirmationState)}`);
+  }
+
   await page.evaluate(() => {
     window.__MELY_HEIGHT_FIXTURE_PROFILE = "narrow";
-    window.__MELY_HEIGHT_FIXTURE_ACTUAL_HEIGHT = 4064;
+    // 让结果高度严格跟随 Worker 命令，避免 fixture 掩盖 4064 被静默降为 2032。
+    window.__MELY_HEIGHT_FIXTURE_ACTUAL_HEIGHT = null;
   });
-  await page.getByRole("button", { name: "Generate hologram" }).click();
+  const generation = await startFixtureGeneration(page, true);
   await page.locator(".export-button").waitFor({ state: "visible", timeout: 120_000 });
   await page.waitForFunction(() => {
     const control = document.querySelector(".export-button");
     return control instanceof HTMLButtonElement && !control.disabled;
   }, null, { timeout: 120_000 });
+  const workerCommand = generation.workerCommand;
+  if (!workerCommand
+    || workerCommand.commandType !== "GENERATE_HOLOGRAM"
+    || workerCommand.targetHeight !== 4064
+    || workerCommand.heightMode !== "experimental_4064"
+    || !workerCommand.targetDimension
+    || workerCommand.targetDimension.minY !== -2032
+    || workerCommand.targetDimension.height !== 4064
+    || workerCommand.placementBottomY !== -2032) {
+    throw new Error(`Worker received an invalid 4,064-layer command: ${JSON.stringify(workerCommand)}`);
+  }
   const exportCenter = await openExportCenter(page);
   const litematic = formats.find(({ id }) => id === "litematic");
   if (!litematic) throw new Error("Missing Litematica E2E descriptor");
@@ -535,10 +689,18 @@ const reachExtremeHeight = async (page, report) => {
     report,
   );
   assertExport(litematic.id, parsed, fixtureProfiles.narrow(4064).dimensions);
+  if (parsed.dimensions?.[1] !== 4064) {
+    throw new Error(`The exported Litematic was silently reduced below 4,064 layers: ${JSON.stringify(parsed)}`);
+  }
   return {
     unlockDialogReached: true,
     environmentDialogReached: true,
-    environmentNoticeCount: 3,
+    environmentNoticeCount: initialConfirmation.environmentNoticeCount,
+    postMutationState,
+    repeatedEnvironmentNoticeCount: repeatedConfirmation.environmentNoticeCount,
+    postReconfirmationState,
+    generationResourceRisk: generation.resourceRisk,
+    workerCommand,
     exportDialogReached: true,
     confirmDisabledInitially,
     confirmEnabledAfterAcknowledgement,
@@ -634,7 +796,8 @@ const main = async () => {
       ...await unlockExtendedHeight(page),
       javaAvailability: {},
     };
-    await generateFixture(page, "narrow", 2032);
+    const extendedGeneration = await generateFixture(page, "narrow", 2032, 2032, true);
+    extended2032.generationResourceRisk = extendedGeneration.resourceRisk;
     const extendedCenter = await openExportCenter(page);
     for (const format of formats.filter(({ id }) => !isBedrockFormat({ id }))) {
       const formatControl = formatButton(extendedCenter, format);

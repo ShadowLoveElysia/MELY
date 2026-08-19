@@ -14,6 +14,14 @@ const outputDirectory = resolve(
 const reportPath = resolve(
   process.env.MELY_REPORT_PATH || join(outputDirectory, "report.json"),
 );
+const BACKENDS = ["vanilla", "moeru", "babylon"];
+const TARGET_FRAMES = Object.freeze({
+  vanilla: Object.freeze({ dance: 30, expression: 15 }),
+  moeru: Object.freeze({ dance: 45, expression: 24 }),
+  babylon: Object.freeze({ dance: 60, expression: 33 }),
+});
+const SOFTWARE_RENDERER_PATTERN = /swiftshader|llvmpipe|lavapipe|software rasterizer|reference rasterizer|microsoft basic render|basic render driver|\bwarp\b/i;
+const D3D11_RENDERER_PATTERN = /direct3d11|d3d11/i;
 
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const delay = (milliseconds) => new Promise((resolve_) => setTimeout(resolve_, milliseconds));
@@ -77,171 +85,166 @@ const readWebGlDiagnostics = async (page) => page.evaluate(() => {
   };
 });
 
-const measureTimelineScrub = async (page, targetFrame) => {
-  const roundTripStartedAt = Date.now();
-  const application = await page.evaluate(async ({ frame, timeoutMs }) => {
-    const timeline = document.querySelector('input[aria-label="Motion frame"]');
-    const output = timeline?.closest(".viewport-motion__scrubber")?.querySelector("output");
-    if (!(timeline instanceof HTMLInputElement) || !(output instanceof HTMLOutputElement)) {
-      throw new Error("Motion timeline controls are unavailable");
-    }
-    const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-    if (!valueSetter) throw new Error("Native range value setter is unavailable");
+const trackPanel = (page, kind) => page.locator(`.viewport-motion--${kind}`);
+const trackInput = (page, kind) => trackPanel(page, kind).getByRole("spinbutton", {
+  name: `Jump to ${kind === "dance" ? "Dance" : "Expression"} track frame`,
+  exact: true,
+});
 
+const readTrackFrames = async (page) => ({
+  dance: Number(await trackInput(page, "dance").inputValue()),
+  expression: Number(await trackInput(page, "expression").inputValue()),
+});
+
+const armRenderedFrames = async (page, expected, timeoutMs = 15_000) => {
+  await page.evaluate(({ frames, timeout }) => {
+    window.__MELY_E2E_FRAME_WAIT__?.cancel?.();
     window.__MELY_E2E_GPU_PROBE__ = true;
-    const initialOutput = output.textContent;
-    const startedAt = performance.now();
-    let mutationAt = null;
-    let renderedDetail = null;
-    let timeout = 0;
-
-    const committed = () => (
-      Number(timeline.value) === frame
-      && output.textContent !== initialOutput
-    );
-
-    const result = await new Promise((resolve_, reject) => {
-      let dispatchReturnedAt = startedAt;
-      const maybeFinish = () => {
-        if (!renderedDetail || mutationAt === null || !committed()) return;
-        finish({
-          eventDispatchDurationMs: dispatchReturnedAt - startedAt,
-          gpuCompletionLatencyMs: renderedDetail.renderedAt - startedAt,
-          gpuSynchronized: renderedDetail.gpuSynchronized === true,
-          uiCommitLatencyMs: mutationAt - startedAt,
-          renderedFrame: renderedDetail.frame,
-          appliedFrame: Number(timeline.value),
-          outputText: output.textContent,
-        });
-      };
-      const observer = new MutationObserver(() => {
-        if (mutationAt === null && committed()) mutationAt = performance.now();
-        maybeFinish();
-      });
-      const finish = (value) => {
-        observer.disconnect();
-        window.removeEventListener("mely:vmd-frame-rendered", onRendered);
-        clearTimeout(timeout);
-        window.__MELY_E2E_GPU_PROBE__ = false;
-        resolve_(value);
-      };
-      observer.observe(output, { childList: true, characterData: true, subtree: true });
-      timeout = window.setTimeout(() => {
-        observer.disconnect();
-        window.removeEventListener("mely:vmd-frame-rendered", onRendered);
-        window.__MELY_E2E_GPU_PROBE__ = false;
-        reject(new Error(`Motion scrub did not render frame ${frame} within ${timeoutMs} ms`));
-      }, timeoutMs);
-
-      const onRendered = (event) => {
-        const detail = event.detail;
-        if (!detail || Math.abs(detail.frame - frame) > 0.01) return;
-        renderedDetail = detail;
-        maybeFinish();
-      };
-      window.addEventListener("mely:vmd-frame-rendered", onRendered);
-
-      valueSetter.call(timeline, String(frame));
-      timeline.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      dispatchReturnedAt = performance.now();
-    });
-    return result;
-  }, { frame: targetFrame, timeoutMs: 5_000 });
-
-  return {
-    measurementMethod: "in-page-input-to-webgl-finish",
-    playwrightActionabilityIncluded: false,
-    playwrightEvaluateRoundTripMs: Date.now() - roundTripStartedAt,
-    ...application,
-  };
+    const wait = { status: "pending", detail: null, error: null, cancel: null };
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("mely:vmd-frame-rendered", listener);
+      window.__MELY_E2E_GPU_PROBE__ = false;
+    };
+    const listener = (event) => {
+      const detail = event.detail;
+      if (
+        !detail?.frames
+        || Math.abs(detail.frames.dance - frames.dance) > 0.01
+        || Math.abs(detail.frames.expression - frames.expression) > 0.01
+      ) return;
+      cleanup();
+      wait.status = "complete";
+      wait.detail = detail;
+    };
+    const timer = window.setTimeout(() => {
+      cleanup();
+      wait.status = "error";
+      wait.error = `Timed out waiting for rendered frames ${JSON.stringify(frames)}`;
+    }, timeout);
+    wait.cancel = () => {
+      cleanup();
+      wait.status = "error";
+      wait.error = "Frame wait was replaced";
+    };
+    window.addEventListener("mely:vmd-frame-rendered", listener);
+    window.__MELY_E2E_FRAME_WAIT__ = wait;
+  }, { frames: expected, timeout: timeoutMs });
 };
 
-const measurePlaybackStart = async (page, initialFrame) => {
-  const playButton = page.getByRole("button", { name: "Play motion", exact: true });
-  const actionabilityStartedAt = Date.now();
-  await playButton.click({ trial: true });
-  const playwrightActionabilityProbeMs = Date.now() - actionabilityStartedAt;
+const collectRenderedFrames = async (page, timeoutMs = 16_000) => {
+  await page.waitForFunction(() => window.__MELY_E2E_FRAME_WAIT__?.status !== "pending", undefined, {
+    timeout: timeoutMs,
+  });
+  return page.evaluate(() => {
+    const wait = window.__MELY_E2E_FRAME_WAIT__;
+    delete window.__MELY_E2E_FRAME_WAIT__;
+    if (!wait || wait.status !== "complete") throw new Error(wait?.error || "Frame wait failed");
+    return wait.detail;
+  });
+};
 
-  const roundTripStartedAt = Date.now();
-  const application = await page.evaluate(async ({ frame, timeoutMs }) => {
-    const timeline = document.querySelector('input[aria-label="Motion frame"]');
-    const panel = timeline?.closest(".viewport-motion");
-    const button = panel?.querySelector('button[aria-label="Play motion"]');
-    if (
-      !(timeline instanceof HTMLInputElement)
-      || !(panel instanceof HTMLElement)
-      || !(button instanceof HTMLButtonElement)
-    ) {
-      throw new Error("Motion playback controls are unavailable");
-    }
+const enterTrackFrame = async (page, kind, frame, expectedFrames) => {
+  const input = trackInput(page, kind);
+  await armRenderedFrames(page, expectedFrames);
+  await input.fill(String(frame));
+  await input.press("Enter");
+  const rendered = await collectRenderedFrames(page);
+  await page.waitForFunction(({ dance, expression }) => {
+    const read = (kind) => Number(document.querySelector(
+      `.viewport-motion--${kind} input[type="number"]`,
+    )?.value);
+    return read("dance") === dance && read("expression") === expression;
+  }, expectedFrames);
+  return rendered;
+};
 
-    window.__MELY_E2E_GPU_PROBE__ = true;
-    const startedAt = performance.now();
-    let mutationAt = null;
-    let advancedFrame = null;
-    let timeout = 0;
+const lockButton = (page, kind, locked) => trackPanel(page, kind).getByRole("button", {
+  name: `${locked ? "Unlock" : "Lock"} ${kind === "dance" ? "Dance" : "Expression"} track`,
+  exact: true,
+});
 
-    const readAdvance = () => {
-      const current = Number(timeline.value);
-      if (Number.isFinite(current) && current > frame) {
-        if (advancedFrame === null) advancedFrame = current;
-        return true;
-      }
-      return false;
-    };
+const switchRenderer = async (page, backend) => {
+  const select = page.getByRole("combobox", { name: "MMD renderer", exact: true });
+  if (await select.inputValue() !== backend) {
+    await page.evaluate(() => { window.__MELY_E2E_CURRENT_BACKEND__ = null; });
+    await select.selectOption(backend);
+  }
+  await page.waitForFunction((expected) => {
+    const renderer = document.querySelector('select[aria-label="MMD renderer"]');
+    return renderer?.value === expected
+      && !renderer.disabled
+      && window.__MELY_E2E_CURRENT_BACKEND__?.backend === expected
+      && document.querySelector(".viewport-canvas canvas");
+  }, backend, { timeout: 180_000 });
+};
 
-    const result = await new Promise((resolve_, reject) => {
-      let clickReturnedAt = startedAt;
-      const observer = new MutationObserver(() => {
-        if (mutationAt === null && readAdvance()) mutationAt = performance.now();
-      });
-      const finish = (value) => {
-        observer.disconnect();
-        window.removeEventListener("mely:vmd-frame-rendered", onRendered);
-        clearTimeout(timeout);
-        window.__MELY_E2E_GPU_PROBE__ = false;
-        resolve_(value);
-      };
-      observer.observe(panel, {
-        attributes: true,
-        attributeFilter: ["aria-label", "aria-pressed", "value"],
-        childList: true,
-        characterData: true,
-        subtree: true,
-      });
-      timeout = window.setTimeout(() => {
-        observer.disconnect();
-        window.removeEventListener("mely:vmd-frame-rendered", onRendered);
-        window.__MELY_E2E_GPU_PROBE__ = false;
-        reject(new Error(`Motion playback did not advance within ${timeoutMs} ms`));
-      }, timeoutMs);
+const exerciseRenderer = async (page, backend, previousFrames) => {
+  await switchRenderer(page, backend);
+  const restoredFrames = await readTrackFrames(page);
+  const restoredLocks = {
+    dance: await lockButton(page, "dance", true).count() === 1,
+    expression: await lockButton(page, "expression", true).count() === 1,
+  };
+  const target = TARGET_FRAMES[backend];
+  const expectedAfterDance = { dance: target.dance, expression: restoredFrames.expression };
+  const danceRender = await enterTrackFrame(page, "dance", target.dance, expectedAfterDance);
+  const expressionLockPreserved = previousFrames === null
+    ? true
+    : await lockButton(page, "expression", true).count() === 1;
+  const danceUnlockedAlone = await lockButton(page, "dance", false).count() === 1;
+  const expressionRender = await enterTrackFrame(page, "expression", target.expression, target);
+  const appliedFrames = await readTrackFrames(page);
 
-      const onRendered = (event) => {
-        const detail = event.detail;
-        if (!detail || detail.frame <= frame) return;
-        readAdvance();
-        finish({
-          nativeClickDispatchDurationMs: clickReturnedAt - startedAt,
-          gpuCompletionLatencyMs: detail.renderedAt - startedAt,
-          gpuSynchronized: detail.gpuSynchronized === true,
-          firstUiAdvanceLatencyMs: mutationAt === null ? null : mutationAt - startedAt,
-          firstAdvancedFrame: advancedFrame ?? detail.frame,
-        });
-      };
-      window.addEventListener("mely:vmd-frame-rendered", onRendered);
+  await lockButton(page, "dance", false).click();
+  await lockButton(page, "expression", false).click();
+  const lockedAfterInput = {
+    dance: await lockButton(page, "dance", true).count() === 1,
+    expression: await lockButton(page, "expression", true).count() === 1,
+  };
 
-      button.click();
-      clickReturnedAt = performance.now();
-    });
-    return result;
-  }, { frame: initialFrame, timeoutMs: 5_000 });
+  const canvas = page.locator(".viewport-canvas canvas");
+  const webgl = await readWebGlDiagnostics(page);
+  const rendererIdentity = `${webgl.vendor} ${webgl.renderer}`;
+  const hardwareGpu = !SOFTWARE_RENDERER_PATTERN.test(rendererIdentity)
+    && D3D11_RENDERER_PATTERN.test(rendererIdentity);
+  const screenshot = await canvas.screenshot({ type: "png" });
+  const screenshotPath = join(outputDirectory, `${backend}-D${target.dance}-E${target.expression}.png`);
+  await writeFile(screenshotPath, screenshot);
 
+  const assertions = {
+    restoredPreviousFrames: previousFrames === null || (
+      restoredFrames.dance === previousFrames.dance
+      && restoredFrames.expression === previousFrames.expression
+    ),
+    restoredPreviousLocks: previousFrames === null || (restoredLocks.dance && restoredLocks.expression),
+    danceInputPreservedExpression: Math.abs(danceRender.frames.dance - target.dance) <= 0.01
+      && Math.abs(danceRender.frames.expression - restoredFrames.expression) <= 0.01,
+    expressionInputPreservedDance: Math.abs(expressionRender.frames.dance - target.dance) <= 0.01
+      && Math.abs(expressionRender.frames.expression - target.expression) <= 0.01,
+    gpuSynchronized: danceRender.gpuSynchronized === true
+      && expressionRender.gpuSynchronized === true,
+    editingLockedDanceUnlockedOnlyDance: previousFrames === null
+      || (danceUnlockedAlone && expressionLockPreserved),
+    appliedIndependentFrames: appliedFrames.dance === target.dance
+      && appliedFrames.expression === target.expression,
+    relockedBothTracks: lockedAfterInput.dance && lockedAfterInput.expression,
+    hardwareGpu,
+  };
+  if (!Object.values(assertions).every(Boolean)) {
+    throw new Error(`${backend} dual-track assertions failed: ${JSON.stringify(assertions)}`);
+  }
   return {
-    measurementMethod: "in-page-click-to-webgl-finish",
-    playwrightActionabilityIncluded: false,
-    playwrightActionabilityProbeMs,
-    playwrightEvaluateRoundTripMs: Date.now() - roundTripStartedAt,
-    ...application,
+    backend,
+    target,
+    restoredFrames,
+    restoredLocks,
+    appliedFrames,
+    danceRender,
+    expressionRender,
+    webgl,
+    screenshot: { path: screenshotPath, sha256: sha256(screenshot) },
+    assertions,
   };
 };
 
@@ -256,10 +259,14 @@ const main = async () => {
     appUrl,
     consoleErrors: [],
     pageErrors: [],
+    renderers: [],
+    assertions: {},
+    passed: false,
   };
   const browser = await chromium.launch({
     headless: true,
     executablePath: browserPath || undefined,
+    args: ["--enable-gpu", "--disable-software-rasterizer", "--use-angle=d3d11"],
   });
   try {
     const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
@@ -269,6 +276,13 @@ const main = async () => {
     });
     page.on("pageerror", (error) => report.pageErrors.push(error.message));
 
+    await page.addInitScript(() => {
+      window.__MELY_E2E_MATERIAL_SELECTION_PROBE__ = true;
+      window.__MELY_E2E_CURRENT_BACKEND__ = null;
+      window.addEventListener("mely:material-selection-state", (event) => {
+        window.__MELY_E2E_CURRENT_BACKEND__ = event.detail;
+      });
+    });
     await page.goto(appUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.locator(".locale-control select").selectOption("en-US");
     const input = page.locator('input[type="file"][accept*=".pmx"]');
@@ -277,47 +291,53 @@ const main = async () => {
     await page.locator(".model-summary").waitFor({ state: "visible", timeout: 180_000 });
 
     await input.setInputFiles(motionZip);
-    const timelinePanel = page.locator(".viewport-motion");
-    await timelinePanel.waitFor({ state: "visible", timeout: 180_000 });
-    const timeline = page.getByRole("slider", { name: "Motion frame" });
+    const timelinePanels = page.locator(".viewport-motion");
+    await timelinePanels.first().waitFor({ state: "visible", timeout: 180_000 });
+    if (await timelinePanels.count() !== 2) {
+      throw new Error("The real VMD package must load both Dance and Expression tracks");
+    }
+    await trackInput(page, "dance").waitFor({ state: "visible" });
+    await trackInput(page, "expression").waitFor({ state: "visible" });
     const canvas = page.locator(".viewport-canvas canvas");
     const panel = page.locator(".viewport-panel");
     report.browser = {
       version: await browser.version(),
-      webgl: await readWebGlDiagnostics(page),
     };
 
     report.motion = {
-      selectedName: await page.locator(".viewport-motion__identity strong").innerText(),
-      frameMaximum: Number(await timeline.getAttribute("max")),
-      matchText: await page.locator(".viewport-motion__meta").innerText(),
+      dance: {
+        selectedName: await trackPanel(page, "dance").locator(".viewport-motion__identity strong").innerText(),
+        frameMaximum: Number(await trackInput(page, "dance").getAttribute("max")),
+        matchText: await trackPanel(page, "dance").locator(".viewport-motion__meta").innerText(),
+      },
+      expression: {
+        selectedName: await trackPanel(page, "expression").locator(".viewport-motion__identity strong").innerText(),
+        frameMaximum: Number(await trackInput(page, "expression").getAttribute("max")),
+        matchText: await trackPanel(page, "expression").locator(".viewport-motion__meta").innerText(),
+      },
     };
     const [timelineBounds, canvasBounds, panelBounds] = await Promise.all([
-      timelinePanel.boundingBox(),
+      timelinePanels.first().boundingBox(),
       canvas.boundingBox(),
       panel.boundingBox(),
     ]);
     report.layout = { timelineBounds, canvasBounds, panelBounds };
 
-    report.scrub = await measureTimelineScrub(page, 100);
-    const before = await captureCanvas(page, "frame-100-before-play");
-
-    report.playback = await measurePlaybackStart(page, 100);
-    await delay(350);
-    await page.getByRole("button", { name: "Pause motion", exact: true }).click();
-    const pausedFrame = Number(await timeline.inputValue());
-    const after = await captureCanvas(page, "after-live-playback");
-    await delay(180);
-    const stableFrame = Number(await timeline.inputValue());
-    report.playback.pausedFrame = pausedFrame;
-    report.playback.stableFrame = stableFrame;
-    report.playback.canvasDifference = canvasDifference(before.pixels, after.pixels);
+    let previousFrames = null;
+    for (const backend of BACKENDS) {
+      const result = await exerciseRenderer(page, backend, previousFrames);
+      report.renderers.push(result);
+      previousFrames = result.appliedFrames;
+    }
 
     await panel.screenshot({ path: join(outputDirectory, "viewport-with-bottom-timeline.png") });
     report.assertions = {
-      selectedBodyMotion: report.motion.selectedName.includes("动作"),
-      expectedRealFrameRange: report.motion.frameMaximum === 629,
-      matchedAllBodyTracks: /Bones\s+57\s*\/\s*57/.test(report.motion.matchText),
+      selectedBodyMotion: report.motion.dance.selectedName.includes("动作"),
+      selectedExpressionMotion: report.motion.expression.selectedName.includes("表情"),
+      expectedRealFrameRanges: report.motion.dance.frameMaximum >= 60
+        && report.motion.expression.frameMaximum >= 33,
+      matchedBodyTracks: /Bones\s+[1-9]\d*\s*\/\s*[1-9]\d*/.test(report.motion.dance.matchText),
+      matchedExpressionTracks: /Morphs\s+[1-9]\d*\s*\/\s*[1-9]\d*/.test(report.motion.expression.matchText),
       timelineBelowCanvas: Boolean(
         timelineBounds && canvasBounds
         && timelineBounds.y >= canvasBounds.y + canvasBounds.height - 2
@@ -327,19 +347,15 @@ const main = async () => {
         && timelineBounds.x >= panelBounds.x
         && timelineBounds.x + timelineBounds.width <= panelBounds.x + panelBounds.width
       ),
-      scrubAppliedRequestedFrame: report.scrub.appliedFrame === 100
-        && Math.abs(report.scrub.renderedFrame - 100) <= 0.01,
-      scrubGpuCompletionResponsive: report.scrub.gpuCompletionLatencyMs <= 100,
-      scrubGpuSynchronized: report.scrub.gpuSynchronized,
-      firstPlaybackGpuCompletionResponsive: report.playback.gpuCompletionLatencyMs <= 100,
-      firstPlaybackGpuSynchronized: report.playback.gpuSynchronized,
-      frameAdvanced: pausedFrame > 100,
-      canvasChangedDuringPlayback: report.playback.canvasDifference.changedPixelRatio >= 0.001,
-      pauseStable: stableFrame === pausedFrame,
+      allRenderersExecuted: report.renderers.length === BACKENDS.length,
+      allRenderersPassed: report.renderers.every((entry) => (
+        Object.values(entry.assertions).every(Boolean)
+      )),
       noConsoleErrors: report.consoleErrors.length === 0,
       noPageErrors: report.pageErrors.length === 0,
     };
-    if (!Object.values(report.assertions).every(Boolean)) {
+    report.passed = Object.values(report.assertions).every(Boolean);
+    if (!report.passed) {
       throw new Error(`VMD live-preview assertions failed: ${JSON.stringify(report.assertions)}`);
     }
   } catch (error) {

@@ -12,13 +12,46 @@ import {
 } from "../src/core/projectionDocument";
 
 test("projection content hashing uses standard SHA-256", () => {
-  for (const value of ["", "abc", "MELY".repeat(40)]) {
+  for (const value of [
+    "",
+    "abc",
+    "x".repeat(55),
+    "x".repeat(56),
+    "x".repeat(63),
+    "x".repeat(64),
+    "MELY".repeat(40),
+  ]) {
     const bytes = new TextEncoder().encode(value);
     assert.equal(
       sha256Hex(bytes),
       createHash("sha256").update(bytes).digest("hex"),
     );
   }
+});
+
+test("incremental document hashing keeps legacy ordering across interleaved chunks", () => {
+  const blocks = [
+    { position: [0, 0, 0] as [number, number, number], paletteIndex: 0 },
+    { position: [0, 0, 32] as [number, number, number], paletteIndex: 1 },
+    { position: [1, 1, 0] as [number, number, number], paletteIndex: 1 },
+    { position: [1, 1, 32] as [number, number, number], paletteIndex: 0 },
+  ];
+  const palette = [
+    { blockId: "minecraft:white_concrete" },
+    { blockId: "minecraft:black_concrete" },
+  ];
+  const first = createProjectionDocument(blocks, palette);
+  const reordered = createProjectionDocument([...blocks].reverse(), palette);
+  reordered.chunks.reverse();
+
+  assert.equal(
+    createProjectionDocumentContentHash(first),
+    createProjectionDocumentContentHash(reordered),
+  );
+  assert.equal(
+    createProjectionViewContentHash(first, splitProjectionViews(first, [64, 64, 64])[0]),
+    createProjectionViewContentHash(reordered, splitProjectionViews(reordered, [64, 64, 64])[0]),
+  );
 });
 
 test("part content hashes are stable across palette order and global placement", () => {

@@ -1,4 +1,5 @@
 import { ChevronDown } from "lucide-react";
+import { useState } from "react";
 import type { ReactNode } from "react";
 
 interface SectionProps {
@@ -7,11 +8,32 @@ interface SectionProps {
   subtitle?: string;
   children: ReactNode;
   defaultOpen?: boolean;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
-export function Section({ index, title, subtitle, children, defaultOpen = true }: SectionProps) {
+export function Section({
+  index,
+  title,
+  subtitle,
+  children,
+  defaultOpen = true,
+  open,
+  onOpenChange,
+}: SectionProps) {
+  const [internalOpen, setInternalOpen] = useState(defaultOpen);
+  const resolvedOpen = open ?? internalOpen;
+
   return (
-    <details className="settings-section" open={defaultOpen}>
+    <details
+      className="settings-section"
+      open={resolvedOpen}
+      onToggle={(event) => {
+        const nextOpen = event.currentTarget.open;
+        if (open === undefined) setInternalOpen(nextOpen);
+        onOpenChange?.(nextOpen);
+      }}
+    >
       <summary>
         <span className="section-index">{index}</span>
         <span className="section-heading">

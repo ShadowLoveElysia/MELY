@@ -77,6 +77,20 @@ test("Bedrock mcstructure ignores untested Java target and extreme-height metada
   assert.equal(exported.summary.blockCount, 2);
 });
 
+test("Bedrock maxVolume is a confirmation threshold, not a serializer gate", () => {
+  const document = deriveBedrockProjectionDocument(createProjectionDocument([
+    { position: [0, 0, 0], paletteIndex: 0 },
+    { position: [10, 0, 0], paletteIndex: 0 },
+  ], [{ blockId: "minecraft:white_concrete" }]));
+
+  const exported = createMcstructure(document, { maxVolume: 1 });
+  assert.equal(exported.summary.volume, 11);
+  assert.throws(
+    () => createMcstructure(document, { maxVolume: 0 }),
+    /warning threshold must be a positive safe integer/i,
+  );
+});
+
 test("Bedrock state resolver converts Java facing and removes pane connections", () => {
   assert.deepEqual(resolveBedrockBlockState({
     blockId: "minecraft:end_rod",

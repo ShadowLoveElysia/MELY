@@ -36,7 +36,7 @@ import type {
   JavaCompatibilityLevel,
   JavaCompatibilityWarningCode,
 } from "./minecraftVersions";
-import { AppError, appError } from "./appError";
+import { AppError } from "./appError";
 import {
   createMaterialPlan,
   type MaterialPlan,
@@ -105,7 +105,9 @@ export interface ExportBundleResourceEstimate {
   partMetadataBytes: number;
   mcfunctionWorkingBytes: number;
   estimatedWorkingBytes: number;
+  workingBudgetBytes: number;
   allowed: boolean;
+  requiresConfirmation: boolean;
 }
 
 export type ExportBundleChunkSink = ZipChunkSink;
@@ -186,7 +188,8 @@ export interface ExportBundle {
 export interface StreamedExportBundle extends Omit<ExportBundle, "bytes"> {}
 
 export const DEFAULT_BUNDLE_WORKING_BUDGET_BYTES = 768 * 1024 ** 2;
-export const DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES = 768 * 1024 ** 2;
+/** Web 内存保留风险的提示阈值，不是 ZIP 写入上限。 */
+export const DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES = 512 * 1024 ** 2;
 const SYNC_BUNDLE_WORKING_BUDGET_BYTES = 256 * 1024 ** 2;
 const BUNDLE_BASE_WORKING_BYTES = 96 * 1024 ** 2;
 const REGION_STAGING_BYTES_PER_BLOCK = 12;
@@ -649,6 +652,9 @@ export const estimateExportBundleResources = (
     mcfunctionWorkingBytes,
   );
   const maximum = options.maxWorkingBytes ?? DEFAULT_BUNDLE_WORKING_BUDGET_BYTES;
+  if (!Number.isSafeInteger(maximum) || maximum <= 0) {
+    throw new RangeError("Export bundle working-set warning threshold must be a positive safe integer");
+  }
   return {
     blockCount: document.blockCount,
     occupiedRegionVolume,
@@ -664,8 +670,10 @@ export const estimateExportBundleResources = (
     partMetadataBytes,
     mcfunctionWorkingBytes,
     estimatedWorkingBytes,
-    allowed: Number.isSafeInteger(estimatedWorkingBytes)
-      && estimatedWorkingBytes <= maximum,
+    workingBudgetBytes: maximum,
+    allowed: Number.isSafeInteger(estimatedWorkingBytes),
+    requiresConfirmation: Number.isSafeInteger(estimatedWorkingBytes)
+      && estimatedWorkingBytes > maximum,
   };
 };
 
@@ -675,10 +683,7 @@ const assertBundleResources = (
 ) => {
   const estimate = estimateExportBundleResources(document, options);
   if (!estimate.allowed) {
-    throw appError("error.export.bundleWorkingSet", {
-      memory: Math.ceil(estimate.estimatedWorkingBytes / 1024 ** 2),
-      limit: Math.floor((options.maxWorkingBytes ?? DEFAULT_BUNDLE_WORKING_BUDGET_BYTES) / 1024 ** 2),
-    });
+    throw new RangeError("Export bundle working-set estimate exceeds the safe integer range");
   }
   return estimate;
 };
@@ -902,7 +907,7 @@ export const createExportBundleAsync = async (
     byteLength += chunk.byteLength;
   }, {
     ...options,
-    maxOutputBytes: options.maxOutputBytes ?? DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES,
+    maxOutputBytes: options.maxOutputBytes,
   });
   return {
     ...streamed,

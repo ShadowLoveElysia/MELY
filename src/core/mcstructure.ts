@@ -9,6 +9,7 @@ import {
   type MinecraftBlockStateValue,
 } from "./blockRegistry";
 import { DEFAULT_BEDROCK_VERSION } from "./minecraftVersions";
+import { DENSE_NBT_ARRAY_LENGTH_LIMIT } from "./exportPreflight";
 import {
   assertProjectionDocumentHologramIsolation,
   assertProjectionDocumentIntegrity,
@@ -49,7 +50,6 @@ const TAG_INT = 3;
 const TAG_STRING = 8;
 const TAG_LIST = 9;
 const TAG_COMPOUND = 10;
-const DEFAULT_MAX_VOLUME = 64 * 1024 * 1024;
 export const BEDROCK_BLOCK_VERSION = DEFAULT_BEDROCK_VERSION.blockVersion;
 
 const FACING_DIRECTION: Record<string, number> = {
@@ -276,11 +276,23 @@ export const createMcstructure = (
     throw new RangeError("Cannot export an empty Bedrock structure");
   }
   const dimensions = [...document.bounds.dimensions] as [number, number, number];
+  [...dimensions, ...document.bounds.min].forEach((value) => {
+    if (!Number.isInteger(value) || value < -0x8000_0000 || value > 0x7fff_ffff) {
+      throw new RangeError("Bedrock structure dimensions and origin must fit signed 32-bit NBT integers");
+    }
+  });
   const [sizeX, sizeY, sizeZ] = dimensions;
   const volume = sizeX * sizeY * sizeZ;
-  const maxVolume = options.maxVolume ?? DEFAULT_MAX_VOLUME;
-  if (!Number.isSafeInteger(volume) || volume <= 0 || volume > maxVolume) {
-    throw new RangeError(`Bedrock structure volume ${volume} exceeds limit ${maxVolume}`);
+  if (!Number.isSafeInteger(volume) || volume <= 0 || volume > DENSE_NBT_ARRAY_LENGTH_LIMIT) {
+    throw new RangeError(
+      `Bedrock structure volume ${volume} exceeds the NBT list length limit ${DENSE_NBT_ARRAY_LENGTH_LIMIT}`,
+    );
+  }
+  if (
+    options.maxVolume !== undefined
+    && (!Number.isSafeInteger(options.maxVolume) || options.maxVolume <= 0)
+  ) {
+    throw new RangeError("Bedrock structure volume warning threshold must be a positive safe integer");
   }
 
   const palette: ResolvedBedrockBlockState[] = [];

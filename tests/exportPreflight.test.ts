@@ -3,10 +3,17 @@ import { test } from "node:test";
 import {
   assertJavaProjectionExportSafety,
   DEFAULT_DENSE_EXPORT_VOLUME_LIMIT,
+  DENSE_NBT_ARRAY_LENGTH_LIMIT,
   preflightProjectionExport,
   preflightProjectionHeightExport,
   type ExportPreflightFormat,
 } from "../src/core/exportPreflight";
+import {
+  confirmExtremeEnvironment,
+  confirmExtremeExport,
+  confirmExtremeUnlock,
+  createExtremeHeightConfirmationState,
+} from "../src/core/heightSafety";
 import { createProjectionDocument } from "../src/core/projectionDocument";
 import type { ProjectionDocument } from "../src/types";
 
@@ -36,7 +43,7 @@ test("small projections pass every export preflight", () => {
   }
 });
 
-test("large sparse bounds disable only dense schematic formats", () => {
+test("large sparse dense formats require confirmation instead of being disabled", () => {
   const document = sparseDocument([4095, 4095, 4]);
   assert.ok(document.bounds);
   assert.ok(
@@ -46,11 +53,13 @@ test("large sparse bounds disable only dense schematic formats", () => {
 
   for (const format of ["schematic", "mcstructure"] as const) {
     const result = preflightProjectionExport(document, format);
-    assert.equal(result.allowed, false, format);
+    assert.equal(result.allowed, true, format);
+    assert.equal(result.requiresConfirmation, true, format);
     assert.equal(result.reason, "unsafeVolume", format);
   }
   for (const format of ["litematic", "bundle", "mcfunction"] as const) {
     assert.equal(preflightProjectionExport(document, format).allowed, true, format);
+    assert.equal(preflightProjectionExport(document, format).requiresConfirmation, false, format);
   }
 });
 
@@ -70,7 +79,8 @@ test("custom dense volume limits include their exact boundary", () => {
     true,
   );
   const rejected = preflightProjectionExport(document, "mcstructure", { maxVolume: 63 });
-  assert.equal(rejected.allowed, false);
+  assert.equal(rejected.allowed, true);
+  assert.equal(rejected.requiresConfirmation, true);
   assert.equal(rejected.reason, "unsafeVolume");
   assert.equal(rejected.volumeLimit, 63);
 });
@@ -88,8 +98,10 @@ test("non-safe dense volume multiplication is rejected", () => {
     volumeLimit: Number.MAX_SAFE_INTEGER,
   });
   assert.equal(result.allowed, false);
-  assert.equal(result.reason, "unsafeVolume");
+  assert.equal(result.requiresConfirmation, false);
+  assert.equal(result.reason, "dimensionLimit");
   assert.equal(result.volume, Number.POSITIVE_INFINITY);
+  assert.equal(result.dimensionLimit, DENSE_NBT_ARRAY_LENGTH_LIMIT);
 });
 
 test("empty projections are rejected consistently", () => {
@@ -159,6 +171,61 @@ test("height-aware export preflight checks actual span and placement Y", () => {
   });
   assert.equal(rejected.allowed, false);
   assert.equal(rejected.reason, "PLACEMENT_OUTSIDE_DIMENSION_RANGE");
+});
+
+test("height-aware export preflight exposes 4064 confirmation height for a 2032 projection", () => {
+  const document = sparseDocument([0, 2031, 0]);
+  const configurationFingerprint = "sha256:short-extreme-world";
+  const exportFingerprint = "sha256:short-extreme-export";
+  const environment = confirmExtremeEnvironment(
+    confirmExtremeUnlock(
+      createExtremeHeightConfirmationState(),
+      configurationFingerprint,
+      "unlock",
+      1,
+    ),
+    configurationFingerprint,
+    "environment",
+    2,
+  );
+  const input = {
+    heightMode: "experimental_4064" as const,
+    targetHeight: 2032,
+    targetDimension: { minY: -2032, height: 4064 },
+    placementBottomY: -2032,
+    datapackAcknowledged: true,
+    confirmations: environment,
+    configurationFingerprint,
+    exportFingerprint,
+  };
+  const pending = preflightProjectionHeightExport(document, "litematic", input);
+  assert.equal(pending.allowed, false);
+  assert.equal(pending.requiredHeight, 2032);
+  assert.equal(pending.confirmationHeight, 4064);
+  assert.equal(pending.reason, "HEIGHT_EXTREME_CONFIRMATION_REQUIRED");
+
+  const confirmed = confirmExtremeExport(
+    environment,
+    configurationFingerprint,
+    exportFingerprint,
+    "导出 2032",
+    2032,
+    "export",
+    3,
+  );
+  const accepted = preflightProjectionHeightExport(document, "litematic", {
+    ...input,
+    confirmations: confirmed,
+  });
+  assert.equal(accepted.allowed, true);
+  assert.equal(accepted.requiredHeight, 2032);
+  assert.equal(accepted.confirmationHeight, 4064);
+  const serializer = assertJavaProjectionExportSafety(document, "litematic", {
+    ...input,
+    confirmations: confirmed,
+  });
+  assert.equal(serializer.preflight.requiredHeight, 2032);
+  assert.equal(serializer.preflight.confirmationHeight, 4064);
 });
 
 test("Bedrock exports do not inherit Java height confirmation state", () => {

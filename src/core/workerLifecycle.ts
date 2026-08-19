@@ -2,6 +2,8 @@ import type { WorkerCommand, WorkerEvent } from "../types";
 
 export interface ConversionWorkerPort {
   onmessage: ((event: MessageEvent<WorkerEvent>) => void) | null;
+  onerror: ((event: ErrorEvent) => void) | null;
+  onmessageerror: ((event: MessageEvent<unknown>) => void) | null;
   postMessage: (message: WorkerCommand, transfer: Transferable[]) => void;
   terminate: () => void;
 }
@@ -28,29 +30,67 @@ export const createConversionWorkerLifecycle = ({
   let generation = 0;
   let disposed = false;
 
+  const detachWorker = (target: ConversionWorkerPort) => {
+    target.onmessage = null;
+    target.onerror = null;
+    target.onmessageerror = null;
+  };
+
   const replaceWorker = () => {
     generation += 1;
     const currentGeneration = generation;
     const previous = worker;
     worker = null;
     if (previous) {
-      previous.onmessage = null;
+      detachWorker(previous);
       previous.terminate();
     }
     if (disposed) return;
 
     const next = createWorker();
     worker = next;
+    const handleWorkerFailure = (code: "error.worker.crashed" | "error.worker.protocol") => {
+      if (
+        disposed
+        || generation !== currentGeneration
+        || worker !== next
+      ) return;
+      const failedJobId = activeJobId;
+      activeJobId = null;
+      detachWorker(next);
+      next.terminate();
+      worker = null;
+      replaceWorker();
+      if (failedJobId !== null) {
+        onEvent({ type: "ERROR", jobId: failedJobId, code });
+      }
+    };
     next.onmessage = (message) => {
       const event = message.data;
       if (
         disposed
         || generation !== currentGeneration
         || worker !== next
-        || event.jobId !== activeJobId
       ) return;
+      if (
+        !event
+        || typeof event !== "object"
+        || !("jobId" in event)
+        || typeof event.jobId !== "string"
+        || !("type" in event)
+        || !["PROGRESS", "RESULT", "ERROR"].includes(String(event.type))
+      ) {
+        handleWorkerFailure("error.worker.protocol");
+        return;
+      }
+      if (event.jobId !== activeJobId) return;
       onEvent(event);
     };
+    next.onerror = (event) => {
+      event.preventDefault?.();
+      handleWorkerFailure("error.worker.crashed");
+    };
+    next.onmessageerror = () => handleWorkerFailure("error.worker.protocol");
   };
 
   replaceWorker();

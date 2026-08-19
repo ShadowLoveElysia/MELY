@@ -224,10 +224,22 @@ export interface SolidVoxelStats {
   dimensions: [number, number, number];
 }
 
+export interface SolidVoxelChunk {
+  /** 32x32x32 分块坐标，顺序约定为 Y、Z、X 递增。 */
+  chunk: [number, number, number];
+  /** localIndex = x + 32 * (z + 32 * y)，分块内严格递增且唯一。 */
+  positions: Uint16Array;
+  blockIndices: Uint16Array;
+}
+
 export interface SolidVoxelResult {
   kind: "solid";
+  /** 未声明 storage 的旧结果按 flat 处理。 */
+  storage?: "flat" | "chunked";
   positions: Float32Array;
   blockIndices: Uint16Array;
+  /** 超大结果以分块为主存储，此时两个扁平数组必须为空。 */
+  chunks?: SolidVoxelChunk[];
   palette: VoxelPaletteEntry[];
   faceFrame?: FaceFrameSnapshot;
   stats: SolidVoxelStats;

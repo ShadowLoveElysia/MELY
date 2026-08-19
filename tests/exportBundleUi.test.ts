@@ -22,6 +22,14 @@ test("single projection exports use the canonical litematic extension and facial
   const source = readFileSync("src/App.tsx", "utf8");
 
   assert.match(source, /faceDetail:\s*"off"/);
-  assert.match(source, /request\.format === "litematic"[\s\S]*extension = "litematic"/);
+  const branch = source.match(
+    /if \(request\.format === "litematic"\) \{([\s\S]*?)\n\s*return;\n\s*\}/,
+  )?.[1] ?? "";
+  assert.match(branch, /streamLitematicFromDocument/);
+  assert.match(branch, /openDesktopChunkWriterWithDialog/);
+  assert.match(branch, /\(chunk\) => writer\.write\(chunk\)/);
+  assert.match(branch, /downloadBinaryChunks\(chunks,[\s\S]*\.litematic/);
+  assert.doesNotMatch(branch, /createLitematicFromDocument/);
+  assert.match(branch, /defaultPath:\s*`\$\{request\.name\}\.litematic`/);
   assert.doesNotMatch(source, /extension = "litematica"/);
 });

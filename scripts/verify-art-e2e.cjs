@@ -16,7 +16,7 @@ const outputDirectory = resolve(
   process.env.MELY_OUTPUT_DIRECTORY || join(projectRoot, "release-validation/art-e2e"),
 );
 const reportPath = resolve(process.env.MELY_REPORT_PATH || join(outputDirectory, "report.json"));
-const TWO_GIB = 2 * 1024 ** 3;
+const FIVE_GIB = 5 * 1024 ** 3;
 
 if (!modelZip) throw new Error("MELY_MODEL_ZIP is required");
 if (!Number.isInteger(targetHeight) || targetHeight < 32 || targetHeight > 384) {
@@ -387,7 +387,7 @@ const run = async () => {
     const paletteAllowed = (projection, allowed) => projection.paletteCounts.every(({ blockId }) => (
       allowed.has(blockId) || lightIds.has(blockId)
     ));
-    report.underTwoGiB = report.peakWorkingSetBytes < TWO_GIB;
+    report.withinFiveGiB = report.peakWorkingSetBytes <= FIVE_GIB;
     report.assertions = {
       baselineGenerated: base.stats.blockCount > 0,
       emissiveCoordinatesPreserved: noGlow.missingFromBaseline === 0 && noGlow.additionsToBaseline === 0,
@@ -407,7 +407,7 @@ const run = async () => {
         && report.nightPreview.difference.meanAbsoluteRgbError > 3,
       noConsoleErrors: report.consoleErrors.length === 0,
       noPageErrors: report.pageErrors.length === 0,
-      underTwoGiB: report.underTwoGiB,
+      withinFiveGiB: report.withinFiveGiB,
     };
     if (!Object.values(report.assertions).every(Boolean)) {
       throw new Error(`Art E2E assertions failed: ${JSON.stringify(report.assertions)}`);

@@ -538,12 +538,15 @@ test("bundle resource estimate permits the audited 2032 hologram footprint", () 
   assert.equal(estimate.largestRegionVolume, 32_768);
   assert.equal(estimate.estimatedWorkingBytes, 332_160_640);
   assert.equal(estimate.allowed, true);
-  assert.equal(estimateExportBundleResources(document, {
+  assert.equal(estimate.requiresConfirmation, false);
+  const aboveWarningThreshold = estimateExportBundleResources(document, {
     maxWorkingBytes: estimate.estimatedWorkingBytes - 1,
-  }).allowed, false);
+  });
+  assert.equal(aboveWarningThreshold.allowed, true);
+  assert.equal(aboveWarningThreshold.requiresConfirmation, true);
 });
 
-test("async bundle output and working-set budgets fail before unsafe retention", async () => {
+test("bundle working-set budgets warn without blocking while explicit ZIP limits remain enforced", async () => {
   const document = createProjectionDocument([
     { position: [0, 0, 0], paletteIndex: 0 },
     { position: [32, 0, 0], paletteIndex: 0 },
@@ -553,10 +556,12 @@ test("async bundle output and working-set budgets fail before unsafe retention",
   });
   assert.equal(estimate.partCount, 2);
   assert.equal(estimate.allowed, true);
-  assert.equal(estimateExportBundleResources(document, {
+  const overWorkingBudget = estimateExportBundleResources(document, {
     includeMcfunction: false,
     maxWorkingBytes: 1,
-  }).allowed, false);
+  });
+  assert.equal(overWorkingBudget.allowed, true);
+  assert.equal(overWorkingBudget.requiresConfirmation, true);
   await assert.rejects(createExportBundleAsync(document, {
     includeSchematic: false,
     includeMcstructure: false,
@@ -569,14 +574,10 @@ test("async bundle output and working-set budgets fail before unsafe retention",
     assert.equal(error.params?.limit, 0);
     return true;
   });
-  await assert.rejects(createExportBundleStream(document, () => undefined, {
+  const streamed = await createExportBundleStream(document, () => undefined, {
     maxWorkingBytes: 1,
-  }), (error: unknown) => {
-    assert.ok(error instanceof AppError);
-    assert.equal(error.code, "error.export.bundleWorkingSet");
-    assert.equal(error.params?.limit, 0);
-    return true;
   });
+  assert.ok(streamed.summary.byteLength > 0);
 });
 
 test("streaming bundle honors cancellation before generating files", async () => {
@@ -673,6 +674,6 @@ test("all bundle entry points still fail before output for unsafe Java documents
   ], [
     { blockId: "minecraft:end_rod" },
     { blockId: "minecraft:white_stained_glass_pane" },
-  ]);
+  ], { metadata: { source: "hologram" } });
   assert.throws(() => createExportBundle(adjacent), /six-way isolation/);
 });

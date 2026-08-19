@@ -61,6 +61,8 @@ export interface BabylonMmdViewportSource {
   camera: unknown;
   sourceRoot: unknown;
   sourceMeshes: readonly unknown[];
+  /** Resolves a Babylon pick to the canonical LoadedMmdModel material index. */
+  resolveMaterialIndex: (mesh: unknown, subMeshId: number) => number | null;
 }
 
 export type MmdViewportSource = ThreeMmdViewportSource | BabylonMmdViewportSource;

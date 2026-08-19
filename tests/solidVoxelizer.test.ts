@@ -3,8 +3,10 @@ import { test } from "node:test";
 import {
   applyMmdTextureColor,
   generateSolidVoxels,
+  SolidPaletteMatchCache,
   triangleIntersectsBox,
 } from "../src/core/solidVoxelizer";
+import { createBlockPalette } from "../src/core/blockPalette";
 import type { MmdMeshSnapshot, SolidOptions } from "../src/types";
 
 const options: SolidOptions = {
@@ -532,21 +534,53 @@ test("dithering changes only block selection and preserves protected skin matchi
   assert.equal(protectedSkin.stats.skinBlockCount, protectedSkin.stats.blockCount);
 });
 
-test("filled projections reject oversized volumes before triangle traversal", () => {
+test("filled projections are no longer rejected by the former product budget gate", () => {
   const snapshot: MmdMeshSnapshot = {
     positions: Float32Array.from([0, 0, 0, 100, 0, 0, 0, 1, 100]),
     indices: Uint32Array.from([0, 1, 2]),
     triangleMaterials: Uint16Array.of(0),
   };
-  let progressCalls = 0;
+  let firstProgress: number | undefined;
   assert.throws(() => generateSolidVoxels(snapshot, {
     ...options,
     targetHeight: 1_000,
     fillMode: "filled",
   }, () => {
-    progressCalls += 1;
-  }), /error\.solid\.volumeTooLarge/);
-  assert.equal(progressCalls, 0);
+    firstProgress ??= 1;
+    throw new Error("stop after traversal starts");
+  }), /stop after traversal starts/);
+  assert.equal(firstProgress, 1);
+});
+
+test("palette matching caches repeated colors independently by semantic role", () => {
+  const palette = createBlockPalette(options);
+  const cache = new SolidPaletteMatchCache(palette);
+  const color: [number, number, number] = [207, 213, 214];
+  const general = cache.match(color, "general");
+
+  for (let index = 0; index < 100_000; index += 1) {
+    assert.equal(cache.match(color, "general"), general);
+  }
+  const skin = cache.match(color, "skinBase");
+  assert.equal(cache.match(color, "skinBase"), skin);
+  cache.matchEmissive(color);
+  cache.matchEmissive(color);
+
+  assert.equal(cache.expensiveMatchCount, 3);
+  assert.equal(cache.cachedEntryCount, 3);
+});
+
+test("palette match cache stays bounded for texture-heavy color streams", () => {
+  const cache = new SolidPaletteMatchCache(createBlockPalette(options));
+  for (let index = 0; index < 70_000; index += 1) {
+    cache.match([
+      index & 0xff,
+      (index >> 8) & 0xff,
+      (index >> 16) & 0xff,
+    ], "general");
+  }
+
+  assert.ok(cache.cachedEntryCount <= 65_536);
 });
 
 test("ancient ruins decoration returns internally consistent solid buffers", () => {
@@ -570,4 +604,74 @@ test("ancient ruins decoration returns internally consistent solid buffers", () 
     result.bounds.max[1] - result.bounds.min[1] + 1,
     result.bounds.max[2] - result.bounds.min[2] + 1,
   ]);
+});
+
+test("large-output mode emits sorted unique typed chunks without flat buffers", () => {
+  const result = generateSolidVoxels(cubeSnapshot(), options, undefined, {
+    flatVoxelLimit: 0,
+  });
+
+  assert.equal(result.storage, "chunked");
+  assert.equal(result.positions.length, 0);
+  assert.equal(result.blockIndices.length, 0);
+  assert.ok(result.chunks?.length);
+  assert.equal(
+    result.chunks!.reduce((count, chunk) => count + chunk.positions.length, 0),
+    result.stats.blockCount,
+  );
+  for (let chunkIndex = 0; chunkIndex < result.chunks!.length; chunkIndex += 1) {
+    const chunk = result.chunks![chunkIndex];
+    assert.equal(chunk.positions.length, chunk.blockIndices.length);
+    for (let index = 0; index < chunk.positions.length; index += 1) {
+      assert.ok(chunk.positions[index] < 32 ** 3);
+      if (index > 0) assert.ok(chunk.positions[index - 1] < chunk.positions[index]);
+      assert.ok(chunk.blockIndices[index] < result.palette.length);
+    }
+    if (chunkIndex === 0) continue;
+    const previous = result.chunks![chunkIndex - 1].chunk;
+    const current = chunk.chunk;
+    assert.ok(
+      previous[1] < current[1]
+      || (previous[1] === current[1] && previous[2] < current[2])
+      || (previous[1] === current[1] && previous[2] === current[2] && previous[0] < current[0]),
+    );
+  }
+});
+
+test("chunked ancient ruins preserve decorations without a global occupancy Set", () => {
+  const result = generateSolidVoxels(cubeSnapshot(), {
+    ...options,
+    materialTheme: "ancientRuins",
+    ruinDecoration: 100,
+  }, undefined, { flatVoxelLimit: 0 });
+
+  assert.equal(result.storage, "chunked");
+  assert.equal(result.positions.length, 0);
+  assert.ok(result.chunks?.length);
+  assert.ok(result.palette.some((entry) => [
+    "minecraft:mossy_stone_bricks",
+    "minecraft:moss_block",
+    "minecraft:vine",
+    "minecraft:glow_lichen",
+  ].includes(entry.blockId)));
+});
+
+test("voxelizing progress advances inside a single large triangle and can cancel", () => {
+  const snapshot: MmdMeshSnapshot = {
+    positions: Float32Array.from([-10, 0, -10, 10, 0, -10, 0, 1, 10]),
+    indices: Uint32Array.from([0, 1, 2]),
+    triangleMaterials: Uint16Array.of(0),
+  };
+  const progress: number[] = [];
+  let checks = 0;
+  assert.throws(() => generateSolidVoxels(
+    snapshot,
+    { ...options, targetHeight: 2_000 },
+    (stage, value) => {
+      if (stage === "voxelizing") progress.push(value);
+    },
+    { isCancelled: () => ++checks >= 4 },
+  ), /error\.snapshot\.cancelled/);
+  assert.ok(progress.length >= 2);
+  assert.ok(progress.every((value, index) => index === 0 || value >= progress[index - 1]));
 });

@@ -70,14 +70,33 @@ test("Worker resource preflight derives normalized dimensions from transferred m
   assert.equal(result.triangleCount, 1);
   assert.equal(result.textureBytes, 1_024);
   assert.equal(result.allowed, true);
+  assert.equal(result.solidWorkEstimate?.triangleCandidateUpperBounds.length, 1);
+  assert.ok((result.solidWorkEstimate?.totalCandidateUpperBound ?? 0) > 0);
+  assert.ok(
+    (result.solidWorkEstimate?.legacyAabbCandidateTests ?? 0)
+      >= (result.solidWorkEstimate?.maxLegacyAabbCandidateTests ?? 0),
+  );
 });
 
-test("Worker resource preflight rejects a filled 4064 workload before dense allocation", () => {
+test("Worker resource preflight reports a filled 4064 workload as a confirmation risk", () => {
   const result = preflightWorkerResources(solidCommand(mesh(2, 4, 2), 4_064, "filled"));
 
   assert.equal(result.height, 4_064);
-  assert.equal(result.allowed, false);
+  assert.equal(result.allowed, true);
   assert.equal(result.reason, "volume");
+  assert.equal(result.requiresConfirmation, true);
+  assert.ok(result.risks.includes("volume"));
+});
+
+test("Worker resource assertions return budget risks instead of hard-rejecting confirmed work", () => {
+  const command = solidCommand(mesh(2, 4, 2), 4_064, "filled");
+  const result = assertWorkerResources(command);
+
+  assert.equal(result.allowed, true);
+  assert.equal(result.reason, "volume");
+  assert.equal(result.requiresConfirmation, true);
+  assert.equal(result.height, 4_064);
+  assert.ok((result.solidWorkEstimate?.totalCandidateUpperBound ?? 0) > 0);
 });
 
 test("Worker hologram preflight mirrors the generator's sparse 4064 interior plan", () => {
@@ -99,7 +118,9 @@ test("Worker hologram preflight mirrors the generator's sparse 4064 interior pla
   const result = preflightWorkerResources(command);
 
   assert.equal(result.allowed, true);
-  assert.ok(result.estimatedBlocks <= 320_000);
+  assert.ok(result.estimatedBlocks > 320_000);
+  assert.equal(result.requiresConfirmation, true);
+  assert.ok(result.risks.includes("blocks"));
 });
 
 test("Worker resource preflight rejects malformed geometry instead of trusting UI estimates", () => {
@@ -108,6 +129,15 @@ test("Worker resource preflight rejects malformed geometry instead of trusting U
   assert.throws(
     () => preflightWorkerResources(solidCommand(invalid, 320, "shell")),
     /non-finite vertex/,
+  );
+});
+
+test("Worker resource preflight rejects damaged triangle indices", () => {
+  const invalid = mesh(2, 4, 1);
+  invalid.indices[2] = 99;
+  assert.throws(
+    () => preflightWorkerResources(solidCommand(invalid, 320, "shell")),
+    /out of bounds/,
   );
 });
 

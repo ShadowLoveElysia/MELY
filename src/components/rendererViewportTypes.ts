@@ -7,6 +7,12 @@ export interface RendererViewportBinding {
   modelId: string;
 }
 
+/** Engine-neutral identity for a material selected from the model viewport. */
+export interface RendererMaterialSelection {
+  modelId: string;
+  materialIndex: number;
+}
+
 /**
  * Common surface used by every renderer viewport. The optional URL fields keep
  * the component usable as a small standalone player, while the remaining
@@ -38,6 +44,13 @@ export interface RendererViewportProps {
   poseEditing?: boolean;
   selectedBoneIndex?: number | null;
   onBoneSelected?: (index: number | null) => void;
+  /** Canonical material index selected for the active model. */
+  selectedMaterialIndex?: number | null;
+  /** Canonical material indices excluded from picking and selection feedback. */
+  hiddenMaterialIndices?: readonly number[];
+  /** Increments for each viewport selection request, including repeated selections. */
+  materialSelectionRequestId?: number;
+  onMaterialSelected?: (selection: RendererMaterialSelection | null) => void;
   onPoseCommitted?: () => void;
   onBeforeRender?: (now: number) => MmdMotionTimes | null;
   onAfterRender?: (
@@ -77,6 +90,10 @@ export const defaultRendererViewportProps = (
   poseEditing: props.poseEditing ?? false,
   selectedBoneIndex: props.selectedBoneIndex ?? null,
   onBoneSelected: props.onBoneSelected ?? (() => undefined),
+  selectedMaterialIndex: props.selectedMaterialIndex ?? null,
+  hiddenMaterialIndices: props.hiddenMaterialIndices ?? [],
+  materialSelectionRequestId: props.materialSelectionRequestId ?? 0,
+  onMaterialSelected: props.onMaterialSelected ?? (() => undefined),
   onPoseCommitted: props.onPoseCommitted ?? (() => undefined),
   onBeforeRender: props.onBeforeRender,
   onAfterRender: props.onAfterRender,

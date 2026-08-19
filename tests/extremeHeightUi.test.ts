@@ -29,6 +29,13 @@ test("4064 product flow wires three distinct confirmations and final fingerprint
   assert.match(app, /extendedExport\.projectionHeight/);
   assert.match(app, /extremeExportPhrase\(pendingExport\.requiredHeight\)/);
   assert.doesNotMatch(app, /pendingExport\.safetyHeight/);
+  assert.match(app, /const invalidateExtremeAuthorization = useCallback/);
+  assert.match(app, /const \[extremeDialogOrigin, setExtremeDialogOrigin\]/);
+  assert.match(app, /if \(extremeDialogOrigin === "reconfirm"\) return/);
+  assert.match(app, /experimentalHeightConfirmed=\{extremeEnvironmentConfirmed\}/);
+  assert.match(sidebar, /sidebar\.scale\.experimental4064Reconfirm/);
+  assert.doesNotMatch(app, /if \(heightMode === "experimental_4064"\) \{[\s\S]{0,320}?setHeightMode\("extended_2032"\)/);
+  assert.doesNotMatch(app, /if \(heightMode === "experimental_4064"\) \{[\s\S]{0,420}?Math\.min\([\s\S]*?EXTENDED_WORLD_HEIGHT/);
 });
 
 test("registered versions keep generation and both height unlock controls actionable", async () => {
@@ -61,6 +68,9 @@ test("2032 and 4064 unlock actions initialize a complete dimension declaration",
 test("experimental preflight can enter its final confirmation dialog", async () => {
   const app = await readFile("src/App.tsx", "utf8");
   assert.match(app, /preflight\.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"/);
+  assert.match(app, /const needsExtremeEnvironmentConfirmation = !isBedrockExportFormat\(format\)/);
+  assert.match(app, /!hasExtremeEnvironmentConfirmation\(/);
+  assert.match(app, /setExtremeDialogOrigin\("reconfirm"\);[\s\S]*?setExtremeDialogStage\("unlock"\)/);
   assert.match(app, /!preflight\.allowed && !needsExtremeExportConfirmation/);
   assert.match(app, /!preflight\.allowed && !awaitsExtremeConfirmation/);
 });
@@ -76,6 +86,7 @@ test("final confirmation distinguishes projection height from declared world hei
   assert.match(app, /height: number\(pendingExport\?\.targetDimensionHeight/);
   assert.match(app, /height: number\(pendingExport\.requiredHeight\)/);
   assert.match(app, /pendingExport\.targetDimensionHeight !== pendingExport\.requiredHeight/);
+  assert.match(app, /confirmationHeight > EXTENDED_WORLD_HEIGHT/);
   for (const locale of [zh, en, ja]) {
     assert.match(locale, /"extendedExport\.body": "[^"]*\{\{height\}\}[^"]*\{\{vanilla\}\}/);
     assert.match(locale, /"extendedExport\.projectionHeight": "[^"]*\{\{height\}\}/);

@@ -5,7 +5,12 @@ import { test } from "node:test";
 import { unzipSync } from "fflate";
 import { AppError } from "../src/core/appError";
 import {
+  MAX_ZIP32_ENTRIES,
+  MAX_ZIP32_NAME_BYTES,
+  MAX_ZIP32_VALUE,
+  assertZip32Entry,
   combineZipChunks,
+  createZipCollector,
   createZipStreamWriter,
 } from "../src/core/zipStream";
 
@@ -134,4 +139,89 @@ test("ZIP output budget rejects before an oversized chunk reaches the sink", asy
     assert.equal(error.code, "error.export.bundleOutput");
     return true;
   });
+});
+
+test("ZIP32 structural limits accept exact maxima and reject the next value", () => {
+  assert.doesNotThrow(() => assertZip32Entry(
+    {
+      entryCount: MAX_ZIP32_ENTRIES - 1,
+      localOffset: 0,
+      centralDirectorySize: 0,
+    },
+    {
+      nameBytes: 0,
+      uncompressedSize: MAX_ZIP32_VALUE,
+      compressedSize: 0,
+    },
+  ));
+  assert.throws(() => assertZip32Entry(
+    { entryCount: MAX_ZIP32_ENTRIES, localOffset: 0, centralDirectorySize: 0 },
+    { nameBytes: 0, uncompressedSize: 0, compressedSize: 0 },
+  ), /ZIP32 entry count 65536 exceeds maximum 65535/);
+  assert.throws(() => assertZip32Entry(
+    { entryCount: 0, localOffset: 0, centralDirectorySize: 0 },
+    { nameBytes: MAX_ZIP32_NAME_BYTES + 1, uncompressedSize: 0, compressedSize: 0 },
+  ), /UTF-8 filename length 65536 exceeds maximum 65535/);
+  assert.throws(() => assertZip32Entry(
+    { entryCount: 0, localOffset: 0, centralDirectorySize: 0 },
+    { nameBytes: 0, uncompressedSize: MAX_ZIP32_VALUE + 1, compressedSize: 0 },
+  ), /uncompressed entry size 4294967296 exceeds maximum 4294967295/);
+  assert.throws(() => assertZip32Entry(
+    { entryCount: 0, localOffset: 0, centralDirectorySize: 0 },
+    { nameBytes: 0, uncompressedSize: 0, compressedSize: MAX_ZIP32_VALUE + 1 },
+  ), /compressed entry size 4294967296 exceeds maximum 4294967295/);
+});
+
+test("ZIP32 validates local offsets and central directory arithmetic without allocating 4 GiB", () => {
+  assert.throws(() => assertZip32Entry(
+    {
+      entryCount: 0,
+      localOffset: MAX_ZIP32_VALUE - 10,
+      centralDirectorySize: 0,
+    },
+    { nameBytes: 1, uncompressedSize: 0, compressedSize: 0 },
+  ), /local data offset/);
+  assert.throws(() => assertZip32Entry(
+    {
+      entryCount: 0,
+      localOffset: 0,
+      centralDirectorySize: MAX_ZIP32_VALUE - 10,
+    },
+    { nameBytes: 1, uncompressedSize: 0, compressedSize: 0 },
+  ), /central directory size/);
+  assert.throws(() => assertZip32Entry(
+    {
+      entryCount: 0,
+      localOffset: MAX_ZIP32_VALUE - 150,
+      centralDirectorySize: 100,
+    },
+    { nameBytes: 1, uncompressedSize: 0, compressedSize: 0 },
+  ), /central directory offset/);
+});
+
+test("stream and collector apply injected ZIP32 entry boundaries before large allocations", async () => {
+  let sinkCalls = 0;
+  const writer = createZipStreamWriter(() => {
+    sinkCalls += 1;
+  }, {
+    zip32TestState: { entryCount: MAX_ZIP32_ENTRIES },
+  });
+  await assert.rejects(writer.add("entry.txt", new Uint8Array(0)), /entry count/);
+  assert.equal(sinkCalls, 0);
+
+  const collector = createZipCollector({
+    zip32TestState: { entryUncompressedSize: MAX_ZIP32_VALUE + 1 },
+  });
+  assert.throws(
+    () => collector.add("entry.txt", new Uint8Array(0)),
+    /uncompressed entry size/,
+  );
+});
+
+test("ZIP32 filename limit counts UTF-8 bytes rather than JavaScript code units", async () => {
+  const path = "猫".repeat(Math.floor(MAX_ZIP32_NAME_BYTES / 3) + 1);
+  assert.ok(path.length < MAX_ZIP32_NAME_BYTES);
+  const writer = createZipStreamWriter(() => undefined);
+
+  await assert.rejects(writer.add(path, new Uint8Array(0)), /UTF-8 filename length/);
 });

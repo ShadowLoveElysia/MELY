@@ -34,6 +34,7 @@ import {
 import { Sidebar, type ImportedAsset } from "./components/Sidebar";
 import { SurvivalTools, type SurvivalToolsLabels } from "./components/SurvivalTools";
 import { RendererViewport } from "./components/RendererViewport";
+import type { RendererMaterialSelection } from "./components/rendererViewportTypes";
 import { Windows } from "./components/Windows";
 import { appError, errorDescriptor } from "./core/appError";
 import {
@@ -59,6 +60,7 @@ import {
   createHeightProfileFingerprint,
   evaluateProjectionHeightRisk,
   extremeExportPhrase,
+  hasExtremeEnvironmentConfirmation,
   invalidateExtremeConfirmations,
   preflightGenerationHeight,
   type ExtremeHeightConfirmationState,
@@ -87,6 +89,7 @@ import {
   canToggleMotionPlayback,
   formatMotionFrame,
   getAdjacentMotionFrame,
+  normalizeMotionFrame,
   shouldIgnoreMotionShortcut,
 } from "./core/motionUi";
 import {
@@ -98,8 +101,16 @@ import {
   deriveBedrockProjectionDocument,
 } from "./core/projectionDocument";
 import { createProjectionDocumentContentHash, sha256Hex } from "./core/projectionContentHash";
-import { formatBinaryBytes, estimateVoxelizationResources } from "./core/resourceBudget";
-import type { ExportBundlePhase } from "./core/exportBundle";
+import {
+  estimateVoxelizationResources,
+  formatBinaryBytes,
+  type ResourceEstimate,
+} from "./core/resourceBudget";
+import {
+  assessGenerationResourceRisk,
+  type GenerationResourceRiskAssessment,
+} from "./core/generationResourceRisk";
+import type { ExportBundlePhase, ExportBundleResourceEstimate } from "./core/exportBundle";
 import {
   createConversionWorkerLifecycle,
   type ConversionWorkerLifecycle,
@@ -205,6 +216,15 @@ const exportPreflightReasonKeys = {
   dimensionLimit: "exportCenter.unavailable.dimension",
 } as const satisfies Record<ExportPreflightReason, TranslationKey>;
 
+interface ExportResourceRisk {
+  fingerprint: string;
+  reasons: Array<"denseVolume" | "workingSet" | "webRetention">;
+  denseVolume: number | null;
+  denseVolumeLimit: number | null;
+  bundle?: ExportBundleResourceEstimate;
+  estimatedWebRetentionBytes: number;
+}
+
 interface PendingExport {
   format: ExportFormat;
   document: ProjectionDocument;
@@ -225,6 +245,8 @@ interface PendingExport {
   };
   resultId: string;
   experimental: boolean;
+  resourceRisk?: ExportResourceRisk;
+  resourceRiskAccepted?: boolean;
   bundleFormats?: {
     includeSchematic: boolean;
     includeMcstructure: boolean;
@@ -312,7 +334,29 @@ interface MotionTrackRuntime {
   };
 }
 
+interface GenerationResourceRiskConfiguration {
+  mode: GenerationMode;
+  modelId: string;
+  poseRevision: number;
+  partsRevision: number;
+  javaVersionId: string;
+  heightMode: HeightMode;
+  targetDimensionMinY: number | null;
+  targetDimensionHeight: number | null;
+  placementBottomY: number | null;
+  hologramOptions: HologramOptions;
+  solidOptions: SolidOptions;
+}
+
+interface PendingGenerationResourceRisk {
+  fingerprint: string;
+  configuration: GenerationResourceRiskConfiguration;
+  resources: ResourceEstimate;
+  assessment: GenerationResourceRiskAssessment;
+}
+
 type ExtremeDialogStage = "unlock" | "environment" | null;
+type ExtremeDialogOrigin = "initial" | "reconfirm" | null;
 
 interface ActiveMmdSource {
   files: File[];
@@ -324,6 +368,7 @@ interface ActiveMmdSource {
 interface MmdRuntimeRestoreState {
   poseTransfer: MmdPoseTransferState | null;
   hiddenMaterialIndices: readonly number[];
+  selectedMaterialIndex: number | null;
   motionPaths: Record<MmdMotionTrackKind, string>;
   motionTimes: MmdMotionTimes;
   lockedFrames: Record<MmdMotionTrackKind, number | null>;
@@ -552,6 +597,49 @@ const safeFileStem = (value: string) => value
   .replace(/\s+/g, "_")
   .replace(/^_+|_+$/g, "") || "pose";
 
+const generationResourceRiskFingerprint = (
+  configuration: GenerationResourceRiskConfiguration,
+) => `sha256:${sha256Hex(new TextEncoder().encode(JSON.stringify(configuration)))}`;
+
+const estimateWebExportRetentionBytes = (
+  document: ProjectionDocument,
+  format: ExportFormat,
+) => {
+  if (format === "bundle") return document.blockCount * 64 + 96 * 1024 ** 2;
+  if (format === "mcfunction") return document.blockCount * 192 + 16 * 1024 ** 2;
+  return 0;
+};
+
+const exportResourceRiskFingerprint = (
+  resultId: string,
+  format: ExportFormat,
+  bundleFormats: PendingExport["bundleFormats"],
+  risk: Omit<ExportResourceRisk, "fingerprint">,
+) => `sha256:${sha256Hex(new TextEncoder().encode(JSON.stringify({
+  resultId,
+  format,
+  bundleFormats: bundleFormats ?? null,
+  risk,
+})))}`;
+
+const formatRiskDuration = (
+  seconds: number,
+  number: (value: number) => string,
+  t: (key: TranslationKey, params?: Record<string, string | number>) => string,
+) => {
+  if (seconds < 60) {
+    return t("generationResourceRisk.durationSeconds", { value: number(seconds) });
+  }
+  if (seconds < 3_600) {
+    return t("generationResourceRisk.durationMinutes", {
+      value: number(Math.ceil(seconds / 60)),
+    });
+  }
+  return t("generationResourceRisk.durationHours", {
+    value: number(Math.ceil(seconds / 3_600)),
+  });
+};
+
 const yieldForModelRelease = () => new Promise<void>((resolve) => {
   window.requestAnimationFrame(() => window.setTimeout(resolve, 0));
 });
@@ -598,6 +686,7 @@ export default function App() {
   const projectionDocumentRef = useRef<{
     result: ProjectionResult;
     document: ProjectionDocument;
+    configurationKey: string;
     contentHash?: string;
   } | null>(null);
   const motionRuntimeRef = useRef<Record<MmdMotionTrackKind, MotionTrackRuntime> | null>(null);
@@ -655,6 +744,11 @@ export default function App() {
   const [physicsLoading, setPhysicsLoading] = useState(false);
   const hiddenMaterialIndicesRef = useRef<number[]>([]);
   const [hiddenMaterialIndices, setHiddenMaterialIndices] = useState<number[]>([]);
+  const [selectedMaterialIndex, setSelectedMaterialIndex] = useState<number | null>(null);
+  const [materialSelectionRequestId, setMaterialSelectionRequestId] = useState(0);
+  const lastPickedMaterialIndexRef = useRef<number | null>(null);
+  const materialSelectionProbeRevisionRef = useRef(0);
+  const [materialSelectionProbeRevision, setMaterialSelectionProbeRevision] = useState(0);
   const [cameraMode, setCameraMode] = useState<CameraMode>("perspective");
   const [previewMode, setPreviewMode] = useState<PreviewMode>("source");
   const [showGrid, setShowGrid] = useState(true);
@@ -666,8 +760,8 @@ export default function App() {
   const [targetDimensionHeight, setTargetDimensionHeight] = useState<number | null>(null);
   const [placementBottomY, setPlacementBottomY] = useState<number | null>(null);
   const [heightUnlockOpen, setHeightUnlockOpen] = useState(false);
-  const [extremeUnlockConfigurationFingerprint, setExtremeUnlockConfigurationFingerprint] = useState<string | null>(null);
   const [extremeDialogStage, setExtremeDialogStage] = useState<ExtremeDialogStage>(null);
+  const [extremeDialogOrigin, setExtremeDialogOrigin] = useState<ExtremeDialogOrigin>(null);
   const [extremeEnvironmentChecks, setExtremeEnvironmentChecks] = useState({
     datapack: false,
     backup: false,
@@ -690,6 +784,8 @@ export default function App() {
   });
   const [pendingExport, setPendingExport] = useState<PendingExport | null>(null);
   const [extendedExportAcknowledged, setExtendedExportAcknowledged] = useState(false);
+  const [pendingGenerationResourceRisk, setPendingGenerationResourceRisk] = useState<PendingGenerationResourceRisk | null>(null);
+  const [generationResourceRiskAcknowledged, setGenerationResourceRiskAcknowledged] = useState(false);
   const [survivalToolsOpen, setSurvivalToolsOpen] = useState(false);
   const [survivalDocument, setSurvivalDocument] = useState<ProjectionDocument | null>(null);
   const survivalToolsTriggerRef = useRef<HTMLButtonElement>(null);
@@ -707,6 +803,13 @@ export default function App() {
     extremeConfirmationsRef.current = resolved;
     setExtremeConfirmations(resolved);
   }, []);
+
+  const invalidateExtremeAuthorization = useCallback(() => {
+    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+    setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
+    setExtremeDialogStage(null);
+    setExtremeDialogOrigin(null);
+  }, [replaceExtremeConfirmations]);
 
   const acquireBackendOperation = useCallback(() => {
     if (backendOperationRef.current) return null;
@@ -772,6 +875,7 @@ export default function App() {
           setProgress(event.progress);
           setStageKey(workerStageKeys[event.stage]);
         } else if (event.type === "RESULT") {
+          currentJobRef.current = "";
           workerLifecycleRef.current?.cancel();
           projectionDocumentRef.current = null;
           setSurvivalDocument(null);
@@ -782,8 +886,11 @@ export default function App() {
           setPoseEditing(false);
           setPreviewMode("hologram");
         } else if (event.type === "ERROR") {
+          currentJobRef.current = "";
           workerLifecycleRef.current?.cancel();
           setProcessing(false);
+          setProgress(0);
+          setStageKey("app.stage.prepareGeneration");
           setPreviewMode("source");
           setToast(translateRef.current(event.code, event.params));
         }
@@ -1083,12 +1190,16 @@ export default function App() {
   const computedExtremeConfigurationFingerprint = useMemo(() => extremeFingerprintBase
     ? createExtremeHeightConfigurationFingerprint(extremeFingerprintBase)
     : null, [extremeFingerprintBase]);
-  const extremeConfigurationFingerprint = heightMode === "experimental_4064"
-    ? extremeUnlockConfigurationFingerprint
-    : computedExtremeConfigurationFingerprint;
+  const extremeConfigurationFingerprint = computedExtremeConfigurationFingerprint;
+  const extremeEnvironmentConfirmed = heightMode === "experimental_4064"
+    && hasExtremeEnvironmentConfirmation(
+      extremeConfirmations,
+      extremeConfigurationFingerprint,
+    );
 
   useEffect(() => {
     if (heightMode !== "experimental_4064") return;
+    if (extremeDialogStage !== null) return;
     if (!extremeConfigurationFingerprint) {
       replaceExtremeConfirmations(createExtremeHeightConfirmationState());
       return;
@@ -1097,18 +1208,13 @@ export default function App() {
       current,
       extremeConfigurationFingerprint,
     ));
-  }, [extremeConfigurationFingerprint, heightMode]);
+  }, [extremeConfigurationFingerprint, extremeDialogStage, heightMode]);
 
   useEffect(() => {
     if (heightMode !== "experimental_4064") return;
-    setHeightMode("extended_2032");
-    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
-    setExtremeUnlockConfigurationFingerprint(null);
-    const normalizedHeight = Math.min(options.targetHeight, EXTENDED_WORLD_HEIGHT);
-    setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
-    setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
-  // 模型、姿态或材质可见性变化后必须重新走极限确认。
-  }, [partsRevision, poseRevision, selectedModelPath]);
+    invalidateExtremeAuthorization();
+    // 模型、姿态或材质变化只使确认失效，不能改写用户选择的极限高度。
+  }, [invalidateExtremeAuthorization, partsRevision, poseRevision, selectedModelPath]);
   const survivalLabels = useMemo(
     () => buildSurvivalLabels(locale, t),
     [locale, t],
@@ -1118,6 +1224,7 @@ export default function App() {
     mode: GenerationMode,
     nextHologramOptions: HologramOptions,
     nextSolidOptions: SolidOptions,
+    acceptedResourceRiskFingerprint?: string,
   ) => {
     const versionProfile = getJavaVersionProfile(javaVersionId);
     if (!versionProfile) {
@@ -1129,10 +1236,22 @@ export default function App() {
       heightMode,
       targetHeight: mode === "solid" ? nextSolidOptions.targetHeight : nextHologramOptions.targetHeight,
       datapackAcknowledged: heightMode !== "default",
+      targetDimension: heightMode === "default"
+        ? versionProfile.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION
+        : declaredTargetDimension,
       confirmations: extremeConfirmationsRef.current,
       configurationFingerprint: extremeConfigurationFingerprint,
     });
     if (!generationHeight.allowed) {
+      if (
+        generationHeight.errorCode === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"
+        && heightMode === "experimental_4064"
+      ) {
+        setExtremeDialogStage("unlock");
+        setExtremeDialogOrigin("reconfirm");
+        setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
+        return;
+      }
       setToast(t("toast.heightPreflightRejected", { reason: generationHeight.errorCode ?? "unknown" }));
       return;
     }
@@ -1160,19 +1279,41 @@ export default function App() {
       estimatedBlocks,
       ...(mode === "hologram" ? { interiorDensity: nextHologramOptions.interiorDensity ?? 0 } : {}),
     });
-    if (!resources.allowed) {
-      const resourceReason = resources.reason === "blocks"
-        ? "toast.resourceBlocksRejected"
-        : resources.reason === "candidates"
-          ? "toast.resourceCandidatesRejected"
-          : resources.reason === "volume"
-            ? "toast.resourceVolumeRejected"
-            : "toast.resourceMemoryRejected";
-      setToast(t(resourceReason as TranslationKey, {
-        memory: formatBinaryBytes(resources.estimatedBytes),
-      }));
+    const resourceRisk = assessGenerationResourceRisk({
+      mode,
+      targetHeight,
+      triangleCount: model.visibleTriangleCount(),
+      estimate: resources,
+    });
+    const resourceRiskConfiguration: GenerationResourceRiskConfiguration = {
+      mode,
+      modelId: model.id,
+      poseRevision,
+      partsRevision,
+      javaVersionId,
+      heightMode,
+      targetDimensionMinY,
+      targetDimensionHeight,
+      placementBottomY,
+      hologramOptions: { ...nextHologramOptions },
+      solidOptions: { ...nextSolidOptions },
+    };
+    const resourceRiskFingerprint = generationResourceRiskFingerprint(resourceRiskConfiguration);
+    if (
+      resourceRisk.requiresConfirmation
+      && acceptedResourceRiskFingerprint !== resourceRiskFingerprint
+    ) {
+      setPendingGenerationResourceRisk({
+        fingerprint: resourceRiskFingerprint,
+        configuration: resourceRiskConfiguration,
+        resources,
+        assessment: resourceRisk,
+      });
+      setGenerationResourceRiskAcknowledged(false);
       return;
     }
+    setPendingGenerationResourceRisk(null);
+    setGenerationResourceRiskAcknowledged(false);
     // Generation reads and mutates the active renderer while capturing the
     // snapshot. Keep the same backend lease used by model/renderer changes so
     // a programmatic switch cannot dispose the model between those steps.
@@ -1262,7 +1403,9 @@ export default function App() {
     }
   }, [acquireBackendOperation, clearProjectionArtifacts, currentMotionTimes,
     declaredTargetDimension, extremeConfigurationFingerprint, heightMode,
-    javaVersionId, localizeError, placementForHeightPreflight, releaseBackendOperation, t]);
+    javaVersionId, localizeError, partsRevision, placementBottomY,
+    placementForHeightPreflight, poseRevision, releaseBackendOperation, t,
+    targetDimensionHeight, targetDimensionMinY]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1371,15 +1514,7 @@ export default function App() {
       heightMode === "experimental_4064"
       && Object.keys(normalizedPatch).some((key) => key !== "glow")
     ) {
-      setHeightMode("extended_2032");
-      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
-      setExtremeUnlockConfigurationFingerprint(null);
-      const normalizedHeight = Math.min(
-        normalizedPatch.targetHeight ?? options.targetHeight,
-        EXTENDED_WORLD_HEIGHT,
-      );
-      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
-      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+      invalidateExtremeAuthorization();
     }
   };
 
@@ -1403,15 +1538,7 @@ export default function App() {
     }
     invalidateProjection("solid-options");
     if (heightMode === "experimental_4064") {
-      setHeightMode("extended_2032");
-      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
-      setExtremeUnlockConfigurationFingerprint(null);
-      const normalizedHeight = Math.min(
-        normalizedPatch.targetHeight ?? solidOptions.targetHeight,
-        EXTENDED_WORLD_HEIGHT,
-      );
-      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
-      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+      invalidateExtremeAuthorization();
     }
   };
 
@@ -1422,7 +1549,6 @@ export default function App() {
       setTargetDimensionHeight(null);
       setPlacementBottomY(null);
       setExtremeDialogStage(null);
-      setExtremeUnlockConfigurationFingerprint(null);
       replaceExtremeConfirmations(createExtremeHeightConfirmationState());
       const defaultHeight = getJavaVersionProfile(javaVersionId)?.defaultDimension?.height
         ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
@@ -1445,32 +1571,33 @@ export default function App() {
   };
 
   const changeGenerationMode = (mode: GenerationMode) => {
+    if (mode === generationMode) return;
     if (mode === "solid" && !modelRef.current) {
       setToast(t("toast.solidModelRequired"));
       return;
     }
     invalidateProjection("mode");
     if (heightMode === "experimental_4064") {
-      setHeightMode("extended_2032");
-      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
-      setExtremeUnlockConfigurationFingerprint(null);
-      const normalizedHeight = Math.min(options.targetHeight, EXTENDED_WORLD_HEIGHT);
-      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
-      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
+      invalidateExtremeAuthorization();
     }
     setGenerationMode(mode);
   };
 
   const beginExtremeHeightUnlock = () => {
-    if (heightMode !== "extended_2032") return;
-    setOptions((current) => ({ ...current, targetHeight: EXPERIMENTAL_WORLD_HEIGHT }));
-    setSolidOptions((current) => ({ ...current, targetHeight: EXPERIMENTAL_WORLD_HEIGHT }));
-    setTargetDimensionMinY(-2032);
-    setTargetDimensionHeight(EXPERIMENTAL_WORLD_HEIGHT);
-    setPlacementBottomY(-2032);
-    invalidateProjection("extreme-height-unlock");
+    if (heightMode !== "extended_2032" && heightMode !== "experimental_4064") return;
+    const initialUnlock = heightMode === "extended_2032";
+    if (initialUnlock) {
+      setHeightMode("experimental_4064");
+      setOptions((current) => ({ ...current, targetHeight: EXPERIMENTAL_WORLD_HEIGHT }));
+      setSolidOptions((current) => ({ ...current, targetHeight: EXPERIMENTAL_WORLD_HEIGHT }));
+      setTargetDimensionMinY(-2032);
+      setTargetDimensionHeight(EXPERIMENTAL_WORLD_HEIGHT);
+      setPlacementBottomY(-2032);
+      invalidateProjection("extreme-height-unlock");
+    }
+    invalidateExtremeAuthorization();
     setExtremeDialogStage("unlock");
-    setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
+    setExtremeDialogOrigin(initialUnlock ? "initial" : "reconfirm");
   };
 
   const confirmExtremeUnlockStage = () => {
@@ -1483,15 +1610,15 @@ export default function App() {
       fingerprint,
       `Java ${javaVersionId}; Y=-2032..2031; 2033-4064 layers`,
     ));
-    setExtremeUnlockConfigurationFingerprint(fingerprint);
     setExtremeDialogStage("environment");
   };
 
   const cancelExtremeHeightUnlock = () => {
     setExtremeDialogStage(null);
+    setExtremeDialogOrigin(null);
     setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
     replaceExtremeConfirmations(createExtremeHeightConfirmationState());
-    setExtremeUnlockConfigurationFingerprint(null);
+    if (extremeDialogOrigin === "reconfirm") return;
     setHeightMode("extended_2032");
     setTargetDimensionMinY(-1024);
     setTargetDimensionHeight(EXTENDED_WORLD_HEIGHT);
@@ -1513,8 +1640,8 @@ export default function App() {
         `Java ${javaVersionId}; data pack, backup, and toolchain self-checked`,
       ));
       setHeightMode("experimental_4064");
-      setExtremeUnlockConfigurationFingerprint(fingerprint);
       setExtremeDialogStage(null);
+      setExtremeDialogOrigin(null);
     } catch (error) {
       setToast(localizeError(error));
     }
@@ -1534,14 +1661,7 @@ export default function App() {
     if (patch.placementBottomY !== undefined) {
       setPlacementBottomY(normalize(patch.placementBottomY));
     }
-    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
-    setExtremeUnlockConfigurationFingerprint(null);
-    if (heightMode === "experimental_4064") {
-      setHeightMode("extended_2032");
-      const normalizedHeight = Math.min(options.targetHeight, EXTENDED_WORLD_HEIGHT);
-      setOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
-      setSolidOptions((current) => ({ ...current, targetHeight: normalizedHeight }));
-    }
+    if (heightMode === "experimental_4064") invalidateExtremeAuthorization();
     projectionDocumentRef.current = null;
     setSurvivalDocument(null);
     setSurvivalToolsOpen(false);
@@ -1555,21 +1675,22 @@ export default function App() {
     const profile = getJavaVersionProfile(versionId);
     if (!profile) return;
     setJavaVersionId(versionId);
-    setHeightMode("default");
-    setTargetDimensionMinY(null);
-    setTargetDimensionHeight(null);
-    setPlacementBottomY(null);
-    const maximum = profile.defaultDimension?.height ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
-    const targetHeight = Math.min(options.targetHeight, maximum);
-    setOptions((current) => ({
-      ...current,
-      targetHeight,
-    }));
-    setSolidOptions((current) => ({ ...current, targetHeight }));
+    if (heightMode === "default") {
+      setTargetDimensionMinY(null);
+      setTargetDimensionHeight(null);
+      setPlacementBottomY(null);
+      const maximum = profile.defaultDimension?.height ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
+      const nextTargetHeight = Math.min(options.targetHeight, maximum);
+      setOptions((current) => ({ ...current, targetHeight: nextTargetHeight }));
+      setSolidOptions((current) => ({ ...current, targetHeight: nextTargetHeight }));
+      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+    } else if (heightMode === "experimental_4064") {
+      invalidateExtremeAuthorization();
+    } else {
+      replaceExtremeConfirmations(createExtremeHeightConfirmationState());
+    }
     setHeightUnlockOpen(false);
     setExtremeDialogStage(null);
-    replaceExtremeConfirmations(createExtremeHeightConfirmationState());
-    setExtremeUnlockConfigurationFingerprint(null);
     setExtendedExportAcknowledged(false);
     invalidateProjection("java-version");
     if (profile.releaseStatus !== "verified") {
@@ -1582,6 +1703,7 @@ export default function App() {
   ): MmdRuntimeRestoreState => ({
     poseTransfer: model.exportPoseTransferState(),
     hiddenMaterialIndices: [...hiddenMaterialIndicesRef.current],
+    selectedMaterialIndex,
     motionPaths: { ...selectedMotionPaths },
     motionTimes: currentMotionTimes(),
     lockedFrames: { ...lockedMotionFrames },
@@ -1589,7 +1711,7 @@ export default function App() {
     selectedBoneIndex,
     poseEditing,
     physicsEnabled: model.physicsEnabled(),
-  }), [currentMotionTimes, lockedMotionFrames, motionRuntime, poseEditing, selectedBoneIndex, selectedMotionPaths]);
+  }), [currentMotionTimes, lockedMotionFrames, motionRuntime, poseEditing, selectedBoneIndex, selectedMaterialIndex, selectedMotionPaths]);
 
   const loadRendererModelWithLease = useCallback(async (
     mode: MmdRendererMode,
@@ -1821,6 +1943,7 @@ export default function App() {
     setPhysicsLoading(false);
     hiddenMaterialIndicesRef.current = [];
     setHiddenMaterialIndices([]);
+    setSelectedMaterialIndex(null);
     setPoseEditing(false);
     setSelectedBoneIndex(null);
     setPoseState(emptyPoseState);
@@ -2047,6 +2170,14 @@ export default function App() {
       setPhysicsEnabled(loaded.physicsEnabled());
       hiddenMaterialIndicesRef.current = [...(restoreState?.hiddenMaterialIndices ?? [])];
       setHiddenMaterialIndices(hiddenMaterialIndicesRef.current);
+      const restoredSelectedMaterialIndex = restoreState?.selectedMaterialIndex ?? null;
+      setSelectedMaterialIndex(
+        restoredSelectedMaterialIndex !== null
+          && Number.isInteger(restoredSelectedMaterialIndex)
+          && loaded.materials[restoredSelectedMaterialIndex]?.index === restoredSelectedMaterialIndex
+          ? restoredSelectedMaterialIndex
+          : null,
+      );
       activeMmdSourceRef.current = {
         files: [...packageFiles],
         modelFile,
@@ -2448,6 +2579,7 @@ export default function App() {
       hidden.add(index);
     }
     model.setMaterialVisible(index, visible);
+    lastPickedMaterialIndexRef.current = null;
     const next = [...hidden].sort((left, right) => left - right);
     hiddenMaterialIndicesRef.current = next;
     setHiddenMaterialIndices(next);
@@ -2455,6 +2587,94 @@ export default function App() {
     setPartsRevision((value) => value + 1);
     setPreviewMode("source");
   }, [invalidateProjection, modelLoading, processing]);
+
+  useEffect(() => {
+    const probeWindow = window as Window & {
+      __MELY_E2E_MATERIAL_SELECTION_PROBE__?: boolean;
+    };
+    if (!probeWindow.__MELY_E2E_MATERIAL_SELECTION_PROBE__ || !mmdModel) return;
+    const selectedHidden = selectedMaterialIndex !== null
+      && hiddenMaterialIndices.includes(selectedMaterialIndex);
+    probeWindow.dispatchEvent(new CustomEvent("mely:material-selection-state", {
+      detail: {
+        backend: mmdModel.rendererMode,
+        modelId: mmdModel.id,
+        selectedMaterialIndex,
+        pickedMaterialIndex: lastPickedMaterialIndexRef.current,
+        hiddenMaterialIndices: [...hiddenMaterialIndices],
+        outlineTargetCount: selectedMaterialIndex !== null
+          && previewMode === "source"
+          && !selectedHidden
+          ? 1
+          : 0,
+      },
+    }));
+    lastPickedMaterialIndexRef.current = null;
+  }, [
+    hiddenMaterialIndices,
+    materialSelectionRequestId,
+    materialSelectionProbeRevision,
+    mmdModel,
+    previewMode,
+    selectedMaterialIndex,
+  ]);
+
+  const changeMaterialSelection = useCallback((index: number | null) => {
+    if (index === null) {
+      lastPickedMaterialIndexRef.current = null;
+      setSelectedMaterialIndex(null);
+      materialSelectionProbeRevisionRef.current += 1;
+      setMaterialSelectionProbeRevision(materialSelectionProbeRevisionRef.current);
+      return;
+    }
+    const model = modelRef.current;
+    if (
+      !model
+      || !Number.isInteger(index)
+      || model.materials[index]?.index !== index
+    ) return;
+    lastPickedMaterialIndexRef.current = null;
+    setSelectedMaterialIndex(index);
+    materialSelectionProbeRevisionRef.current += 1;
+    setMaterialSelectionProbeRevision(materialSelectionProbeRevisionRef.current);
+  }, []);
+
+  const handleRendererMaterialSelection = useCallback((
+    selection: RendererMaterialSelection | null,
+    sourceModelId: string,
+  ) => {
+    const model = modelRef.current;
+    if (
+      !model
+      || sourceModelId !== model.id
+      || previewMode !== "source"
+      || backendOperationRef.current
+      || modelLoading
+      || processing
+      || exporting
+      || physicsLoading
+    ) return;
+    if (selection === null) {
+      lastPickedMaterialIndexRef.current = null;
+      setSelectedMaterialIndex(null);
+      materialSelectionProbeRevisionRef.current += 1;
+      setMaterialSelectionProbeRevision(materialSelectionProbeRevisionRef.current);
+      return;
+    }
+    if (
+      selection.modelId !== model.id
+      || !Number.isInteger(selection.materialIndex)
+      || model.materials[selection.materialIndex]?.index !== selection.materialIndex
+    ) return;
+
+    lastPickedMaterialIndexRef.current = selection.materialIndex;
+    setSelectedMaterialIndex(selection.materialIndex);
+    setSidebarOpen(true);
+    materialSelectionProbeRevisionRef.current += 1;
+    setMaterialSelectionProbeRevision(materialSelectionProbeRevisionRef.current);
+    // 只有视口点击递增定位请求；跨渲染器恢复不会抢占侧栏焦点。
+    setMaterialSelectionRequestId((current) => current + 1);
+  }, [exporting, modelLoading, physicsLoading, previewMode, processing]);
 
   const openClearResources = () => {
     setClearResourceSelection(emptyClearResourceSelection());
@@ -2550,17 +2770,20 @@ export default function App() {
 
   const setMotionFrame = (kind: MmdMotionTrackKind, frame: number) => {
     if (backendOperationRef.current) return;
+    if (!Number.isFinite(frame)) return;
     const model = modelRef.current;
     const motion = motionTracks[kind];
     const runtime = motionRuntime[kind];
     if (!model || !motion) return;
+    const clampedFrame = normalizeMotionFrame(frame, motion.maxFrame);
+    const currentFrame = runtime.seconds * motion.frameRate;
+    if (Math.abs(clampedFrame - currentFrame) <= 1e-6) return;
     const wasPlaying = runtime.playing;
     runtime.playing = false;
     if (wasPlaying) runtime.playbackStore.set(false);
     if (lockedMotionFrames[kind] !== null) {
       setLockedMotionFrames((current) => ({ ...current, [kind]: null }));
     }
-    const clampedFrame = Math.max(0, Math.min(motion.maxFrame, frame));
     const seconds = clampedFrame / motion.frameRate;
     runtime.pendingSeconds = seconds;
     runtime.seconds = seconds;
@@ -2589,6 +2812,42 @@ export default function App() {
     setPoseEditing(false);
     setPreviewMode("source");
     void generate(generationMode, options, solidOptions);
+  };
+
+  const closeGenerationResourceRisk = () => {
+    setPendingGenerationResourceRisk(null);
+    setGenerationResourceRiskAcknowledged(false);
+  };
+
+  const confirmGenerationResourceRisk = () => {
+    const pending = pendingGenerationResourceRisk;
+    const model = modelRef.current;
+    if (!pending || !generationResourceRiskAcknowledged || !model) return;
+    const currentConfiguration: GenerationResourceRiskConfiguration = {
+      mode: generationMode,
+      modelId: model.id,
+      poseRevision,
+      partsRevision,
+      javaVersionId,
+      heightMode,
+      targetDimensionMinY,
+      targetDimensionHeight,
+      placementBottomY,
+      hologramOptions: { ...options },
+      solidOptions: { ...solidOptions },
+    };
+    if (generationResourceRiskFingerprint(currentConfiguration) !== pending.fingerprint) {
+      closeGenerationResourceRisk();
+      setToast(t("generationResourceRisk.stale"));
+      return;
+    }
+    closeGenerationResourceRisk();
+    void generate(
+      pending.configuration.mode,
+      pending.configuration.hologramOptions,
+      pending.configuration.solidOptions,
+      pending.fingerprint,
+    );
   };
 
   const toggleMotionLock = (kind: MmdMotionTrackKind) => {
@@ -2654,6 +2913,7 @@ export default function App() {
 
   const setPoseEditingState = (editing: boolean) => {
     if (backendOperationRef.current) return;
+    if (editing === poseEditing) return;
     const model = modelRef.current;
     if (!model) return;
     if (editing) {
@@ -2816,6 +3076,22 @@ export default function App() {
   };
 
   useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key !== "Escape"
+        || event.repeat
+        || event.defaultPrevented
+        || selectedMaterialIndex === null
+        || shouldIgnoreMotionShortcut(event.target)
+      ) return;
+      event.preventDefault();
+      changeMaterialSelection(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [changeMaterialSelection, selectedMaterialIndex]);
+
+  useEffect(() => {
     if (!poseEditing) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (shouldIgnoreMotionShortcut(event.target)) return;
@@ -2860,19 +3136,23 @@ export default function App() {
 
   const prepareProjectionDocument = useCallback(async () => {
     if (!result) throw appError("error.litematic.emptyProjection");
+    const configurationKey = JSON.stringify({
+      javaVersionId,
+      heightMode,
+      targetHeight,
+      targetDimensionMinY,
+      targetDimensionHeight,
+      placementBottomY,
+      projectionName,
+    });
     const cached = projectionDocumentRef.current;
-    if (cached?.result === result && cached.document.minecraftVersion === javaVersionId) {
+    if (cached?.result === result && cached.configurationKey === configurationKey) {
       return cached.document;
     }
     await yieldToBrowser();
     const profile = getJavaVersionProfile(javaVersionId);
     const defaultDimension = profile?.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION;
-    const requiredHeight = Math.max(targetHeight, result.stats.dimensions[1]);
-    const documentHeightMode: HeightMode = requiredHeight > EXTENDED_WORLD_HEIGHT
-      ? "experimental_4064"
-      : requiredHeight > defaultDimension.height
-        ? "extended_2032"
-        : "default";
+    const documentHeightMode = heightMode;
     const placementMetadata: Record<string, string | number | boolean> = documentHeightMode === "default"
       ? {
           placementBottomY: defaultDimension.minY,
@@ -2905,7 +3185,7 @@ export default function App() {
         generationMode: result.kind === "solid" ? "solid" : "hologram",
       },
     });
-    projectionDocumentRef.current = { result, document };
+    projectionDocumentRef.current = { result, document, configurationKey };
     return document;
   }, [heightMode, javaVersionId, placementBottomY, projectionName, result,
     targetDimensionHeight, targetDimensionMinY, targetHeight]);
@@ -3042,16 +3322,19 @@ export default function App() {
       setExtendedExportAcknowledged(false);
       return;
     }
+    // 资源阈值不拒绝导出，但必须由绑定当前投影与选项的确认重入。
+    if (request.resourceRisk && !request.resourceRiskAccepted) {
+      setExporting(false);
+      setToast(t("exportResourceRisk.confirmationRequired"));
+      return;
+    }
     setExporting(true);
     setExportCurrentFile("");
     setExportCenterOpen(false);
     try {
       await yieldToBrowser();
       if (request.format === "bundle") {
-        const [{
-          createExportBundleStream,
-          DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES,
-        }, desktop] = await Promise.all([
+        const [{ createExportBundleStream }, desktop] = await Promise.all([
           import("./core/exportBundle"),
           import("./platform/desktop"),
         ]);
@@ -3117,10 +3400,7 @@ export default function App() {
             (chunk) => {
               chunks.push(chunk);
             },
-            {
-              ...bundleOptions,
-              maxOutputBytes: DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES,
-            },
+            bundleOptions,
           );
           byteLength = bundle.summary.byteLength;
           downloadBinaryChunks(chunks, `${request.name}.zip`, "application/zip");
@@ -3132,11 +3412,8 @@ export default function App() {
         return;
       }
       if (request.format === "mcfunction") {
-        const [{ createMcfunctionBehaviorPackZipStream }, {
-          DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES,
-        }, desktop] = await Promise.all([
+        const [{ createMcfunctionBehaviorPackZipStream }, desktop] = await Promise.all([
           import("./core/mcfunction"),
-          import("./core/exportBundle"),
           import("./platform/desktop"),
         ]);
         const behaviorPackOptions = {
@@ -3173,10 +3450,7 @@ export default function App() {
             (chunk) => {
               chunks.push(chunk);
             },
-            {
-              ...behaviorPackOptions,
-              maxOutputBytes: DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES,
-            },
+            behaviorPackOptions,
           );
           byteLength = streamed.archive.bytesWritten;
           downloadBinaryChunks(chunks, `${request.name}.zip`, "application/zip");
@@ -3187,12 +3461,12 @@ export default function App() {
         }));
         return;
       }
-      let bytes: Uint8Array;
-      let extension: string;
-      let mime = "application/octet-stream";
       if (request.format === "litematic") {
-        const { createLitematicFromDocument } = await import("./core/litematic");
-        bytes = createLitematicFromDocument(request.document, {
+        const [{ streamLitematicFromDocument }, desktop] = await Promise.all([
+          import("./core/litematic"),
+          import("./platform/desktop"),
+        ]);
+        const litematicOptions = {
           name: request.name,
           author: "MELY",
           description: t("export.description.unified", { version: request.document.minecraftVersion }),
@@ -3203,10 +3477,49 @@ export default function App() {
             exportFingerprint,
             request.safety,
           ),
-        }).bytes;
-        extension = "litematic";
-        mime = "application/gzip";
-      } else if (request.format === "schematic") {
+        };
+        let byteLength = 0;
+        if (desktop.isDesktopRuntime()) {
+          const writer = await desktop.openDesktopChunkWriterWithDialog({
+            defaultPath: `${request.name}.litematic`,
+            filters: [{
+              name: t("export.format.litematic"),
+              extensions: ["litematic"],
+            }],
+          });
+          if (!writer) return;
+          try {
+            const summary = await streamLitematicFromDocument(
+              request.document,
+              (chunk) => writer.write(chunk),
+              litematicOptions,
+            );
+            byteLength = summary.byteLength;
+            await writer.close();
+          } catch (error) {
+            await writer.abort();
+            throw error;
+          }
+        } else {
+          const chunks: Uint8Array[] = [];
+          const summary = await streamLitematicFromDocument(
+            request.document,
+            (chunk) => { chunks.push(chunk); },
+            litematicOptions,
+          );
+          byteLength = summary.byteLength;
+          downloadBinaryChunks(chunks, `${request.name}.litematic`, "application/gzip");
+        }
+        setToast(t("toast.exportFormatComplete", {
+          format: t("export.format.litematic"),
+          size: (byteLength / 1024).toFixed(1),
+        }));
+        return;
+      }
+      let bytes: Uint8Array;
+      let extension: string;
+      let mime = "application/octet-stream";
+      if (request.format === "schematic") {
         const { createSchematic } = await import("./core/schematic");
         bytes = createSchematic(request.document, {
           name: request.name,
@@ -3275,8 +3588,29 @@ export default function App() {
         document.bounds,
         selectedDefaultHeight,
       );
+      const confirmationHeight = "confirmationHeight" in preflight
+        ? preflight.confirmationHeight
+        : requestHeightRisk.requiredHeight;
+      // Bedrock 格式没有 Java 4064 三阶段指纹；其资源风险只走普通二次确认。
+      const experimental = !isBedrockExportFormat(format)
+        && confirmationHeight > EXTENDED_WORLD_HEIGHT;
+      const needsExtremeEnvironmentConfirmation = !isBedrockExportFormat(format)
+        && experimental
+        && preflight.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"
+        && !hasExtremeEnvironmentConfirmation(
+          extremeConfirmationsRef.current,
+          fingerprints?.configurationFingerprint,
+        );
+      if (needsExtremeEnvironmentConfirmation) {
+        setExporting(false);
+        setExportCenterOpen(false);
+        setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
+        setExtremeDialogOrigin("reconfirm");
+        setExtremeDialogStage("unlock");
+        return;
+      }
       const needsExtremeExportConfirmation = !isBedrockExportFormat(format)
-        && requestHeightRisk.risk === "experimental"
+        && experimental
         && preflight.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"
         && fingerprints;
       if (!preflight.allowed && !needsExtremeExportConfirmation) {
@@ -3284,6 +3618,50 @@ export default function App() {
         setToast(exportPreflightMessage(preflight));
         return;
       }
+      const resourceRiskReasons: NonNullable<PendingExport["resourceRisk"]>["reasons"] = [];
+      if (preflight.requiresConfirmation) resourceRiskReasons.push("denseVolume");
+      let bundleResourceEstimate: ExportBundleResourceEstimate | undefined;
+      let webRetentionWarningBytes = 0;
+      if (format === "bundle") {
+        const {
+          DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES,
+          estimateExportBundleResources,
+        } = await import("./core/exportBundle");
+        bundleResourceEstimate = estimateExportBundleResources(document, {
+          partSize: [32, 32, 32],
+          includeSchematic: bundleFormats.includeSchematic,
+          includeMcstructure: bundleFormats.includeMcstructure,
+          includeMcfunction: bundleFormats.includeMcfunction,
+        });
+        if (bundleResourceEstimate.requiresConfirmation) resourceRiskReasons.push("workingSet");
+        const desktop = await import("./platform/desktop");
+        if (!desktop.isDesktopRuntime()) {
+          webRetentionWarningBytes = estimateWebExportRetentionBytes(document, format);
+          if (webRetentionWarningBytes > DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES) {
+            resourceRiskReasons.push("webRetention");
+          }
+        }
+      } else if (format === "mcfunction") {
+        const [{ DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES }, desktop] = await Promise.all([
+          import("./core/exportBundle"),
+          import("./platform/desktop"),
+        ]);
+        if (!desktop.isDesktopRuntime()) {
+          webRetentionWarningBytes = estimateWebExportRetentionBytes(document, format);
+          if (webRetentionWarningBytes > DEFAULT_WEB_BUNDLE_OUTPUT_BUDGET_BYTES) {
+            resourceRiskReasons.push("webRetention");
+          }
+        }
+      }
+      const resultId = documentResultId(document);
+      const pendingBundleFormats = format === "bundle" ? { ...bundleFormats } : undefined;
+      const resourceRisk = resourceRiskReasons.length > 0 ? {
+        reasons: resourceRiskReasons,
+        denseVolume: preflight.requiresConfirmation ? preflight.volume : null,
+        denseVolumeLimit: preflight.requiresConfirmation ? preflight.volumeLimit : null,
+        ...(bundleResourceEstimate ? { bundle: bundleResourceEstimate } : {}),
+        estimatedWebRetentionBytes: webRetentionWarningBytes,
+      } : null;
       const request: PendingExport = {
         format,
         document,
@@ -3313,12 +3691,25 @@ export default function App() {
           configurationFingerprint: fingerprints?.configurationFingerprint,
           confirmations: extremeConfirmationsRef.current,
         },
-        resultId: documentResultId(document),
-        experimental: requestHeightRisk.risk === "experimental",
-        ...(format === "bundle" ? { bundleFormats: { ...bundleFormats } } : {}),
+        resultId,
+        experimental,
+        ...(resourceRisk ? {
+          resourceRisk: {
+            ...resourceRisk,
+            fingerprint: exportResourceRiskFingerprint(
+              resultId,
+              format,
+              pendingBundleFormats,
+              resourceRisk,
+            ),
+          },
+        } : {}),
+        ...(pendingBundleFormats ? { bundleFormats: pendingBundleFormats } : {}),
       };
-      if (!isBedrockExportFormat(format)
-        && requestHeightRisk.requiresExportConfirmation) {
+      if (
+        (!isBedrockExportFormat(format) && confirmationHeight > selectedDefaultHeight)
+        || resourceRiskReasons.length > 0
+      ) {
         setExportCenterOpen(false);
         setPendingExport(request);
         setExtendedExportAcknowledged(false);
@@ -3334,6 +3725,34 @@ export default function App() {
 
   const confirmPendingExport = () => {
     if (!pendingExport) return;
+    const currentBundleConfiguration = pendingExport.format === "bundle"
+      ? JSON.stringify(bundleFormats)
+      : null;
+    const pendingBundleConfiguration = pendingExport.bundleFormats
+      ? JSON.stringify(pendingExport.bundleFormats)
+      : null;
+    const currentPlacementBottomY = pendingExport.safety.heightMode === "default"
+      ? selectedDefaultDimension.minY
+      : placementForHeightPreflight;
+    const currentTargetDimension = pendingExport.safety.heightMode === "default"
+      ? pendingExport.safety.targetDimension
+      : declaredTargetDimension;
+    const currentResourceFingerprint = pendingExport.resourceRisk
+      ? exportResourceRiskFingerprint(
+          pendingExport.resultId,
+          pendingExport.format,
+          pendingExport.bundleFormats,
+          {
+            reasons: pendingExport.resourceRisk.reasons,
+            denseVolume: pendingExport.resourceRisk.denseVolume,
+            denseVolumeLimit: pendingExport.resourceRisk.denseVolumeLimit,
+            ...(pendingExport.resourceRisk.bundle
+              ? { bundle: pendingExport.resourceRisk.bundle }
+              : {}),
+            estimatedWebRetentionBytes: pendingExport.resourceRisk.estimatedWebRetentionBytes,
+          },
+        )
+      : null;
     if (
       !projectionDocumentRef.current
       || projectionDocumentRef.current.result !== result
@@ -3341,10 +3760,13 @@ export default function App() {
       || projectionDocumentRef.current.contentHash !== pendingExport.resultId
       || pendingExport.safety.heightMode !== heightMode
       || pendingExport.safety.targetHeight !== targetHeight
-      || pendingExport.safety.configurationFingerprint !== (extremeConfigurationFingerprint ?? undefined)
-      || pendingExport.safety.placementBottomY !== placementForHeightPreflight
-      || pendingExport.safety.targetDimension?.minY !== declaredTargetDimension?.minY
-      || pendingExport.safety.targetDimension?.height !== declaredTargetDimension?.height
+      || (!isBedrockExportFormat(pendingExport.format)
+        && pendingExport.safety.configurationFingerprint !== (extremeConfigurationFingerprint ?? undefined))
+      || pendingExport.safety.placementBottomY !== currentPlacementBottomY
+      || pendingExport.safety.targetDimension?.minY !== currentTargetDimension?.minY
+      || pendingExport.safety.targetDimension?.height !== currentTargetDimension?.height
+      || currentBundleConfiguration !== pendingBundleConfiguration
+      || currentResourceFingerprint !== (pendingExport.resourceRisk?.fingerprint ?? null)
     ) {
       setPendingExport(null);
       setExtendedExportAcknowledged(false);
@@ -3353,7 +3775,7 @@ export default function App() {
       return;
     }
     if (!pendingExport.experimental) {
-      void performExport(pendingExport);
+      void performExport({ ...pendingExport, resourceRiskAccepted: true });
       return;
     }
     if (
@@ -3374,6 +3796,7 @@ export default function App() {
       replaceExtremeConfirmations(confirmed);
       void performExport({
         ...pendingExport,
+        resourceRiskAccepted: true,
         safety: { ...pendingExport.safety, confirmations: confirmed },
       });
     } catch (error) {
@@ -3519,6 +3942,8 @@ export default function App() {
             bones={mmdModel?.bones ?? []}
             materials={mmdModel?.materials ?? []}
             hiddenMaterialIndices={hiddenMaterialIndices}
+            selectedMaterialIndex={selectedMaterialIndex}
+            materialSelectionRequestId={materialSelectionRequestId}
             selectedBoneIndex={selectedBoneIndex}
             poseEditing={poseEditing}
             poseState={poseState}
@@ -3538,6 +3963,7 @@ export default function App() {
                 : selectedDefaultHeight}
             extendedHeightUnlocked={heightMode !== "default"}
             experimentalHeightActive={heightMode === "experimental_4064"}
+            experimentalHeightConfirmed={extremeEnvironmentConfirmed}
             extendedHeightActive={extendedHeightActive}
             targetDimensionMinY={targetDimensionMinY}
             targetDimensionHeight={targetDimensionHeight}
@@ -3560,6 +3986,7 @@ export default function App() {
             onAssetsAdded={addAssets}
             onPhysicsEnabledChange={changePhysicsEnabled}
             onMaterialVisibilityChange={changeMaterialVisibility}
+            onMaterialSelectionChange={changeMaterialSelection}
             onSidebarResizeStart={beginSidebarResize}
             onSidebarResizeStep={stepSidebarWidth}
             onSidebarResizeReset={resetSidebarWidth}
@@ -3667,7 +4094,13 @@ export default function App() {
               poseRevision={poseRevision}
               poseEditing={poseEditing}
               selectedBoneIndex={selectedBoneIndex}
+              selectedMaterialIndex={selectedMaterialIndex}
+              hiddenMaterialIndices={hiddenMaterialIndices}
+              materialSelectionRequestId={materialSelectionRequestId}
               onBoneSelected={selectBone}
+              onMaterialSelected={(selection) => {
+                handleRendererMaterialSelection(selection, viewportBinding?.modelId ?? "");
+              }}
               onPoseCommitted={commitPoseMutation}
               onBeforeRender={advanceMotionPreview}
               onAfterRender={publishRenderedMotionPreview}
@@ -3691,7 +4124,16 @@ export default function App() {
               <div className="view-label">
                 <Camera size={14} />
                 <span>{poseEditing ? t("viewport.poseMode") : cameraMode === "perspective" ? t("viewport.perspective") : t("viewport.orthographic")}</span>
-                {poseEditing ? <><kbd>{t("viewport.clickJoint")}</kbd><kbd>{t("viewport.dragRing")}</kbd></> : <><kbd>{t("viewport.rotate")}</kbd><kbd>{t("viewport.pan")}</kbd><kbd>{t("viewport.zoom")}</kbd></>}
+                {poseEditing ? (
+                  <><kbd>{t("viewport.clickJoint")}</kbd><kbd>{t("viewport.dragRing")}</kbd></>
+                ) : (
+                  <>
+                    {previewMode === "source" && mmdModel ? <kbd>{t("viewport.selectPart")}</kbd> : null}
+                    <kbd>{t("viewport.rotate")}</kbd>
+                    <kbd>{t("viewport.pan")}</kbd>
+                    <kbd>{t("viewport.zoom")}</kbd>
+                  </>
+                )}
               </div>
               {previewMode === "source" && mmdModel ? (
                 <div className="scene-stats scene-stats--model">
@@ -3744,7 +4186,7 @@ export default function App() {
                   timeSource={motionRuntime[kind].timeStore}
                   playbackSource={motionRuntime[kind].playbackStore}
                   lockedFrame={lockedMotionFrames[kind]}
-                  disabled={processing || modelLoading}
+                  disabled={processing || modelLoading || physicsLoading || backendOperationBusy}
                   onPlayingChange={(playing) => setMotionPlayingState(kind, playing)}
                   onFrameChange={(frame) => setMotionFrame(kind, frame)}
                   onFrameStep={(direction) => stepMotionFrame(kind, direction)}
@@ -3937,8 +4379,7 @@ export default function App() {
             const preflight = exportPreflights[format];
             const awaitsExtremeConfirmation = preflight
               && !preflight.allowed
-              && preflight.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED"
-              && heightMode === "experimental_4064";
+              && preflight.reason === "HEIGHT_EXTREME_CONFIRMATION_REQUIRED";
             const unavailable = Boolean(preflight && !preflight.allowed && !awaitsExtremeConfirmation);
             return (
               <button
@@ -3963,6 +4404,11 @@ export default function App() {
                         <small className="export-format__alternative">{t("exportCenter.useBundle")}</small>
                       ) : null}
                     </>
+                  ) : null}
+                  {preflight?.requiresConfirmation ? (
+                    <small className="export-format__reason">
+                      {t("exportResourceRisk.preflightWarning")}
+                    </small>
                   ) : null}
                 </span>
               </button>
@@ -3997,8 +4443,86 @@ export default function App() {
       </Windows>
 
       <Windows
+        open={Boolean(pendingGenerationResourceRisk)}
+        title={t("generationResourceRisk.title")}
+        closeLabel={t("common.close")}
+        danger
+        onClose={closeGenerationResourceRisk}
+        actions={[
+          {
+            label: t("common.cancel"),
+            onClick: closeGenerationResourceRisk,
+          },
+          {
+            label: t("generationResourceRisk.continue"),
+            emphasis: "danger",
+            disabled: !generationResourceRiskAcknowledged,
+            onClick: confirmGenerationResourceRisk,
+          },
+        ]}
+      >
+        {pendingGenerationResourceRisk ? (
+          <div className="safety-copy generation-resource-risk">
+            <p>{t("generationResourceRisk.body")}</p>
+            <dl className="generation-resource-risk__facts">
+              <div>
+                <dt>{t("generationResourceRisk.candidates")}</dt>
+                <dd>{t("generationResourceRisk.approximate", {
+                  value: number(pendingGenerationResourceRisk.assessment.estimatedCandidateChecks),
+                })}</dd>
+              </div>
+              <div>
+                <dt>{t("generationResourceRisk.memory")}</dt>
+                <dd>{t("generationResourceRisk.approximate", {
+                  value: formatBinaryBytes(pendingGenerationResourceRisk.resources.estimatedBytes),
+                })}</dd>
+              </div>
+              <div>
+                <dt>{t("generationResourceRisk.blocks")}</dt>
+                <dd>{t("generationResourceRisk.approximate", {
+                  value: number(pendingGenerationResourceRisk.resources.estimatedBlocks),
+                })}</dd>
+              </div>
+              <div>
+                <dt>{t("generationResourceRisk.duration")}</dt>
+                <dd>{t("generationResourceRisk.durationRange", {
+                  minimum: formatRiskDuration(
+                    pendingGenerationResourceRisk.assessment.minimumSeconds,
+                    number,
+                    t,
+                  ),
+                  maximum: formatRiskDuration(
+                    pendingGenerationResourceRisk.assessment.maximumSeconds,
+                    number,
+                    t,
+                  ),
+                })}</dd>
+              </div>
+            </dl>
+            <p>{t("generationResourceRisk.details", {
+              risks: pendingGenerationResourceRisk.assessment.risks
+                .map((risk) => t(`generationResourceRisk.reason.${risk}` as TranslationKey))
+                .join(t("generationResourceRisk.reasonSeparator")),
+            })}</p>
+            <p>{t("generationResourceRisk.workerRefines")}</p>
+            <label className="risk-acknowledgement">
+              <input
+                type="checkbox"
+                checked={generationResourceRiskAcknowledged}
+                onChange={(event) => setGenerationResourceRiskAcknowledged(event.currentTarget.checked)}
+              />
+              <span>{t("generationResourceRisk.acknowledge")}</span>
+            </label>
+          </div>
+        ) : null}
+      </Windows>
+
+      <Windows
         open={Boolean(pendingExport)}
-        title={t("extendedExport.title")}
+        title={pendingExport?.resourceRisk
+          && pendingExport.requiredHeight <= selectedDefaultHeight
+          ? t("exportResourceRisk.title")
+          : t("extendedExport.title")}
         closeLabel={t("common.close")}
         danger
         dismissible={!exporting}
@@ -4035,18 +4559,55 @@ export default function App() {
         ]}
       >
         <div className="safety-copy">
-          <p>{t("extendedExport.body", {
-            height: number(pendingExport?.targetDimensionHeight ?? selectedDefaultHeight),
-            vanilla: number(selectedDefaultHeight),
-          })}</p>
+          {pendingExport && pendingExport.requiredHeight > selectedDefaultHeight ? (
+            <p>{t("extendedExport.body", {
+              height: number(pendingExport?.targetDimensionHeight ?? selectedDefaultHeight),
+              vanilla: number(selectedDefaultHeight),
+            })}</p>
+          ) : null}
           {pendingExport && pendingExport.targetDimensionHeight !== pendingExport.requiredHeight ? (
             <p>{t("extendedExport.projectionHeight", {
               height: number(pendingExport.requiredHeight),
             })}</p>
           ) : null}
+          {pendingExport?.resourceRisk ? (
+            <div className="generation-resource-risk">
+              <p>{t("exportResourceRisk.body")}</p>
+              <ul>
+                {pendingExport.resourceRisk.reasons.includes("denseVolume") ? (
+                  <li>{t("exportResourceRisk.denseVolume", {
+                    volume: number(pendingExport.resourceRisk.denseVolume ?? 0),
+                    limit: number(pendingExport.resourceRisk.denseVolumeLimit ?? 0),
+                  })}</li>
+                ) : null}
+                {pendingExport.resourceRisk.reasons.includes("workingSet") ? (
+                  <li>{t("exportResourceRisk.workingSet", {
+                    memory: formatBinaryBytes(
+                      pendingExport.resourceRisk.bundle?.estimatedWorkingBytes ?? 0,
+                    ),
+                    limit: formatBinaryBytes(
+                      pendingExport.resourceRisk.bundle?.workingBudgetBytes ?? 0,
+                    ),
+                  })}</li>
+                ) : null}
+                {pendingExport.resourceRisk.reasons.includes("webRetention") ? (
+                  <li>{t("exportResourceRisk.webRetention", {
+                    memory: formatBinaryBytes(
+                      pendingExport.resourceRisk.estimatedWebRetentionBytes,
+                    ),
+                  })}</li>
+                ) : null}
+              </ul>
+              <p>{t("exportResourceRisk.continueHint")}</p>
+            </div>
+          ) : null}
           <ul>
-            <li>{t("extendedExport.checkDatapack")}</li>
-            <li>{t("extendedExport.checkRisk")}</li>
+            {pendingExport && pendingExport.requiredHeight > selectedDefaultHeight ? (
+              <>
+                <li>{t("extendedExport.checkDatapack")}</li>
+                <li>{t("extendedExport.checkRisk")}</li>
+              </>
+            ) : null}
           </ul>
           <label className="risk-acknowledgement">
             <input
@@ -4054,7 +4615,11 @@ export default function App() {
               checked={extendedExportAcknowledged}
               onChange={(event) => setExtendedExportAcknowledged(event.currentTarget.checked)}
             />
-            <span>{t("extendedExport.acknowledge")}</span>
+            <span>{t(
+              pendingExport?.resourceRisk && pendingExport.requiredHeight <= selectedDefaultHeight
+                ? "exportResourceRisk.acknowledge"
+                : "extendedExport.acknowledge",
+            )}</span>
           </label>
           {pendingExport?.experimental ? (
             <label className="extreme-export-phrase">

@@ -98,10 +98,14 @@ test("Babylon viewport wires dynamic panning without changing source transforms"
   );
   assert.match(
     viewport,
-    /syncBabylonCameraPanningSensibility\(camera\);\s*scene\.render\(\)/,
+    /syncBabylonCameraPanningSensibility\(camera\);[\s\S]{0,120}selectionOutline\.sync\(\);\s*scene\.render\(\)/,
   );
   assert.match(viewport, /canvas\.addEventListener\("contextmenu", preventContextMenu\)/);
   assert.match(viewport, /canvas\.removeEventListener\("contextmenu", preventContextMenu\)/);
+  assert.match(
+    viewport,
+    /const gl = canvas\.getContext\("webgl2"\) \?\? canvas\.getContext\("webgl"\);\s*gl\?\.finish\(\)/,
+  );
   assert.match(viewport, /if \(!probeWindow\.__MELY_E2E_CAMERA_PROBE__\) return/);
   assert.match(viewport, /publishBabylonCameraProbe\(camera, sourceRoot\)/);
   assert.match(

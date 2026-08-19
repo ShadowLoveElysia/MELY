@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { generateHologram, generateMeshHologram } from "../src/core/hologram";
+import {
+  generateHologram,
+  generateMeshHologram,
+  MAX_HOLOGRAM_BLOCKS,
+  MAX_HOLOGRAM_CANDIDATES,
+} from "../src/core/hologram";
 import { assertSixWayIsolated } from "../src/core/hologramIsolation";
 import type { HologramMeshSnapshot, HologramOptions } from "../src/types";
 
@@ -462,4 +467,13 @@ test("demo generation reports unavailable interior sampling without a mesh", () 
   const result = generateHologram({ ...options, interiorDensity: 50 });
   assert.equal(result.stats.interiorMode, "unavailable");
   assert.deepEqual(result.stats.interiorWarnings, ["hologram.interior.unavailable.noMesh"]);
+});
+
+test("confirmed oversized holograms exceed legacy candidate and final block thresholds", { timeout: 30_000 }, () => {
+  const oversizedOptions = { ...options, targetHeight: 300_000, sampleSpacing: 1 };
+  const result = generateHologram(oversizedOptions);
+
+  assert.ok(result.stats.blockCount > MAX_HOLOGRAM_CANDIDATES);
+  assert.ok(result.stats.blockCount > MAX_HOLOGRAM_BLOCKS);
+  assertSixWayIsolated(positionsFromResult(result.positions));
 });

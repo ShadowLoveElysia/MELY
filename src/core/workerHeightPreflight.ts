@@ -5,6 +5,7 @@ const baseInput = (command: WorkerCommand) => ({
   versionId: command.versionId ?? "",
   heightMode: command.heightMode ?? "default" as const,
   targetHeight: command.options.targetHeight,
+  targetDimension: command.targetDimension,
   datapackAcknowledged: command.datapackAcknowledged,
   confirmations: command.confirmations,
   configurationFingerprint: command.configurationFingerprint,

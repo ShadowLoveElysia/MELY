@@ -46,6 +46,10 @@ test("translations interpolate parameters and expose core keys in every locale",
     "toolbar.focusFace",
     "sidebar.motion.previousFrame",
     "sidebar.motion.nextFrame",
+    "viewport.selectPart",
+    "sidebar.parts.selectedName",
+    "sidebar.parts.hideSelected",
+    "sidebar.parts.showSelected",
     "toast.generationFailed",
     "error.pose.invalidJson",
     "error.pose.invalidMorph",
@@ -204,6 +208,11 @@ test("localized public error paths do not contain internal English exception det
     "error.export.failed",
     "error.desktop.writeFile",
     "error.worker.unknown",
+    "error.worker.failed",
+    "error.worker.range",
+    "error.worker.outOfMemory",
+    "error.worker.crashed",
+    "error.worker.protocol",
   ] as const;
   const nonEnglishLocales = ["zh-CN", "ja-JP"] as const;
   const asciiWord = /\b[A-Za-z]{4,}\b/;
@@ -223,8 +232,11 @@ test("localized public error paths do not contain internal English exception det
 
 test("new workflow translations preserve interpolation and component template contracts", () => {
   assert.equal(
-    translate("en-US", "toast.resourceMemoryRejected", { memory: "2.4 GiB" }),
-    "Estimated peak memory is 2.4 GiB, above the 2 GiB safety budget. Lower the height or complexity.",
+    translate("en-US", "toast.resourceMemoryRejected", {
+      memory: "5.1 GiB",
+      limit: "5.0 GiB",
+    }),
+    "Estimated peak memory is 5.1 GiB, above the 5.0 GiB safety budget. Lower the height or complexity.",
   );
   assert.equal(
     translate("ja-JP", "heightUnlock.body", { vanilla: 384, maximum: 2032 }),

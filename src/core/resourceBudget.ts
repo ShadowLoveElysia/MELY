@@ -1,6 +1,6 @@
 import type { SolidFillMode } from "../types";
 
-export const DEFAULT_MEMORY_BUDGET_BYTES = 2 * 1024 ** 3;
+export const DEFAULT_MEMORY_BUDGET_BYTES = 5 * 1024 ** 3;
 export const MAX_FILLED_VOXEL_VOLUME = 12_000_000;
 export const MAX_PROJECTION_BLOCKS = 320_000;
 export const MAX_HOLOGRAM_CANDIDATES = 1_280_000;
@@ -24,11 +24,13 @@ export interface ResourceEstimate {
   estimatedCandidates: number;
   allowed: boolean;
   reason: "ok" | "memory" | "volume" | "blocks" | "candidates";
+  requiresConfirmation: boolean;
+  risks: Exclude<ResourceEstimate["reason"], "ok">[];
 }
 
 const finiteInteger = (value: number) => Math.max(0, Math.floor(Number.isFinite(value) ? value : 0));
 
-/** 与全息生成器一致：闭合网格的内部格点会先自适应降采样到安全预算。 */
+/** 与全息生成器一致：先计算自适应稀疏步长，再保留未裁剪候选数用于风险提示。 */
 export const estimateSparseHologramInterior = (
   width: number,
   height: number,
@@ -44,10 +46,7 @@ export const estimateSparseHologramInterior = (
   const sampledWidth = Math.ceil(finiteInteger(width) / stride);
   const sampledHeight = Math.ceil(finiteInteger(height) / stride);
   const sampledDepth = Math.ceil(finiteInteger(depth) / stride);
-  const candidateCount = Math.min(
-    MAX_HOLOGRAM_CANDIDATES,
-    sampledWidth * sampledHeight * sampledDepth,
-  );
+  const candidateCount = sampledWidth * sampledHeight * sampledDepth;
   return {
     stride,
     candidateCount,
@@ -74,13 +73,10 @@ export const estimateVoxelizationResources = (
   const interior = input.fillMode === "shell"
     ? estimateSparseHologramInterior(width, height, depth, density)
     : { candidateCount: 0, selectedCount: 0 };
-  const contourCandidates = hologramBudgeted && input.candidateCount === undefined
-    ? Math.min(baseBlocks, MAX_PROJECTION_BLOCKS)
-    : baseBlocks;
-  // 生成器不会输出超过硬上限的结果；未提供已测候选数时，
-  // 按轮廓与内部稀疏计划估算候选内存，最终块数上界取硬限。
+  const contourCandidates = baseBlocks;
+  // 建议阈值只用于风险提示；估算必须保留真实数量，否则会漏掉超限确认。
   const estimatedBlocks = hologramBudgeted && input.candidateCount === undefined
-    ? Math.min(MAX_PROJECTION_BLOCKS, contourCandidates + interior.selectedCount)
+    ? contourCandidates + interior.selectedCount
     : baseBlocks + interior.selectedCount;
   const candidateCount = finiteInteger(input.candidateCount ?? (
     input.fillMode === "shell" ? contourCandidates + interior.candidateCount : baseBlocks
@@ -102,20 +98,22 @@ export const estimateVoxelizationResources = (
   const exceedsAddressableVolume = input.fillMode === "filled" && volume > MAX_FILLED_VOXEL_VOLUME;
   const exceedsBlocks = hologramBudgeted && estimatedBlocks > MAX_PROJECTION_BLOCKS;
   const exceedsCandidates = hologramBudgeted && candidateCount > MAX_HOLOGRAM_CANDIDATES;
-  const reason = exceedsAddressableVolume
-    ? "volume"
-    : exceedsBlocks
-      ? "blocks"
-      : exceedsCandidates
-        ? "candidates"
-        : estimatedBytes > memoryBudgetBytes ? "memory" : "ok";
+  const risks: ResourceEstimate["risks"] = [];
+  if (exceedsAddressableVolume) risks.push("volume");
+  if (exceedsBlocks) risks.push("blocks");
+  if (exceedsCandidates) risks.push("candidates");
+  if (estimatedBytes > memoryBudgetBytes) risks.push("memory");
+  const reason = risks[0] ?? "ok";
   return {
     estimatedBytes,
     estimatedVoxelVolume: volume,
     estimatedBlocks,
     estimatedCandidates: candidateCount,
-    allowed: reason === "ok",
+    // 超预算只触发用户风险确认，不得替代用户拒绝可执行任务。
+    allowed: true,
     reason,
+    requiresConfirmation: risks.length > 0,
+    risks,
   };
 };
 
