@@ -50,7 +50,16 @@ test("Windows release builds reuse local dependencies without weakening CI insta
   assert.match(builder, /Set-BuildStage "Rust release compilation"/);
   assert.match(builder, /Invoke-Native \$cargo @\([\s\S]*"build"[\s\S]*"--locked"[\s\S]*"--release"[\s\S]*"--bins"[\s\S]*\)/);
   assert.match(builder, /verify-native-real-4064\.exe/);
+  assert.match(builder, /function Get-RequiredBuildArtifact/);
+  assert.match(builder, /MELY_\$\{version\}_x64-setup\.exe/);
+  assert.match(builder, /if \(\$artifact\.Length -le 0\)/);
+  assert.doesNotMatch(builder, /Get-ChildItem[\s\S]*-Filter "\*\.exe"/);
   assert.match(builder, /\[\$script:buildStage\]/);
+  assert.match(builder, /mely-typescript-tests\.tap/);
+  assert.match(builder, /--test-reporter-destination=stdout/);
+  assert.match(builder, /The tests directory was not found/);
+  assert.match(builder, /contains no \*\.test\.ts files/);
+  assert.doesNotMatch(builder, /Continuing without tests/);
   assert.match(validation, /node\.exe" "scripts\\version\.mjs" sync/);
   assert.match(validation, /node\.exe" "scripts\\version\.mjs" check/);
   assert.doesNotMatch(builder, /Version configuration mismatch/);
@@ -59,6 +68,18 @@ test("Windows release builds reuse local dependencies without weakening CI insta
       < builder.indexOf("$versionManifest = Get-Content"),
     "The release builder must synchronize derived versions before reading the artifact version.",
   );
+});
+
+test("Windows workflows preserve TypeScript diagnostics after failed builds", async () => {
+  for (const workflowPath of [
+    ".github/workflows/dev-release.yml",
+    ".github/workflows/release.yml",
+  ]) {
+    const workflow = await readProjectFile(workflowPath);
+    assert.match(workflow, /name: Preserve build diagnostics/);
+    assert.match(workflow, /if: \$\{\{ always\(\) \}\}/);
+    assert.match(workflow, /mely-typescript-tests\.tap/);
+  }
 });
 
 test("Tauri desktop shell uses v2 configuration and bundled Web assets", async () => {

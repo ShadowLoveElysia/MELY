@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const app = readFileSync("src/App.tsx", "utf8");
+// 源码合同必须在 Windows CRLF 与 Git LF 检出中保持相同语义。
+const app = readFileSync("src/App.tsx", "utf8").replace(/\r\n?/g, "\n");
 
 test("App owns material selection and forwards the common renderer contract", () => {
   assert.match(

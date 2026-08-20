@@ -33,7 +33,7 @@ test("production transport keeps JSON arguments and raw request bytes on separat
   assert.ok(calls[1]?.args instanceof Uint8Array);
 });
 
-test("raw-response transport accepts only one top-level Uint8Array envelope", async () => {
+test("raw-response transport normalizes Tauri ArrayBuffer envelopes to Uint8Array", async () => {
   const envelope = new Uint8Array([0x4d, 0x4c, 0x59, 0x52]);
   const args = { handle: { id: "7", generation: "3" }, maxBytes: 8 * 1024 * 1024 };
   const calls: Array<{ command: string; args: unknown }> = [];
@@ -46,13 +46,19 @@ test("raw-response transport accepts only one top-level Uint8Array envelope", as
 
   assert.equal(response, envelope);
   assert.deepEqual(calls, [{ command: "pull_solid_voxel_chunks", args }]);
+
+  const arrayBufferTransport = createTauriSolidVoxelTransport(coreApi(async () => (
+    envelope.buffer.slice(envelope.byteOffset, envelope.byteOffset + envelope.byteLength) as never
+  )));
+  const normalized = await arrayBufferTransport.invokeRawResponse("pull_solid_voxel_chunks", args);
+  assert.ok(normalized instanceof Uint8Array);
+  assert.deepEqual([...normalized], [...envelope]);
 });
 
 test("raw-response transport fails closed instead of fabricating metadata plus bytes", async () => {
   const invalidResponses: unknown[] = [
     { bytes: new Uint8Array([1]), cursor: "opaque", done: false },
     [1, 2, 3],
-    new ArrayBuffer(3),
     null,
   ];
 
@@ -64,7 +70,7 @@ test("raw-response transport fails closed instead of fabricating metadata plus b
         assert.ok(error instanceof TauriSolidVoxelClientError);
         assert.equal(error.kind, "protocol");
         assert.equal(error.command, "pull_solid_voxel_chunks");
-        assert.match(error.message, /top-level Uint8Array/);
+        assert.match(error.message, /top-level byte buffer/);
         assert.match(error.message, /metadata.*binary envelope/);
         return true;
       },

@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
+const readSource = (path: string) => readFileSync(path, "utf8").replace(/\r\n?/g, "\n");
+
 test("project bundle extras are opt-in and forwarded to the exporter", () => {
-  const source = readFileSync("src/App.tsx", "utf8");
+  const source = readSource("src/App.tsx");
 
   assert.match(source, /includeSchematic:\s*false/);
   assert.match(source, /includeMcstructure:\s*false/);
@@ -19,7 +21,7 @@ test("project bundle extras are opt-in and forwarded to the exporter", () => {
 });
 
 test("single projection exports use the canonical litematic extension and facial enhancement starts disabled", () => {
-  const source = readFileSync("src/App.tsx", "utf8");
+  const source = readSource("src/App.tsx");
 
   assert.match(source, /faceDetail:\s*"off"/);
   const branch = source.match(

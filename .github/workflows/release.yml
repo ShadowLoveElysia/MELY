@@ -78,6 +78,16 @@ jobs:
         shell: pwsh
         run: ./scripts/build-windows-release.ps1 -Channel release
 
+      - name: Preserve build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: MELY-${{ steps.version.outputs.version }}-windows-x64-diagnostics
+          if-no-files-found: ignore
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/mely-typescript-tests.tap
+
       - name: Preserve workflow artifacts
         uses: actions/upload-artifact@v7
         with:

@@ -29,10 +29,16 @@ const defaultCoreLoader: TauriSolidVoxelCoreLoader = async () => {
 
 const requireRawResponse = (command: string, response: unknown): Uint8Array => {
   if (response instanceof Uint8Array) return response;
+  // Tauri v2 的二进制 IPC 在 WebView 中通过 arrayBuffer() 或
+  // `new Uint8Array(...).buffer` 回传，不能假定结果仍是 Uint8Array。
+  if (response instanceof ArrayBuffer) return new Uint8Array(response);
+  if (ArrayBuffer.isView(response)) {
+    return new Uint8Array(response.buffer, response.byteOffset, response.byteLength);
+  }
   throw new TauriSolidVoxelClientError(
     "protocol",
     command,
-    "Raw Tauri responses must be a top-level Uint8Array. Encode metadata, cursor and bytes "
+    "Raw Tauri responses must be a top-level byte buffer. Encode metadata, cursor and bytes "
       + "inside one versioned binary envelope; Tauri v2 invoke does not provide a portable "
       + "metadata-plus-bytes response contract.",
   );

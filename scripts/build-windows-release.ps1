@@ -261,6 +261,22 @@ function Get-Sha256Line {
   return "$hash  $DisplayName"
 }
 
+function Get-RequiredBuildArtifact {
+  param(
+    [string]$Path,
+    [string]$Description
+  )
+
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    throw "$Description was not produced: $Path"
+  }
+  $artifact = Get-Item -LiteralPath $Path
+  if ($artifact.Length -le 0) {
+    throw "$Description is empty: $Path"
+  }
+  return $artifact
+}
+
 Set-Location -LiteralPath $projectRoot
 
 Set-BuildStage "version synchronization"
@@ -413,17 +429,26 @@ if (-not $SkipTests) {
   Set-BuildStage "TypeScript test suite"
   $testsRoot = Join-Path $projectRoot "tests"
   if (-not (Test-Path -LiteralPath $testsRoot)) {
-    New-Item -ItemType Directory -Path $testsRoot -Force | Out-Null
-    Write-Host "[MELY] Created missing tests directory: $testsRoot"
+    throw "The tests directory was not found: $testsRoot"
   }
   $testFiles = Get-ChildItem -LiteralPath $testsRoot -Filter "*.test.ts" -File |
     Sort-Object Name |
     Select-Object -ExpandProperty FullName
   if ($testFiles) {
     $testArguments = @("--import", "tsx", "--test", "--test-concurrency=1") + @($testFiles)
+    if ($env:RUNNER_TEMP) {
+      $testReport = Join-Path $env:RUNNER_TEMP "mely-typescript-tests.tap"
+      $testArguments = @(
+        "--test-reporter=tap",
+        "--test-reporter-destination=stdout",
+        "--test-reporter=tap",
+        "--test-reporter-destination=$testReport"
+      ) + $testArguments
+      Write-Host "[MELY] TypeScript TAP report: $testReport"
+    }
     Invoke-Native $node $testArguments
   } else {
-    Write-Warning "The tests directory contains no *.test.ts files. Continuing without tests."
+    throw "The tests directory contains no *.test.ts files: $testsRoot"
   }
 }
 
@@ -443,9 +468,7 @@ try {
   )
 
   $nativeVerifier = Join-Path $projectRoot "src-tauri\target\release\verify-native-real-4064.exe"
-  if (-not (Test-Path -LiteralPath $nativeVerifier)) {
-    throw "Rust native verifier was not produced: $nativeVerifier"
-  }
+  Get-RequiredBuildArtifact $nativeVerifier "Rust native verifier" | Out-Null
 
   Set-BuildStage "Tauri desktop packaging"
   Write-Utf8File $tauriOverride '{"build":{"beforeBuildCommand":""},"bundle":{"targets":["nsis"]}}'
@@ -461,17 +484,9 @@ try {
 }
 
 $builtExecutable = Join-Path $projectRoot "src-tauri\target\release\mely.exe"
-$installerSource = Get-ChildItem -LiteralPath (Join-Path $projectRoot "src-tauri\target\release\bundle\nsis") `
-  -Filter "*.exe" -File |
-  Sort-Object LastWriteTimeUtc -Descending |
-  Select-Object -First 1
-
-if (-not (Test-Path -LiteralPath $builtExecutable)) {
-  throw "Tauri did not produce the expected desktop executable."
-}
-if (-not $installerSource) {
-  throw "Tauri did not produce an NSIS installer."
-}
+$installerSourcePath = Join-Path $projectRoot "src-tauri\target\release\bundle\nsis\MELY_${version}_x64-setup.exe"
+$builtExecutableArtifact = Get-RequiredBuildArtifact $builtExecutable "Tauri desktop executable"
+$installerSource = Get-RequiredBuildArtifact $installerSourcePath "Tauri NSIS installer"
 
 $artifactVersion = if ($Channel -eq "dev") { "dev" } else { $version }
 $artifactPrefix = "MELY-$artifactVersion-windows-x64"
@@ -487,7 +502,7 @@ $checksumsOutput = Join-Path $releaseRoot ($artifactPrefix + "-SHA256SUMS.txt")
 
 New-Item -ItemType Directory -Force -Path $releaseRoot, $portableRoot | Out-Null
 try {
-  Copy-Item -LiteralPath $builtExecutable -Destination $portableExecutable -Force
+  Copy-Item -LiteralPath $builtExecutableArtifact.FullName -Destination $portableExecutable -Force
   Copy-Item -LiteralPath $installerSource.FullName -Destination $installerOutput -Force
 
   $portableNotes = @"
