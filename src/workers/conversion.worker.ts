@@ -6,6 +6,7 @@ import { workerErrorDescriptor } from "../core/appError";
 import { assertWorkerResources } from "../core/workerResourcePreflight";
 import { projectionResultTransferables } from "../core/workerResultTransfer";
 import { assertWorkerGenerationHeight, assertWorkerResultHeight } from "../core/workerHeightPreflight";
+import { createPerformanceTelemetryRecorder } from "../core/performanceTelemetry";
 import type { MmdMeshSnapshot, WorkerCommand, WorkerEvent, WorkerStage } from "../types";
 
 const send = (event: WorkerEvent, transfer: Transferable[] = []) => {
@@ -28,18 +29,37 @@ const releaseInputMesh = (mesh: MmdMeshSnapshot) => {
 self.onmessage = (message: MessageEvent<WorkerCommand>) => {
   const command = message.data;
   const sourceMesh = command.source.kind === "mesh" ? command.source.mesh : undefined;
+  const telemetry = createPerformanceTelemetryRecorder({
+    scope: "production-ui",
+    workflow: "generation",
+    backend: "web-worker",
+    generationMode: command.type === "GENERATE_SOLID" ? "solid" : "hologram",
+    targetHeight: command.options.targetHeight,
+    workerThreads: 1,
+  });
 
   try {
-    assertWorkerGenerationHeight(command);
-    const resources = assertWorkerResources(command);
+    const resources = telemetry.measure("preflight", () => {
+      assertWorkerGenerationHeight(command);
+      return assertWorkerResources(command);
+    });
     const progress = (stage: WorkerStage, value: number) => {
       send({ type: "PROGRESS", jobId: command.jobId, stage, progress: value });
     };
     let result;
     if (command.type === "GENERATE_SOLID") {
-      result = generateSolidVoxels(command.source.mesh, command.options, progress, {
-        workEstimate: resources.solidWorkEstimate,
-      });
+      // 当前 TS 回退路径在同一热循环完成 SAT、UV、纹理与 Alpha；拆成虚假子阶段会污染基线。
+      result = telemetry.measure("voxelization.total", () => generateSolidVoxels(
+        command.source.mesh,
+        command.options,
+        progress,
+        { workEstimate: resources.solidWorkEstimate },
+      ), (generated) => ({
+        triangleCount: command.source.mesh.indices.length / 3,
+        candidateChecks: generated.stats.triangleBoxTests,
+        blockCount: generated.stats.blockCount,
+        chunkCount: generated.chunks?.length ?? 0,
+      }));
     } else if (command.source.kind === "mesh") {
       if (
         !command.generationSeed
@@ -61,7 +81,7 @@ self.onmessage = (message: MessageEvent<WorkerCommand>) => {
     assertWorkerResultHeight(command, result);
     send({ type: "PROGRESS", jobId: command.jobId, stage: "complete", progress: 1 });
     send(
-      { type: "RESULT", jobId: command.jobId, result },
+      { type: "RESULT", jobId: command.jobId, result, telemetry: telemetry.report() },
       projectionResultTransferables(result),
     );
   } catch (error) {
@@ -71,6 +91,7 @@ self.onmessage = (message: MessageEvent<WorkerCommand>) => {
       jobId: command.jobId,
       code: descriptor.code,
       params: descriptor.params,
+      telemetry: telemetry.report(),
     });
   } finally {
     if (sourceMesh) releaseInputMesh(sourceMesh);

@@ -133,9 +133,11 @@ interface DecodedRegionSummary {
   size: Point;
   volume: number;
   paletteSize: number;
+  canonicalPalette: string[];
   nonAirBlocks: number;
   minimum: Point | null;
   maximum: Point | null;
+  semanticSha256: string;
 }
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -656,6 +658,81 @@ const intValue = (value: unknown, context: string) => {
   return primitive;
 };
 
+const stringValue = (value: unknown, context: string) => {
+  const primitive = value && typeof value === "object" && "valueOf" in value
+    ? (value as { valueOf: () => unknown }).valueOf()
+    : value;
+  if (typeof primitive !== "string") {
+    throw new TypeError(`${context} is not an NBT string`);
+  }
+  return primitive;
+};
+
+const canonicalBlockState = (value: unknown, context: string) => {
+  if (!value || typeof value !== "object") {
+    throw new TypeError(`${context} is not an NBT compound`);
+  }
+  const state = value as Record<string, unknown>;
+  const name = stringValue(state.Name, `${context}.Name`);
+  if (state.Properties === undefined) return name;
+  if (!state.Properties || typeof state.Properties !== "object") {
+    throw new TypeError(`${context}.Properties is not an NBT compound`);
+  }
+  const properties = Object.entries(state.Properties as Record<string, unknown>)
+    .map(([key, property]) => [key, stringValue(property, `${context}.Properties.${key}`)] as const)
+    .sort(([left], [right]) => left.localeCompare(right, "en-US"));
+  return properties.length === 0
+    ? name
+    : `${name}[${properties.map(([key, property]) => `${key}=${property}`).join(",")}]`;
+};
+
+const createRegionSemanticHasher = (
+  position: Point,
+  size: Point,
+  palette: unknown[],
+) => {
+  const canonicalPalette = palette.map((state, index) => (
+    canonicalBlockState(state, `BlockStatePalette[${index}]`)
+  ));
+  assert.equal(canonicalPalette[0], "minecraft:air", "Litematic palette index 0 must be air");
+  const canonicalStates = [...new Set(canonicalPalette)].sort((left, right) => (
+    left.localeCompare(right, "en-US")
+  ));
+  const canonicalIndices = canonicalPalette.map((state) => canonicalStates.indexOf(state));
+  const hash = createHash("sha256");
+  hash.update(JSON.stringify({ position, size, states: canonicalStates }));
+
+  // 固定宽度批量记录避免对数千万方块逐个创建 Buffer 或调用 hash.update。
+  const recordsPerBatch = 4_096;
+  const recordSize = 12;
+  const batch = new Uint8Array(recordsPerBatch * recordSize);
+  const view = new DataView(batch.buffer);
+  let batchLength = 0;
+  const flush = () => {
+    if (batchLength === 0) return;
+    hash.update(batch.subarray(0, batchLength));
+    batchLength = 0;
+  };
+  const append = (linearIndex: number, paletteIndex: number) => {
+    const canonicalIndex = canonicalIndices[paletteIndex];
+    if (canonicalIndex === undefined) {
+      throw new RangeError(`Palette index ${paletteIndex} is outside BlockStatePalette`);
+    }
+    if (batchLength + recordSize > batch.byteLength) flush();
+    view.setBigUint64(batchLength, BigInt(linearIndex), false);
+    view.setUint32(batchLength + 8, canonicalIndex, false);
+    batchLength += recordSize;
+  };
+  return {
+    canonicalPalette,
+    append,
+    digest: () => {
+      flush();
+      return hash.digest("hex");
+    },
+  };
+};
+
 const pointTag = (value: unknown, context: string): Point => {
   if (!value || typeof value !== "object") throw new TypeError(`${context} is not an NBT compound`);
   const compound = value as Record<string, unknown>;
@@ -719,6 +796,11 @@ const decodeLitematic = (bytes: Uint8Array) => {
     const bitsPerBlock = Math.max(2, Math.ceil(Math.log2(Math.max(1, palette.length))));
     const volume = size[0] * size[1] * size[2];
     if (!Number.isSafeInteger(volume)) throw new RangeError(`Region ${name} volume exceeds safe arithmetic`);
+    const semantic = createRegionSemanticHasher(
+      position,
+      size,
+      palette,
+    );
     const regionMinimum: Point = [Infinity, Infinity, Infinity];
     const regionMaximum: Point = [-Infinity, -Infinity, -Infinity];
     let nonAirBlocks = 0;
@@ -726,6 +808,7 @@ const decodeLitematic = (bytes: Uint8Array) => {
       const paletteIndex = unpackPaletteIndex(packed, linearIndex, bitsPerBlock);
       if (paletteIndex === 0) continue;
       if (!palette[paletteIndex]) throw new RangeError(`Region ${name} references palette ${paletteIndex}`);
+      semantic.append(linearIndex, paletteIndex);
       const x = linearIndex % size[0];
       const yz = Math.floor(linearIndex / size[0]);
       const z = yz % size[2];
@@ -742,10 +825,30 @@ const decodeLitematic = (bytes: Uint8Array) => {
       size,
       volume,
       paletteSize: palette.length,
+      canonicalPalette: semantic.canonicalPalette,
       nonAirBlocks,
       minimum: nonAirBlocks > 0 ? regionMinimum : null,
       maximum: nonAirBlocks > 0 ? regionMaximum : null,
+      semanticSha256: semantic.digest(),
     });
+  }
+  const semanticHash = createHash("sha256");
+  const semanticRegions = [...regionSummaries]
+    .sort((left, right) => (
+      left.position[1] - right.position[1]
+      || left.position[2] - right.position[2]
+      || left.position[0] - right.position[0]
+      || left.size[1] - right.size[1]
+      || left.size[2] - right.size[2]
+      || left.size[0] - right.size[0]
+    ));
+  for (const region of semanticRegions) {
+    // Region 名称不属于投影语义，避免仅命名差异导致 parity 误报。
+    semanticHash.update(JSON.stringify({
+      position: region.position,
+      size: region.size,
+      semanticSha256: region.semanticSha256,
+    }));
   }
   return {
     version: intValue(root.Version, "Version"),
@@ -759,6 +862,7 @@ const decodeLitematic = (bytes: Uint8Array) => {
     totalNonAirBlocks,
     minimum: totalNonAirBlocks > 0 ? minimum : null,
     maximum: totalNonAirBlocks > 0 ? maximum : null,
+    semanticSha256: semanticHash.digest("hex"),
     regions: regionSummaries,
   };
 };
@@ -1164,6 +1268,8 @@ export {
   createSnapshot,
   decodeLitematic,
   exportSafety,
+  parsePmx,
+  pmxEntries,
   selectPmxEntry,
   solidOptions,
   worldContractReport,

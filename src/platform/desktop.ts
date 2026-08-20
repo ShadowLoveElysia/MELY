@@ -93,6 +93,18 @@ export const saveBytesWithDesktopDialog = async (
     : false
 );
 
+/** 仅选择桌面端保存路径；实际写入可由持有原生结果句柄的 Rust command 完成。 */
+export const selectDesktopSavePath = async (
+  options: DesktopSaveOptions = {},
+): Promise<string | null> => {
+  if (!isDesktopRuntime()) return null;
+  try {
+    return await save(options);
+  } catch (error) {
+    throw appError("error.desktop.selectSavePath", undefined, error);
+  }
+};
+
 const writeCompleteChunk = async (
   handle: Pick<FileHandle, "write">,
   chunk: Uint8Array,

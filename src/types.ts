@@ -1,4 +1,5 @@
 import type { AppErrorCode } from "./core/appError";
+import type { PerformanceTelemetryReport } from "./core/performanceTelemetry";
 import type {
   ExtremeHeightConfirmationState,
   HeightDimension,
@@ -370,10 +371,12 @@ export type WorkerEvent =
       type: "RESULT";
       jobId: string;
       result: ProjectionResult;
+      telemetry?: PerformanceTelemetryReport;
     }
   | {
       type: "ERROR";
       jobId: string;
       code: AppErrorCode;
       params?: Record<string, string | number>;
+      telemetry?: PerformanceTelemetryReport;
     };

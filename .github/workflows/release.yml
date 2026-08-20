@@ -27,6 +27,9 @@ jobs:
       github.event.release.draft == false)
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
 
     steps:
       - name: Check out the published release tag
@@ -52,8 +55,13 @@ jobs:
         shell: pwsh
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed with exit code $LASTEXITCODE" }
           rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw "rustup default failed with exit code $LASTEXITCODE" }
           rustup target add x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "rustup target add failed with exit code $LASTEXITCODE" }
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { throw "rustup could not report the active toolchain" }
 
       - name: Cache Rust build data
         uses: actions/cache@v5

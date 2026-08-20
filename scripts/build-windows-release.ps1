@@ -13,6 +13,14 @@ $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $releaseRoot = Join-Path $projectRoot "release"
+$script:buildStage = "initialization"
+
+function Set-BuildStage {
+  param([string]$Name)
+
+  $script:buildStage = $Name
+  Write-Host "[MELY] Stage: $Name"
+}
 
 function Resolve-Tool {
   param(
@@ -51,7 +59,8 @@ function Invoke-Native {
     if ($ArgumentList.Count -gt 0) { $options.ArgumentList = $ArgumentList }
     $process = Start-Process @options
     if ($process.ExitCode -ne 0) {
-      throw "Command failed with exit code $($process.ExitCode): $FilePath"
+      $command = "$FilePath $($ArgumentList -join ' ')".TrimEnd()
+      throw "[$script:buildStage] Command failed with exit code $($process.ExitCode): $command"
     }
     return
   }
@@ -79,7 +88,8 @@ function Invoke-Native {
   $exitCode = $process.ExitCode
   $process.Dispose()
   if ($exitCode -ne 0) {
-    throw "Command failed with exit code ${exitCode}: $FilePath"
+    $command = "$FilePath $($ArgumentList -join ' ')".TrimEnd()
+    throw "[$script:buildStage] Command failed with exit code ${exitCode}: $command"
   }
 }
 
@@ -110,7 +120,8 @@ function Get-NativeOutput {
       Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
     } else { "" }
     if ($process.ExitCode -ne 0) {
-      throw "Command failed with exit code $($process.ExitCode): $FilePath`n$stderr"
+      $command = "$FilePath $($ArgumentList -join ' ')".TrimEnd()
+      throw "[$script:buildStage] Command failed with exit code $($process.ExitCode): $command`n$stderr"
     }
     return [string]$stdout
   } finally {
@@ -252,6 +263,7 @@ function Get-Sha256Line {
 
 Set-Location -LiteralPath $projectRoot
 
+Set-BuildStage "version synchronization"
 $node = Resolve-Tool "node.exe" @(
   "$env:ProgramFiles\nodejs\node.exe",
   "$env:LOCALAPPDATA\Programs\nodejs\node.exe"
@@ -278,6 +290,10 @@ if (-not (Test-Path -LiteralPath $npmCli)) {
 }
 $cargo = Resolve-Tool "cargo.exe" @("$env:USERPROFILE\.cargo\bin\cargo.exe")
 $rustc = Resolve-Tool "rustc.exe" @("$env:USERPROFILE\.cargo\bin\rustc.exe")
+$rustManifest = Join-Path $projectRoot "src-tauri\Cargo.toml"
+if (-not (Test-Path -LiteralPath $rustManifest)) {
+  throw "Rust manifest was not found: $rustManifest"
+}
 
 $nodeVersionText = (Get-NativeOutput $node @("--version")).Trim().TrimStart("v")
 if (-not $nodeVersionText) {
@@ -327,6 +343,7 @@ $installDependencies =
   -not $SkipInstall -and
   ($RefreshDependencies -or $Channel -ne "local" -or -not $dependenciesReady)
 if ($installDependencies) {
+  Set-BuildStage "Node dependency installation"
   $npmWrapper = Join-Path $env:TEMP ("mely-npm-ci-" + [Guid]::NewGuid().ToString("N") + ".cmd")
   try {
     $npmArguments = "ci --no-audit --no-fund"
@@ -370,9 +387,30 @@ if (-not (Test-Path -LiteralPath $typescriptCli) -or -not (Test-Path -LiteralPat
   throw "TypeScript or Vite dependencies are missing. Run npm ci or omit -SkipInstall."
 }
 
+Set-BuildStage "TypeScript typecheck"
 Invoke-Native $node @($versionScript, "check")
 Invoke-Native $node @($typescriptCli, "-b")
+
+Set-BuildStage "Rust test suite"
+Invoke-Native $cargo @(
+  "test",
+  "--locked",
+  "--manifest-path",
+  $rustManifest,
+  "--lib"
+)
+Set-BuildStage "Rust validation runner tests"
+Invoke-Native $cargo @(
+  "test",
+  "--locked",
+  "--manifest-path",
+  $rustManifest,
+  "--bin",
+  "verify-native-real-4064"
+)
+
 if (-not $SkipTests) {
+  Set-BuildStage "TypeScript test suite"
   $testsRoot = Join-Path $projectRoot "tests"
   if (-not (Test-Path -LiteralPath $testsRoot)) {
     New-Item -ItemType Directory -Path $testsRoot -Force | Out-Null
@@ -388,10 +426,28 @@ if (-not $SkipTests) {
     Write-Warning "The tests directory contains no *.test.ts files. Continuing without tests."
   }
 }
+
+Set-BuildStage "Web production build"
 Invoke-Native $node @($viteCli, "build", "--config", "vite.config.ts")
 
 $tauriOverride = Join-Path $env:TEMP ("mely-tauri-release-" + [Guid]::NewGuid().ToString("N") + ".json")
 try {
+  Set-BuildStage "Rust release compilation"
+  Invoke-Native $cargo @(
+    "build",
+    "--locked",
+    "--release",
+    "--manifest-path",
+    $rustManifest,
+    "--bins"
+  )
+
+  $nativeVerifier = Join-Path $projectRoot "src-tauri\target\release\verify-native-real-4064.exe"
+  if (-not (Test-Path -LiteralPath $nativeVerifier)) {
+    throw "Rust native verifier was not produced: $nativeVerifier"
+  }
+
+  Set-BuildStage "Tauri desktop packaging"
   Write-Utf8File $tauriOverride '{"build":{"beforeBuildCommand":""},"bundle":{"targets":["nsis"]}}'
   Invoke-Native $node @(
     $tauriCli,

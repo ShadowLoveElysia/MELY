@@ -43,6 +43,14 @@ test("Windows release builds reuse local dependencies without weakening CI insta
   assert.match(builder, /Reusing installed dependencies for the local build/);
   assert.match(builder, /Invoke-Native \$node @\(\$versionScript, "sync"\)/);
   assert.match(builder, /Invoke-Native \$node @\(\$versionScript, "check"\)/);
+  assert.match(builder, /Set-BuildStage "Rust test suite"/);
+  assert.match(builder, /Invoke-Native \$cargo @\([\s\S]*"test"[\s\S]*"--locked"[\s\S]*"--manifest-path"[\s\S]*"--lib"[\s\S]*\)/);
+  assert.match(builder, /Set-BuildStage "Rust validation runner tests"/);
+  assert.match(builder, /Invoke-Native \$cargo @\([\s\S]*"test"[\s\S]*"--locked"[\s\S]*"--manifest-path"[\s\S]*"--bin"[\s\S]*"verify-native-real-4064"[\s\S]*\)/);
+  assert.match(builder, /Set-BuildStage "Rust release compilation"/);
+  assert.match(builder, /Invoke-Native \$cargo @\([\s\S]*"build"[\s\S]*"--locked"[\s\S]*"--release"[\s\S]*"--bins"[\s\S]*\)/);
+  assert.match(builder, /verify-native-real-4064\.exe/);
+  assert.match(builder, /\[\$script:buildStage\]/);
   assert.match(validation, /node\.exe" "scripts\\version\.mjs" sync/);
   assert.match(validation, /node\.exe" "scripts\\version\.mjs" check/);
   assert.doesNotMatch(builder, /Version configuration mismatch/);

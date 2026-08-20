@@ -46,6 +46,10 @@ import type {
 } from "../types";
 import type { JavaVersionProfile } from "../core/minecraftVersions";
 import { Field, Select, Slider, Toggle } from "./Controls";
+import {
+  PerformanceSettings,
+  type PerformanceSettingsCapabilities,
+} from "./PerformanceSettings";
 import { Section } from "./Section";
 
 interface ImportedAsset {
@@ -98,6 +102,11 @@ interface SidebarProps {
   physicsAvailable: boolean;
   physicsEnabled: boolean;
   physicsLoading: boolean;
+  performanceCapabilities: PerformanceSettingsCapabilities;
+  performanceMode: "auto" | "manual";
+  configuredWorkerThreads: number;
+  activeWorkerThreads: number | null;
+  nativeSolidVoxelJobAvailable: boolean;
   onOptionsChange: (patch: Partial<HologramOptions>) => void;
   onSolidOptionsChange: (patch: Partial<SolidOptions>) => void;
   onGenerationModeChange: (mode: GenerationMode) => void;
@@ -129,6 +138,8 @@ interface SidebarProps {
     height?: number | null;
     placementBottomY?: number | null;
   }) => void;
+  onWorkerThreadsChange: (threads: number) => void;
+  onRestoreAutomaticWorkerThreads: () => void;
 }
 
 export function Sidebar({
@@ -174,6 +185,11 @@ export function Sidebar({
   physicsAvailable,
   physicsEnabled,
   physicsLoading,
+  performanceCapabilities,
+  performanceMode,
+  configuredWorkerThreads,
+  activeWorkerThreads,
+  nativeSolidVoxelJobAvailable,
   onOptionsChange,
   onSolidOptionsChange,
   onGenerationModeChange,
@@ -201,6 +217,8 @@ export function Sidebar({
   onExtendedHeightToggle,
   onExperimentalHeightUnlock,
   onTargetDimensionChange,
+  onWorkerThreadsChange,
+  onRestoreAutomaticWorkerThreads,
 }: SidebarProps) {
   const { t, number } = useI18n();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1105,6 +1123,16 @@ export function Sidebar({
                   onChange={(excludeRare) => onSolidOptionsChange({ excludeRare })}
                 />
               </Field>
+              <PerformanceSettings
+                capabilities={performanceCapabilities}
+                mode={performanceMode}
+                configuredThreads={configuredWorkerThreads}
+                activeThreads={activeWorkerThreads}
+                processing={processing}
+                nativeJobAvailable={nativeSolidVoxelJobAvailable}
+                onThreadsChange={onWorkerThreadsChange}
+                onRestoreAuto={onRestoreAutomaticWorkerThreads}
+              />
             </>
           )}
         </Section>

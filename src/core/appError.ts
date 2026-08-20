@@ -33,6 +33,7 @@ export const errorDescriptor = (
   ? { code: error.code, params: error.params }
   : fallback;
 
+/** 原生边界保留可安全展示的 command 错误信息，避免统一退化为“未知错误”。 */
 const WORKER_MEMORY_ERROR_PATTERNS = [
   /map maximum size/i,
   /invalid (?:array|typed array) length/i,

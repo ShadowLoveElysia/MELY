@@ -72,6 +72,7 @@ import {
   DEFAULT_MINECRAFT_VERSION,
   JAVA_VERSION_PROFILES,
   getJavaVersionProfile,
+  requireJavaCompatibilityProfile,
 } from "./core/minecraftVersions";
 import type {
   MmdModelCandidate,
@@ -110,6 +111,24 @@ import {
   assessGenerationResourceRisk,
   type GenerationResourceRiskAssessment,
 } from "./core/generationResourceRisk";
+import {
+  createAutoPerformancePreferences,
+  createManualPerformancePreferences,
+  createWebPerformanceCapabilities,
+  parsePerformancePreferences,
+  PERFORMANCE_PREFERENCES_STORAGE_KEY,
+  resolveNativeWorkerThreads,
+  serializePerformancePreferences,
+  type PerformanceCapabilities,
+  type PerformancePreferencesV1,
+} from "./core/performancePreferences";
+import {
+  assessNativeThreadRisk,
+  continueSelectedNativeThreadExecution,
+  useRecommendedNativeThreadExecution,
+  type NativeThreadExecutionSnapshot,
+  type NativeThreadRiskAssessment,
+} from "./core/nativeThreadRisk";
 import type { ExportBundlePhase, ExportBundleResourceEstimate } from "./core/exportBundle";
 import {
   createConversionWorkerLifecycle,
@@ -117,6 +136,18 @@ import {
 } from "./core/workerLifecycle";
 import { useI18n } from "./i18n/I18nProvider";
 import type { LocaleCode, TranslationKey } from "./i18n";
+import {
+  canRunNativeSolidOptions,
+  probeSolidVoxelBackend,
+  type SolidVoxelBackendProbeResult,
+} from "./platform/solidVoxelBackend";
+import {
+  runNativeSolidVoxelJob,
+  type NativeSolidVoxelCompletedOwnership,
+} from "./platform/nativeSolidVoxelRunOrchestrator";
+import {
+  TauriSolidVoxelClientError,
+} from "./platform/tauriSolidVoxelBackend";
 import type {
   CameraMode,
   GenerationMode,
@@ -353,7 +384,71 @@ interface PendingGenerationResourceRisk {
   configuration: GenerationResourceRiskConfiguration;
   resources: ResourceEstimate;
   assessment: GenerationResourceRiskAssessment;
+  nativeThreadExecutionSnapshot: NativeThreadExecutionSnapshot | null;
 }
+
+interface PendingThreadResourceRisk {
+  assessment: NativeThreadRiskAssessment;
+  mode: GenerationMode;
+  hologramOptions: HologramOptions;
+  solidOptions: SolidOptions;
+  acceptedResourceRiskFingerprint?: string;
+}
+
+const nativeResultConfigurationKey = (input: {
+  javaVersionId: string;
+  heightMode: HeightMode;
+  targetHeight: number;
+  targetDimensionMinY: number | null;
+  targetDimensionHeight: number | null;
+  placementBottomY: number | null;
+  projectionName: string;
+}) => JSON.stringify(input);
+
+const solidProjectionDocumentOptions = (input: {
+  javaVersionId: string;
+  heightMode: HeightMode;
+  targetHeight: number;
+  targetDimensionMinY: number | null;
+  targetDimensionHeight: number | null;
+  placementBottomY: number | null;
+  projectionName: string;
+}) => {
+  const profile = getJavaVersionProfile(input.javaVersionId);
+  const defaultDimension = profile?.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION;
+  const placementMetadata: Record<string, string | number | boolean> = input.heightMode === "default"
+    ? {
+        placementBottomY: defaultDimension.minY,
+        targetDimensionMinY: defaultDimension.minY,
+        targetDimensionMaxY: defaultDimension.minY + defaultDimension.height - 1,
+      }
+    : Number.isSafeInteger(input.targetDimensionMinY)
+      && Number.isSafeInteger(input.targetDimensionHeight)
+      && (input.targetDimensionHeight ?? 0) > 0
+      && Number.isSafeInteger(input.placementBottomY)
+      ? {
+          placementBottomY: input.placementBottomY!,
+          targetDimensionMinY: input.targetDimensionMinY!,
+          targetDimensionMaxY: input.targetDimensionMinY! + input.targetDimensionHeight! - 1,
+        }
+      : {};
+  return {
+    edition: "java" as const,
+    minecraftVersion: input.javaVersionId,
+    metadata: {
+      name: input.projectionName,
+      generator: "MELY",
+      targetHeight: input.targetHeight,
+      heightMode: input.heightMode,
+      datapackAcknowledged: input.heightMode !== "default",
+      ...placementMetadata,
+      heightDisclaimer: input.heightMode === "default"
+        ? ""
+        : "Requires a third-party height data pack matching the exact Java version and target dimension. MELY does not provide, install, validate, or endorse it.",
+      generationMode: "solid",
+    },
+  };
+};
 
 type ExtremeDialogStage = "unlock" | "environment" | null;
 type ExtremeDialogOrigin = "initial" | "reconfirm" | null;
@@ -485,6 +580,18 @@ const initialSidebarUiScale = () => {
     return SIDEBAR_UI_SCALES[0];
   }
 };
+
+const initialPerformancePreferences = (): PerformancePreferencesV1 => {
+  try {
+    return parsePerformancePreferences(window.localStorage.getItem(PERFORMANCE_PREFERENCES_STORAGE_KEY));
+  } catch {
+    return createAutoPerformancePreferences();
+  }
+};
+
+const initialPerformanceCapabilities = (): PerformanceCapabilities => createWebPerformanceCapabilities(
+  typeof navigator === "undefined" ? undefined : navigator.hardwareConcurrency,
+);
 
 const buildSurvivalLabels = (
   locale: LocaleCode,
@@ -661,6 +768,9 @@ export default function App() {
   translateRef.current = t;
   const workerLifecycleRef = useRef<ConversionWorkerLifecycle | null>(null);
   const currentJobRef = useRef<string>("");
+  const nativeRunAbortControllerRef = useRef<AbortController | null>(null);
+  const nativeResultOwnershipRef = useRef<NativeSolidVoxelCompletedOwnership | null>(null);
+  const nativeOwnershipCleanupPromiseRef = useRef<Promise<void>>(Promise.resolve());
   const modelLoadRequestRef = useRef<string>("");
   const modelRef = useRef<LoadedMmdModel | null>(null);
   const modelReleaseRef = useRef<Promise<void>>(Promise.resolve());
@@ -703,6 +813,10 @@ export default function App() {
   const lockedMotionFramesRef = useRef(emptyLockedMotionFrames());
   const [options, setOptions] = useState(initialOptions);
   const [solidOptions, setSolidOptions] = useState(initialSolidOptions);
+  const [performancePreferences, setPerformancePreferences] = useState(initialPerformancePreferences);
+  const [performanceCapabilities, setPerformanceCapabilities] = useState(initialPerformanceCapabilities);
+  const [solidVoxelBackendProbe, setSolidVoxelBackendProbe] = useState<SolidVoxelBackendProbeResult | null>(null);
+  const [activeWorkerThreads, setActiveWorkerThreads] = useState<number | null>(null);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("hologram");
   const [result, setResult] = useState<ProjectionResult | null>(null);
   const [assets, setAssets] = useState<ImportedAsset[]>([]);
@@ -786,10 +900,12 @@ export default function App() {
   const [extendedExportAcknowledged, setExtendedExportAcknowledged] = useState(false);
   const [pendingGenerationResourceRisk, setPendingGenerationResourceRisk] = useState<PendingGenerationResourceRisk | null>(null);
   const [generationResourceRiskAcknowledged, setGenerationResourceRiskAcknowledged] = useState(false);
+  const [pendingThreadResourceRisk, setPendingThreadResourceRisk] = useState<PendingThreadResourceRisk | null>(null);
   const [survivalToolsOpen, setSurvivalToolsOpen] = useState(false);
   const [survivalDocument, setSurvivalDocument] = useState<ProjectionDocument | null>(null);
   const survivalToolsTriggerRef = useRef<HTMLButtonElement>(null);
   const clearResourcesTriggerRef = useRef<HTMLButtonElement>(null);
+  const generateTriggerRef = useRef<HTMLButtonElement>(null);
   const [resetToken, setResetToken] = useState(0);
   const [focusFaceToken, setFocusFaceToken] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
@@ -834,6 +950,75 @@ export default function App() {
   });
   lockedMotionFramesRef.current = lockedMotionFrames;
 
+  const resolvedWorkerThreads = useMemo(
+    () => resolveNativeWorkerThreads(performancePreferences, performanceCapabilities),
+    [performanceCapabilities, performancePreferences],
+  );
+  const nativeSolidVoxelJobAvailable = Boolean(solidVoxelBackendProbe?.nativeJobAvailable);
+
+  const releaseNativeSolidVoxelOwnership = useCallback(async () => {
+    nativeRunAbortControllerRef.current?.abort();
+    nativeRunAbortControllerRef.current = null;
+    const previousCleanup = nativeOwnershipCleanupPromiseRef.current.catch(() => undefined);
+    const cleanup = (async () => {
+      await previousCleanup;
+      const resultOwnership = nativeResultOwnershipRef.current;
+      if (!resultOwnership) return;
+      while (!await resultOwnership.resultStore.release()) {
+        await yieldToBrowser();
+      }
+      if (nativeResultOwnershipRef.current === resultOwnership) {
+        nativeResultOwnershipRef.current = null;
+      }
+    })();
+    nativeOwnershipCleanupPromiseRef.current = cleanup;
+    await cleanup;
+  }, []);
+
+  const cancelNativeSolidVoxelExecution = useCallback(async () => {
+    nativeRunAbortControllerRef.current?.abort();
+    nativeRunAbortControllerRef.current = null;
+    const previousCleanup = nativeOwnershipCleanupPromiseRef.current.catch(() => undefined);
+    const cleanup = (async () => {
+      await previousCleanup;
+      const resultOwnership = nativeResultOwnershipRef.current;
+      if (!resultOwnership) return;
+      let fullyReleased = await resultOwnership.resultStore.cancel();
+      while (!fullyReleased) {
+        await yieldToBrowser();
+        fullyReleased = await resultOwnership.resultStore.release();
+      }
+      if (nativeResultOwnershipRef.current === resultOwnership) {
+        nativeResultOwnershipRef.current = null;
+      }
+    })();
+    nativeOwnershipCleanupPromiseRef.current = cleanup;
+    await cleanup;
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void probeSolidVoxelBackend().then((probe) => {
+      if (cancelled) return;
+      setSolidVoxelBackendProbe(probe);
+      setPerformanceCapabilities(probe.capabilities);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        PERFORMANCE_PREFERENCES_STORAGE_KEY,
+        serializePerformancePreferences(performancePreferences),
+      );
+    } catch {
+      // 性能偏好持久化失败不应阻止生成或影响投影内容。
+    }
+  }, [performancePreferences]);
+
   const publishMotionSeconds = useCallback((kind: MmdMotionTrackKind, seconds: number) => {
     const runtime = motionRuntime[kind];
     if (motionScrubCommitTimerRef.current !== null) {
@@ -851,6 +1036,7 @@ export default function App() {
   }, [motionRuntime]);
 
   const clearProjectionArtifacts = useCallback(() => {
+    void releaseNativeSolidVoxelOwnership().catch(() => undefined);
     setResult(null);
     projectionDocumentRef.current = null;
     setSurvivalDocument(null);
@@ -861,7 +1047,7 @@ export default function App() {
     setExtendedExportAcknowledged(false);
     setExtremeExportPhraseInput("");
     replaceExtremeConfirmations((current) => clearExtremeExportConfirmation(current));
-  }, [replaceExtremeConfirmations]);
+  }, [releaseNativeSolidVoxelOwnership, replaceExtremeConfirmations]);
 
   useEffect(() => {
     const lifecycle = createConversionWorkerLifecycle({
@@ -881,6 +1067,7 @@ export default function App() {
           setSurvivalDocument(null);
           setResult(event.result);
           setProcessing(false);
+          setActiveWorkerThreads(null);
           setProgress(1);
           setStageKey("worker.stage.complete");
           setPoseEditing(false);
@@ -889,6 +1076,7 @@ export default function App() {
           currentJobRef.current = "";
           workerLifecycleRef.current?.cancel();
           setProcessing(false);
+          setActiveWorkerThreads(null);
           setProgress(0);
           setStageKey("app.stage.prepareGeneration");
           setPreviewMode("source");
@@ -900,17 +1088,26 @@ export default function App() {
 
     return () => {
       currentJobRef.current = "";
+      setActiveWorkerThreads(null);
       lifecycle.dispose();
       if (workerLifecycleRef.current === lifecycle) workerLifecycleRef.current = null;
     };
   }, []);
 
   const localizeError = useCallback((error: unknown) => {
+    if (error instanceof TauriSolidVoxelClientError) {
+      if (error.kind === "runtime-unavailable") return t("error.native.unavailable");
+      if (error.kind === "transport") return t("error.native.transport");
+      if (error.kind === "protocol") return t("error.native.protocol");
+      const category = error.nativeError?.category ?? "internal";
+      return t(`error.native.${category}` as TranslationKey);
+    }
     const descriptor = errorDescriptor(error);
     return t(descriptor.code, descriptor.params);
   }, [t]);
 
   useEffect(() => () => {
+    void cancelNativeSolidVoxelExecution().catch(() => undefined);
     modelLoadRequestRef.current = "";
     expandedAssetsRef.current = [];
     if (motionScrubCommitTimerRef.current !== null) {
@@ -925,15 +1122,17 @@ export default function App() {
     if (model) {
       modelReleaseRef.current = Promise.resolve(model.dispose()).catch(() => undefined);
     }
-  }, [motionRuntime]);
+  }, [cancelNativeSolidVoxelExecution, motionRuntime]);
 
   const invalidateProjection = useCallback((reason = "settings") => {
     currentJobRef.current = `${reason}:${crypto.randomUUID()}`;
     workerLifecycleRef.current?.cancel();
+    void cancelNativeSolidVoxelExecution().catch(() => undefined);
     setProcessing(false);
+    setActiveWorkerThreads(null);
     clearProjectionArtifacts();
     setPreviewMode("source");
-  }, [clearProjectionArtifacts]);
+  }, [cancelNativeSolidVoxelExecution, clearProjectionArtifacts]);
 
   const invalidatePoseProjection = useCallback(() => {
     invalidateProjection("pose");
@@ -1225,7 +1424,9 @@ export default function App() {
     nextHologramOptions: HologramOptions,
     nextSolidOptions: SolidOptions,
     acceptedResourceRiskFingerprint?: string,
+    acceptedNativeThreadExecution?: NativeThreadExecutionSnapshot | null,
   ) => {
+    if (backendOperationRef.current) return;
     const versionProfile = getJavaVersionProfile(javaVersionId);
     if (!versionProfile) {
       setToast(t("toast.heightPreflightRejected", { reason: "JAVA_VERSION_PROFILE_UNKNOWN" }));
@@ -1261,6 +1462,48 @@ export default function App() {
       setToast(t("toast.modelRequired"));
       return;
     }
+    const nativeThreadRisk = assessNativeThreadRisk({
+      resolvedThreads: resolvedWorkerThreads,
+      capabilities: performanceCapabilities,
+      nativeJobAvailable: nativeSolidVoxelJobAvailable
+        && mode === "solid"
+        && canRunNativeSolidOptions(solidVoxelBackendProbe?.nativeJobApi, nextSolidOptions),
+    });
+    let nativeThreadExecutionSnapshot = acceptedNativeThreadExecution
+      ?? nativeThreadRisk.executionSnapshot;
+    if (
+      acceptedNativeThreadExecution
+      && (
+        !nativeSolidVoxelJobAvailable
+        || mode !== "solid"
+        || !canRunNativeSolidOptions(solidVoxelBackendProbe?.nativeJobApi, nextSolidOptions)
+      )
+    ) {
+      setPendingThreadResourceRisk(null);
+      setToast(t("threadResourceRisk.stale"));
+      return;
+    }
+    if (
+      nativeThreadRisk.needsConfirmation
+      && acceptedNativeThreadExecution === undefined
+    ) {
+      generateTriggerRef.current = document.activeElement instanceof HTMLButtonElement
+        ? document.activeElement
+        : null;
+      setPendingThreadResourceRisk({
+        assessment: nativeThreadRisk,
+        mode,
+        hologramOptions: { ...nextHologramOptions },
+        solidOptions: { ...nextSolidOptions },
+        acceptedResourceRiskFingerprint,
+      });
+      return;
+    }
+    if (
+      !nativeSolidVoxelJobAvailable
+      || mode !== "solid"
+      || !canRunNativeSolidOptions(solidVoxelBackendProbe?.nativeJobApi, nextSolidOptions)
+    ) nativeThreadExecutionSnapshot = null;
     const targetHeight = mode === "solid" ? nextSolidOptions.targetHeight : nextHologramOptions.targetHeight;
     const dimensions = estimateModelDimensions(model, targetHeight);
     const estimatedBlocks = estimateProjectionBlocks(
@@ -1308,32 +1551,55 @@ export default function App() {
         configuration: resourceRiskConfiguration,
         resources,
         assessment: resourceRisk,
+        nativeThreadExecutionSnapshot,
       });
       setGenerationResourceRiskAcknowledged(false);
       return;
     }
     setPendingGenerationResourceRisk(null);
     setGenerationResourceRiskAcknowledged(false);
+    const requestedFrameSuffix = MOTION_TRACK_KINDS
+      .flatMap((kind) => {
+        const motion = motionTracks[kind];
+        if (!motion) return [];
+        const frame = lockedMotionFramesRef.current[kind]
+          ?? motionRuntime[kind].seconds * motion.frameRate;
+        return [`_${kind === "dance" ? "D" : "E"}${formatMotionFrame(frame)}`];
+      })
+      .join("");
+    const requestedSourceName = mmdModel?.stats.name
+      || assets.find((asset) => asset.type === "model")?.name.replace(/\.[^.]+$/, "")
+      || "ELY_Hologram";
+    const requestedProjectionName = `MELY_${safeFileStem(requestedSourceName)}${requestedFrameSuffix}${
+      poseState.editCount ? "_POSE" : ""
+    }_${mode === "solid" ? "SOLID" : "HOLOGRAM"}`;
     // Generation reads and mutates the active renderer while capturing the
     // snapshot. Keep the same backend lease used by model/renderer changes so
     // a programmatic switch cannot dispose the model between those steps.
     const operationId = acquireBackendOperation();
     if (!operationId) return;
     const jobId = crypto.randomUUID();
+    let useWebWorker = nativeThreadExecutionSnapshot === null;
+    let snapshotTransferredToWorker = false;
+    let nativeRunSignal: AbortSignal | null = null;
 
     try {
       currentJobRef.current = jobId;
-      workerLifecycle.start(jobId);
+      await releaseNativeSolidVoxelOwnership();
+      if (currentJobRef.current !== jobId || modelRef.current !== model) return;
       clearProjectionArtifacts();
+      if (useWebWorker) workerLifecycle.start(jobId);
       setPreviewMode("source");
       setProcessing(true);
+      setActiveWorkerThreads(nativeThreadExecutionSnapshot?.workerThreads ?? null);
       setExportCurrentFile("");
       setProgress(0.04);
       setStageKey("app.stage.createJob");
       setStageKey("app.stage.capturePose");
       if (modelRef.current !== model) {
-        workerLifecycle.cancel();
+        if (useWebWorker) workerLifecycle.cancel();
         setProcessing(false);
+        setActiveWorkerThreads(null);
         return;
       }
       if (model.physicsEnabled()) model.updatePose(currentMotionTimes());
@@ -1341,14 +1607,84 @@ export default function App() {
       const { releaseMmdMeshSnapshot } = await import("./core/mmdSnapshot");
       const snapshot = await model.createSnapshot({
         includeTextures,
-        isCancelled: () => !workerLifecycle.isCurrent(jobId) || modelRef.current !== model,
+        isCancelled: () => currentJobRef.current !== jobId || modelRef.current !== model,
         onProgress: (value) => {
-          if (!workerLifecycle.isCurrent(jobId) || modelRef.current !== model) return;
+          if (currentJobRef.current !== jobId || modelRef.current !== model) return;
           setProgress(0.04 + value * 0.12);
         },
       });
       try {
-        if (!workerLifecycle.isCurrent(jobId) || modelRef.current !== model) return;
+        if (currentJobRef.current !== jobId || modelRef.current !== model) return;
+        if (!useWebWorker && nativeThreadExecutionSnapshot) {
+          setStageKey("worker.stage.voxelizing");
+          const configuration = {
+            javaVersionId,
+            heightMode,
+            targetHeight: nextSolidOptions.targetHeight,
+            targetDimensionMinY,
+            targetDimensionHeight,
+            placementBottomY,
+            projectionName: requestedProjectionName,
+          };
+          const abortController = new AbortController();
+          nativeRunSignal = abortController.signal;
+          nativeRunAbortControllerRef.current = abortController;
+          let nativeRun;
+          try {
+            nativeRun = await runNativeSolidVoxelJob({
+              execution: nativeThreadExecutionSnapshot,
+              options: nextSolidOptions,
+              snapshot,
+              signal: abortController.signal,
+              isCurrent: () => (
+                currentJobRef.current === jobId
+                && modelRef.current === model
+                && nativeRunAbortControllerRef.current === abortController
+              ),
+              onSnapshotUploaded: () => releaseMmdMeshSnapshot(snapshot),
+              onProgress: (fraction) => {
+                if (fraction >= 1) setStageKey("app.stage.prepareGeneration");
+                setProgress(0.16 + fraction * 0.72);
+              },
+              onMaterializationProgress: (pulledChunkCount, totalChunkCount) => {
+                if (totalChunkCount <= 0) return;
+                setProgress(0.88 + Math.min(1, pulledChunkCount / totalChunkCount) * 0.1);
+              },
+              materialization: {
+                document: solidProjectionDocumentOptions(configuration),
+              },
+            });
+          } finally {
+            if (nativeRunAbortControllerRef.current === abortController) {
+              nativeRunAbortControllerRef.current = null;
+            }
+          }
+          if (nativeRun.kind === "fallback-allowed") {
+            useWebWorker = true;
+            setActiveWorkerThreads(null);
+            workerLifecycle.start(jobId);
+          } else {
+            const { ownership } = nativeRun;
+            const { materialized } = ownership;
+            nativeResultOwnershipRef.current = ownership;
+            projectionDocumentRef.current = {
+              result: materialized.result,
+              document: materialized.document,
+              configurationKey: nativeResultConfigurationKey(configuration),
+              contentHash: materialized.contentHash,
+            };
+            currentJobRef.current = "";
+            setSurvivalDocument(null);
+            setResult(materialized.result);
+            setProcessing(false);
+            setActiveWorkerThreads(null);
+            setProgress(1);
+            setStageKey("worker.stage.complete");
+            setPoseEditing(false);
+            setPreviewMode("hologram");
+            return;
+          }
+        }
         const command: WorkerCommand = mode === "solid"
           ? {
               type: "GENERATE_SOLID",
@@ -1384,28 +1720,42 @@ export default function App() {
               },
               source: { kind: "mesh", mesh: snapshot },
             };
-        workerLifecycle.post(jobId, command, snapshotTransferables(snapshot));
+        snapshotTransferredToWorker = workerLifecycle.post(
+          jobId,
+          command,
+          snapshotTransferables(snapshot),
+        );
+        if (!snapshotTransferredToWorker) {
+          throw appError("error.worker.protocol");
+        }
       } finally {
-        releaseMmdMeshSnapshot(snapshot);
+        if (!snapshotTransferredToWorker && snapshot.positions.byteLength > 0) {
+          releaseMmdMeshSnapshot(snapshot);
+        }
       }
     } catch (error) {
-      if (
-        currentJobRef.current !== jobId
-        || modelRef.current !== model
-        || (error instanceof Error && error.name === "AbortError")
-      ) return;
-      workerLifecycle.cancel();
+      const stale = currentJobRef.current !== jobId || modelRef.current !== model;
+      const locallyAborted = nativeRunSignal?.aborted ?? false;
+      if (stale || locallyAborted) return;
+      if (useWebWorker) workerLifecycle.cancel();
+      else await cancelNativeSolidVoxelExecution();
       setProcessing(false);
+      setActiveWorkerThreads(null);
       setPreviewMode("source");
       setToast(t("toast.generationFailed", { reason: localizeError(error) }));
     } finally {
       releaseBackendOperation(operationId);
     }
-  }, [acquireBackendOperation, clearProjectionArtifacts, currentMotionTimes,
+  }, [acquireBackendOperation, cancelNativeSolidVoxelExecution,
+    clearProjectionArtifacts, currentMotionTimes,
     declaredTargetDimension, extremeConfigurationFingerprint, heightMode,
-    javaVersionId, localizeError, partsRevision, placementBottomY,
-    placementForHeightPreflight, poseRevision, releaseBackendOperation, t,
-    targetDimensionHeight, targetDimensionMinY]);
+    javaVersionId, localizeError, nativeSolidVoxelJobAvailable, partsRevision,
+    performanceCapabilities, placementBottomY, resolvedWorkerThreads,
+    placementForHeightPreflight, poseRevision, releaseBackendOperation,
+    releaseNativeSolidVoxelOwnership,
+    solidVoxelBackendProbe?.nativeJobApi, t,
+    targetDimensionHeight, targetDimensionMinY, assets, mmdModel?.stats.name,
+    motionRuntime, motionTracks, poseState.editCount]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1492,6 +1842,7 @@ export default function App() {
   }, []);
 
   const updateOptions = (patch: Partial<HologramOptions>) => {
+    if (backendOperationRef.current) return;
     const selectedDefaultHeight = getJavaVersionProfile(javaVersionId)?.defaultDimension?.height
       ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
     const maximumHeight = heightMode === "experimental_4064"
@@ -1519,6 +1870,7 @@ export default function App() {
   };
 
   const updateSolidOptions = (patch: Partial<SolidOptions>) => {
+    if (backendOperationRef.current) return;
     const selectedDefaultHeight = getJavaVersionProfile(javaVersionId)?.defaultDimension?.height
       ?? COMPATIBILITY_DEFAULT_DIMENSION.height;
     const maximumHeight = heightMode === "experimental_4064"
@@ -1543,6 +1895,7 @@ export default function App() {
   };
 
   const toggleExtendedHeight = () => {
+    if (backendOperationRef.current) return;
     if (heightMode !== "default") {
       setHeightMode("default");
       setTargetDimensionMinY(null);
@@ -1562,6 +1915,7 @@ export default function App() {
   };
 
   const unlockExtendedHeight = () => {
+    if (backendOperationRef.current) return;
     setHeightMode("extended_2032");
     setTargetDimensionMinY(-1024);
     setTargetDimensionHeight(EXTENDED_WORLD_HEIGHT);
@@ -1571,6 +1925,7 @@ export default function App() {
   };
 
   const changeGenerationMode = (mode: GenerationMode) => {
+    if (backendOperationRef.current) return;
     if (mode === generationMode) return;
     if (mode === "solid" && !modelRef.current) {
       setToast(t("toast.solidModelRequired"));
@@ -1584,6 +1939,7 @@ export default function App() {
   };
 
   const beginExtremeHeightUnlock = () => {
+    if (backendOperationRef.current) return;
     if (heightMode !== "extended_2032" && heightMode !== "experimental_4064") return;
     const initialUnlock = heightMode === "extended_2032";
     if (initialUnlock) {
@@ -1601,6 +1957,7 @@ export default function App() {
   };
 
   const confirmExtremeUnlockStage = () => {
+    if (backendOperationRef.current) return;
     const fingerprint = extremeFingerprintBase
       ? createExtremeHeightConfigurationFingerprint(extremeFingerprintBase)
       : null;
@@ -1614,6 +1971,7 @@ export default function App() {
   };
 
   const cancelExtremeHeightUnlock = () => {
+    if (backendOperationRef.current) return;
     setExtremeDialogStage(null);
     setExtremeDialogOrigin(null);
     setExtremeEnvironmentChecks({ datapack: false, backup: false, toolchain: false });
@@ -1629,6 +1987,7 @@ export default function App() {
   };
 
   const confirmExtremeEnvironmentStage = () => {
+    if (backendOperationRef.current) return;
     const fingerprint = extremeFingerprintBase
       ? createExtremeHeightConfigurationFingerprint(extremeFingerprintBase)
       : null;
@@ -1652,6 +2011,7 @@ export default function App() {
     height?: number | null;
     placementBottomY?: number | null;
   }) => {
+    if (backendOperationRef.current) return;
     const normalize = (value: number | null) => Number.isSafeInteger(value) ? value : null;
     if (patch.minY !== undefined) setTargetDimensionMinY(normalize(patch.minY));
     if (patch.height !== undefined) {
@@ -1672,6 +2032,7 @@ export default function App() {
   };
 
   const changeJavaVersion = (versionId: string) => {
+    if (backendOperationRef.current) return;
     const profile = getJavaVersionProfile(versionId);
     if (!profile) return;
     setJavaVersionId(versionId);
@@ -1995,7 +2356,7 @@ export default function App() {
   }, [resetMotionTracks, waitForViewportUnmount]);
 
   const clearCurrentModel = async () => {
-    if (modelLoading || physicsLoading || rendererSwitchingRef.current) return;
+    if (backendOperationRef.current || modelLoading || physicsLoading || rendererSwitchingRef.current) return;
     const operationId = acquireBackendOperation();
     if (!operationId) return;
     const requestId = crypto.randomUUID();
@@ -2304,7 +2665,7 @@ export default function App() {
   }, [acquireBackendOperation, captureMmdRuntimeRestoreState, exporting, invalidateProjection, loadModelFromPackage, localizeError, modelLoading, physicsLoading, processing, releaseBackendOperation, stopAllMotionPlayback, t]);
 
   const addAssets = async (files: File[]) => {
-    if (physicsLoading || rendererSwitchingRef.current) return;
+    if (backendOperationRef.current || physicsLoading || rendererSwitchingRef.current) return;
     const operationId = acquireBackendOperation();
     if (!operationId) return;
     const requestId = crypto.randomUUID();
@@ -2445,7 +2806,7 @@ export default function App() {
   }, []);
 
   const selectModelFromPackage = async (path: string) => {
-    if (modelLoading || physicsLoading || rendererSwitchingRef.current || path === selectedModelPath) return;
+    if (backendOperationRef.current || modelLoading || physicsLoading || rendererSwitchingRef.current || path === selectedModelPath) return;
     if (!path) {
       await clearCurrentModel();
       return;
@@ -2484,11 +2845,11 @@ export default function App() {
   };
 
   const selectMotionFromPackage = async (kind: MmdMotionTrackKind, path: string) => {
+    if (backendOperationRef.current) return;
     const model = modelRef.current;
     if (!model || modelLoading || physicsLoading || processing || rendererSwitchingRef.current || path === selectedMotionPaths[kind]) return;
 
     if (!path) {
-      if (backendOperationRef.current) return;
       model.clearMotion(kind);
       resetMotionTrack(kind);
       model.updatePose(currentMotionTimes());
@@ -2802,6 +3163,7 @@ export default function App() {
   };
 
   const generateCurrentPose = () => {
+    if (backendOperationRef.current || exporting) return;
     if (!areMotionTracksReadyForGeneration(MOTION_TRACK_KINDS.map((kind) => ({
       loaded: Boolean(motionTracks[kind]),
       lockedFrame: lockedMotionFrames[kind],
@@ -2820,6 +3182,7 @@ export default function App() {
   };
 
   const confirmGenerationResourceRisk = () => {
+    if (backendOperationRef.current) return;
     const pending = pendingGenerationResourceRisk;
     const model = modelRef.current;
     if (!pending || !generationResourceRiskAcknowledged || !model) return;
@@ -2847,8 +3210,70 @@ export default function App() {
       pending.configuration.hologramOptions,
       pending.configuration.solidOptions,
       pending.fingerprint,
+      pending.nativeThreadExecutionSnapshot,
     );
   };
+
+  const closeThreadResourceRisk = () => {
+    setPendingThreadResourceRisk(null);
+  };
+
+  const continueWithSelectedThreads = () => {
+    if (backendOperationRef.current) return;
+    const pending = pendingThreadResourceRisk;
+    if (!pending) return;
+    const executionSnapshot = continueSelectedNativeThreadExecution(pending.assessment);
+    if (!executionSnapshot || !nativeSolidVoxelJobAvailable) {
+      closeThreadResourceRisk();
+      setToast(t("threadResourceRisk.stale"));
+      return;
+    }
+    closeThreadResourceRisk();
+    void generate(
+      pending.mode,
+      pending.hologramOptions,
+      pending.solidOptions,
+      pending.acceptedResourceRiskFingerprint,
+      executionSnapshot,
+    );
+  };
+
+  const continueWithRecommendedThreads = () => {
+    if (backendOperationRef.current) return;
+    const pending = pendingThreadResourceRisk;
+    if (!pending) return;
+    const executionSnapshot = useRecommendedNativeThreadExecution(pending.assessment);
+    if (!executionSnapshot || !nativeSolidVoxelJobAvailable) {
+      closeThreadResourceRisk();
+      setToast(t("threadResourceRisk.stale"));
+      return;
+    }
+    closeThreadResourceRisk();
+    void generate(
+      pending.mode,
+      pending.hologramOptions,
+      pending.solidOptions,
+      pending.acceptedResourceRiskFingerprint,
+      executionSnapshot,
+    );
+  };
+
+  const changeWorkerThreads = (threads: number) => {
+    setPerformancePreferences(createManualPerformancePreferences(threads));
+  };
+
+  const restoreAutomaticWorkerThreads = () => {
+    setPerformancePreferences(createAutoPerformancePreferences());
+  };
+
+  const pendingRecommendedWorkerThreads = pendingThreadResourceRisk?.assessment.executionSnapshot
+    ? Math.min(
+        pendingThreadResourceRisk.assessment.executionSnapshot.workerThreads,
+        pendingThreadResourceRisk.assessment.executionSnapshot.recommendedThreads,
+        pendingThreadResourceRisk.assessment.executionSnapshot.memorySuggestedThreads
+          ?? pendingThreadResourceRisk.assessment.executionSnapshot.maximumThreads,
+      )
+    : 1;
 
   const toggleMotionLock = (kind: MmdMotionTrackKind) => {
     if (backendOperationRef.current) return;
@@ -3136,7 +3561,7 @@ export default function App() {
 
   const prepareProjectionDocument = useCallback(async () => {
     if (!result) throw appError("error.litematic.emptyProjection");
-    const configurationKey = JSON.stringify({
+    const configuration = {
       javaVersionId,
       heightMode,
       targetHeight,
@@ -3144,44 +3569,18 @@ export default function App() {
       targetDimensionHeight,
       placementBottomY,
       projectionName,
-    });
+    };
+    const configurationKey = nativeResultConfigurationKey(configuration);
     const cached = projectionDocumentRef.current;
     if (cached?.result === result && cached.configurationKey === configurationKey) {
       return cached.document;
     }
     await yieldToBrowser();
-    const profile = getJavaVersionProfile(javaVersionId);
-    const defaultDimension = profile?.defaultDimension ?? COMPATIBILITY_DEFAULT_DIMENSION;
-    const documentHeightMode = heightMode;
-    const placementMetadata: Record<string, string | number | boolean> = documentHeightMode === "default"
-      ? {
-          placementBottomY: defaultDimension.minY,
-          targetDimensionMinY: defaultDimension.minY,
-          targetDimensionMaxY: defaultDimension.minY + defaultDimension.height - 1,
-        }
-      : Number.isSafeInteger(targetDimensionMinY)
-        && Number.isSafeInteger(targetDimensionHeight)
-        && (targetDimensionHeight ?? 0) > 0
-        && Number.isSafeInteger(placementBottomY)
-        ? {
-            placementBottomY: placementBottomY!,
-            targetDimensionMinY: targetDimensionMinY!,
-            targetDimensionMaxY: targetDimensionMinY! + targetDimensionHeight! - 1,
-          }
-        : {};
+    const documentOptions = solidProjectionDocumentOptions(configuration);
     const document = createProjectionDocumentFromResult(result, {
-      edition: "java",
-      minecraftVersion: javaVersionId,
+      ...documentOptions,
       metadata: {
-        name: projectionName,
-        generator: "MELY",
-        targetHeight,
-        heightMode: documentHeightMode,
-        datapackAcknowledged: documentHeightMode !== "default" && heightMode !== "default",
-        ...placementMetadata,
-        heightDisclaimer: documentHeightMode === "default"
-          ? ""
-          : "Requires a third-party height data pack matching the exact Java version and target dimension. MELY does not provide, install, validate, or endorse it.",
+        ...documentOptions.metadata,
         generationMode: result.kind === "solid" ? "solid" : "hologram",
       },
     });
@@ -3331,6 +3730,7 @@ export default function App() {
     setExporting(true);
     setExportCurrentFile("");
     setExportCenterOpen(false);
+    let nativeWriteOperationId: string | null = null;
     try {
       await yieldToBrowser();
       if (request.format === "bundle") {
@@ -3462,10 +3862,7 @@ export default function App() {
         return;
       }
       if (request.format === "litematic") {
-        const [{ streamLitematicFromDocument }, desktop] = await Promise.all([
-          import("./core/litematic"),
-          import("./platform/desktop"),
-        ]);
+        const desktop = await import("./platform/desktop");
         const litematicOptions = {
           name: request.name,
           author: "MELY",
@@ -3479,36 +3876,90 @@ export default function App() {
           ),
         };
         let byteLength = 0;
-        if (desktop.isDesktopRuntime()) {
-          const writer = await desktop.openDesktopChunkWriterWithDialog({
+        const nativeOwnership = nativeResultOwnershipRef.current;
+        const cachedDocument = projectionDocumentRef.current;
+        if (
+          desktop.isDesktopRuntime()
+          && nativeOwnership
+          && cachedDocument?.result === nativeOwnership.materialized.result
+          && cachedDocument.document === request.document
+        ) {
+          nativeWriteOperationId = acquireBackendOperation();
+          if (!nativeWriteOperationId) return;
+          const outputPath = await desktop.selectDesktopSavePath({
             defaultPath: `${request.name}.litematic`,
             filters: [{
               name: t("export.format.litematic"),
               extensions: ["litematic"],
             }],
           });
-          if (!writer) return;
-          try {
+          if (!outputPath) return;
+          if (
+            nativeResultOwnershipRef.current !== nativeOwnership
+            || projectionDocumentRef.current?.document !== request.document
+          ) return;
+          const compatibility = requireJavaCompatibilityProfile(request.document.minecraftVersion);
+          const descriptor = compatibility.serializerProfile.exporters.litematic;
+          if (!descriptor || descriptor.subVersion === null || !request.safety.targetDimension) {
+            throw new RangeError("Native Litematic export requires a complete Java serializer contract");
+          }
+          setExportCurrentFile(outputPath);
+          const summary = await nativeOwnership.client.writeLitematic({
+            handle: nativeOwnership.handle,
+            outputPath,
+            overwriteExisting: true,
+            name: request.name,
+            author: "MELY",
+            description: t("export.description.unified", {
+              version: request.document.minecraftVersion,
+            }),
+            regionMaxSize: 32,
+            safety: {
+              heightMode: request.safety.heightMode,
+              targetHeight: request.safety.targetHeight,
+              targetDimension: request.safety.targetDimension,
+              placementBottomY: request.safety.placementBottomY,
+              targetMinecraftVersion: request.document.minecraftVersion,
+              serializerMinecraftVersion: compatibility.serializerProfile.id,
+              dataVersion: compatibility.serializerProfile.dataVersion,
+              formatVersion: descriptor.formatVersion,
+              subVersion: descriptor.subVersion,
+            },
+          });
+          byteLength = summary.byteLength;
+        } else {
+          const { streamLitematicFromDocument } = await import("./core/litematic");
+          if (desktop.isDesktopRuntime()) {
+            const writer = await desktop.openDesktopChunkWriterWithDialog({
+              defaultPath: `${request.name}.litematic`,
+              filters: [{
+                name: t("export.format.litematic"),
+                extensions: ["litematic"],
+              }],
+            });
+            if (!writer) return;
+            try {
+              const summary = await streamLitematicFromDocument(
+                request.document,
+                (chunk) => writer.write(chunk),
+                litematicOptions,
+              );
+              byteLength = summary.byteLength;
+              await writer.close();
+            } catch (error) {
+              await writer.abort();
+              throw error;
+            }
+          } else {
+            const chunks: Uint8Array[] = [];
             const summary = await streamLitematicFromDocument(
               request.document,
-              (chunk) => writer.write(chunk),
+              (chunk) => { chunks.push(chunk); },
               litematicOptions,
             );
             byteLength = summary.byteLength;
-            await writer.close();
-          } catch (error) {
-            await writer.abort();
-            throw error;
+            downloadBinaryChunks(chunks, `${request.name}.litematic`, "application/gzip");
           }
-        } else {
-          const chunks: Uint8Array[] = [];
-          const summary = await streamLitematicFromDocument(
-            request.document,
-            (chunk) => { chunks.push(chunk); },
-            litematicOptions,
-          );
-          byteLength = summary.byteLength;
-          downloadBinaryChunks(chunks, `${request.name}.litematic`, "application/gzip");
         }
         setToast(t("toast.exportFormatComplete", {
           format: t("export.format.litematic"),
@@ -3556,6 +4007,7 @@ export default function App() {
     } catch (error) {
       setToast(t("toast.exportFailed", { reason: localizeError(error) }));
     } finally {
+      if (nativeWriteOperationId) releaseBackendOperation(nativeWriteOperationId);
       setExporting(false);
       setExportCurrentFile("");
       setPendingExport(null);
@@ -3564,8 +4016,8 @@ export default function App() {
       replaceExtremeConfirmations((current) => clearExtremeExportConfirmation(current));
       if (!survivalToolsOpen) projectionDocumentRef.current = null;
     }
-  }, [exportPreflightMessage, heightSafetyForExport, locale,
-    localizeError, survivalToolsOpen, t]);
+  }, [acquireBackendOperation, exportPreflightMessage, heightSafetyForExport, locale,
+    localizeError, releaseBackendOperation, survivalToolsOpen, t]);
 
   const requestExport = async (format: ExportFormat) => {
     if (!result || exporting) return;
@@ -3979,6 +4431,11 @@ export default function App() {
             physicsAvailable={mmdModel?.physicsAvailable ?? false}
             physicsEnabled={physicsEnabled}
             physicsLoading={physicsLoading}
+            performanceCapabilities={performanceCapabilities}
+            performanceMode={resolvedWorkerThreads.mode}
+            configuredWorkerThreads={resolvedWorkerThreads.configuredThreads}
+            activeWorkerThreads={activeWorkerThreads}
+            nativeSolidVoxelJobAvailable={nativeSolidVoxelJobAvailable}
             onOptionsChange={updateOptions}
             onSolidOptionsChange={updateSolidOptions}
             onGenerationModeChange={changeGenerationMode}
@@ -4006,6 +4463,8 @@ export default function App() {
             onExtendedHeightToggle={toggleExtendedHeight}
             onExperimentalHeightUnlock={beginExtremeHeightUnlock}
             onTargetDimensionChange={changeTargetDimension}
+            onWorkerThreadsChange={changeWorkerThreads}
+            onRestoreAutomaticWorkerThreads={restoreAutomaticWorkerThreads}
           />
         ) : null}
 
@@ -4440,6 +4899,45 @@ export default function App() {
           ))}
         </fieldset>
         <p className="export-center-note">{t("exportCenter.splitNote")}</p>
+      </Windows>
+
+      <Windows
+        open={Boolean(pendingThreadResourceRisk)}
+        title={t("threadResourceRisk.title")}
+        closeLabel={t("common.close")}
+        danger
+        onClose={closeThreadResourceRisk}
+        restoreFocusTo={generateTriggerRef.current}
+        actions={pendingThreadResourceRisk ? [
+          {
+            label: t("common.cancel"),
+            onClick: closeThreadResourceRisk,
+          },
+          {
+            label: t("threadResourceRisk.useRecommended", {
+              count: number(pendingRecommendedWorkerThreads),
+            }),
+            onClick: continueWithRecommendedThreads,
+          },
+          {
+            label: t("threadResourceRisk.continue", {
+              count: number(pendingThreadResourceRisk.assessment.executionSnapshot?.workerThreads ?? 1),
+            }),
+            emphasis: "danger",
+            onClick: continueWithSelectedThreads,
+          },
+        ] : []}
+      >
+        {pendingThreadResourceRisk?.assessment.executionSnapshot ? (
+          <div className="safety-copy">
+            <p>{t("threadResourceRisk.body", {
+              configured: number(pendingThreadResourceRisk.assessment.executionSnapshot.workerThreads),
+              recommended: number(
+                pendingRecommendedWorkerThreads,
+              ),
+            })}</p>
+          </div>
+        ) : null}
       </Windows>
 
       <Windows
