@@ -19,6 +19,7 @@ import {
   type MelyPoseBinding,
   type MelyPoseMorphBinding,
 } from "./melyPose";
+import { syncMmdUvMorphAttributes } from "./mmdUvMorphs";
 
 type VectorTuple = [number, number, number];
 type QuaternionTuple = [number, number, number, number];
@@ -475,6 +476,13 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
       bone.updateMatrix();
     });
     solveManualIk();
+    // Preview evaluation runs immediately before rendering. Runtime updates
+    // refresh the skeleton first, so manual offsets must flush the dependent
+    // world and skin matrices in the same frame instead of waiting for the
+    // next animation tick.
+    mesh.updateMatrixWorld(true);
+    mesh.skeleton.update();
+    if (mesh.skeleton.boneTexture) mesh.skeleton.boneTexture.needsUpdate = true;
   };
 
   const syncMorphSplitTargets = () => {
@@ -538,14 +546,17 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
     syncAfterRuntimePreview: () => {
       runtimeBaseDirty = true;
       if (offsets.size > 0) applyPreviewOffsets();
+      syncMmdUvMorphAttributes(mesh);
     },
     syncAfterRuntimeUpdate: () => {
       if (offsets.size === 0) {
         runtimeBaseDirty = true;
+        syncMmdUvMorphAttributes(mesh);
         return;
       }
       captureRuntimeBase();
       applyOffsets();
+      syncMmdUvMorphAttributes(mesh);
     },
     beginBoneEdit: () => {
       ensureRuntimeBase();
@@ -621,6 +632,7 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
       editStart = null;
       runtimeBaseDirty = false;
       applyOffsets();
+      syncMmdUvMorphAttributes(mesh);
       return {
         appliedBoneCount: resolved.appliedBoneCount,
         missingBoneNames: resolved.missingBoneNames,
@@ -636,6 +648,7 @@ export const createMmdPoseController = (mesh: THREE.SkinnedMesh): MmdPoseControl
       const baseResult = applyImportedPose(state.importedPose);
       const manualResult = applyManualOffsetDocument(state.manualOffsets);
       runtimeBaseDirty = false;
+      syncMmdUvMorphAttributes(mesh);
       return {
         appliedBoneCount: (baseResult?.appliedBoneCount ?? 0) + manualResult.appliedBoneCount,
         missingBoneNames: [

@@ -4,6 +4,7 @@ import { DefaultMmdRuntime } from "@yohawing/three-mmd-loader";
 import * as THREE from "three";
 import { parseMelyPoseJson, stringifyMelyPose } from "../src/core/melyPose";
 import { createMmdPoseController } from "../src/core/mmdPose";
+import { syncMmdUvMorphAttributes } from "../src/core/mmdUvMorphs";
 import {
   createMmdMeshSnapshot,
   type ThreeMmdSnapshotSource,
@@ -90,6 +91,30 @@ test("manual rotation remains layered over a new animation frame", () => {
   assert.equal(pose.state().editCount, 1);
 });
 
+test("preview sync flushes manual offsets to world bone matrices", () => {
+  const { mesh, arm } = createRig();
+  const pose = createMmdPoseController(mesh);
+  const manualRotation = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(1, 0, 0),
+    Math.PI / 4,
+  );
+  const animationRotation = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(0, 1, 0),
+    Math.PI / 6,
+  );
+
+  assert.ok(pose.nudgeBone(1, "x", Math.PI / 4));
+  arm.quaternion.copy(animationRotation);
+  arm.updateMatrix();
+  pose.syncAfterRuntimePreview();
+
+  const expected = animationRotation.clone().multiply(manualRotation);
+  // Read matrixWorld directly: getWorldQuaternion() would itself repair a
+  // stale hierarchy and would miss the preview-sync regression.
+  const worldRotation = new THREE.Quaternion().setFromRotationMatrix(arm.matrixWorld);
+  assert.ok(worldRotation.angleTo(expected) < 1e-6);
+});
+
 test("pose history supports undo, redo, per-bone reset and full reset", () => {
   const { mesh, root, arm } = createRig();
   const pose = createMmdPoseController(mesh);
@@ -159,6 +184,91 @@ test("pose import clears morphs that are absent from the imported document", () 
   assert.equal(target.mesh.morphTargetInfluences?.[0], 0);
   assert.equal(applied.appliedMorphCount, 0);
   assert.deepEqual(applied.missingMorphNames, []);
+});
+
+test("UV morph synchronization is repeatable for relative and absolute attributes", () => {
+  const makeMesh = (relative: boolean) => {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute([
+      0, 0, 0,
+      1, 0, 0,
+      0, 1, 0,
+    ], 3));
+    geometry.setAttribute("uv", new THREE.Float32BufferAttribute([
+      0, 0,
+      1, 0,
+      0, 1,
+    ], 2));
+    geometry.morphTargetsRelative = relative;
+    geometry.morphAttributes.uv = [new THREE.Float32BufferAttribute([
+      relative ? 0.25 : 0.5, relative ? 0.5 : 0.5,
+      0.5, 0.5,
+      0.5, 1,
+    ], 2)];
+    const mesh = new THREE.SkinnedMesh(geometry, new THREE.MeshBasicMaterial());
+    mesh.morphTargetInfluences = [0.5];
+    const root = new THREE.Group();
+    root.add(mesh);
+    return { geometry, root };
+  };
+
+  const relative = makeMesh(true);
+  syncMmdUvMorphAttributes(relative.root);
+  syncMmdUvMorphAttributes(relative.root);
+  assert.deepEqual([...relative.geometry.getAttribute("uv").array], [
+    0.125, 0.25,
+    1.25, 0.25,
+    0.25, 1.5,
+  ]);
+
+  const absolute = makeMesh(false);
+  syncMmdUvMorphAttributes(absolute.root);
+  syncMmdUvMorphAttributes(absolute.root);
+  assert.deepEqual([...absolute.geometry.getAttribute("uv").array], [
+    0.25, 0.25,
+    0.75, 0.25,
+    0.25, 1,
+  ]);
+});
+
+test("UV morph synchronization updates detached morph-split bodies", () => {
+  const sourceGeometry = new THREE.BufferGeometry();
+  sourceGeometry.setAttribute("position", new THREE.Float32BufferAttribute([
+    0, 0, 0,
+    1, 0, 0,
+    0, 1, 0,
+  ], 3));
+  sourceGeometry.setAttribute("uv", new THREE.Float32BufferAttribute([
+    0, 0,
+    1, 0,
+    0, 1,
+  ], 2));
+  const source = new THREE.SkinnedMesh(sourceGeometry, new THREE.MeshBasicMaterial());
+  source.morphTargetInfluences = [0.75];
+
+  const bodyGeometry = sourceGeometry.clone();
+  bodyGeometry.morphTargetsRelative = true;
+  bodyGeometry.morphAttributes.uv = [new THREE.Float32BufferAttribute([
+    0.4, 0,
+    0, 0,
+    0, 0,
+  ], 2)];
+  const body = new THREE.SkinnedMesh(bodyGeometry, new THREE.MeshBasicMaterial());
+  body.morphTargetInfluences = [0];
+  body.userData.mmdMorphSplitBody = { morphTargetIndices: Uint16Array.of(0) };
+  source.userData.mmdMorphSplitBodyMeshes = [body];
+
+  const root = new THREE.Group();
+  root.add(source);
+  syncMmdUvMorphAttributes(root);
+  assert.equal(body.morphTargetInfluences?.[0], 0.75);
+  const bodyUv = bodyGeometry.getAttribute("uv");
+  assert.ok(Math.abs(bodyUv.getX(0) - 0.3) < 1e-6);
+  assert.equal(bodyUv.getY(0), 0);
+  assert.equal(bodyUv.getX(1), 1);
+  assert.equal(bodyUv.getY(1), 0);
+  assert.equal(bodyUv.getX(2), 0);
+  assert.equal(bodyUv.getY(2), 1);
 });
 
 test("imported pose remains stable across runtime evaluation and manual offsets apply once", () => {

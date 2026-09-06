@@ -108,6 +108,7 @@ type RuntimeAnimation = IMmdRuntimeModelAnimation & {
 };
 
 const BABYLON_PHYSICS_FIXED_STEP = 1 / 120;
+const BABYLON_PHYSICS_SETTLE_STEPS = 120;
 
 interface MutablePhysicsClock {
   deltaSeconds: number;
@@ -240,6 +241,7 @@ const materialIndexForSubMesh = (
   subMeshMaterialIndex: number,
   materials: readonly Material[],
 ) : number | null => {
+  if (!Number.isSafeInteger(subMeshMaterialIndex) || subMeshMaterialIndex < 0) return null;
   const value = mesh.material;
   const slots = Array.isArray(value)
     ? value
@@ -566,9 +568,11 @@ const disposeMeshResources = (container: AssetContainer | null, scene: Scene, ro
 
 const readIndices = (mesh: Mesh) => {
   const indices = mesh.getIndices();
-  if (indices) return Uint32Array.from(indices as ArrayLike<number>);
+  if (indices) return Array.from(indices as ArrayLike<number>, (value) => Number(value));
   const count = mesh.getTotalVertices();
-  return Uint32Array.from({ length: count }, (_value, index) => index);
+  return Number.isSafeInteger(count) && count >= 0
+    ? Array.from({ length: count }, (_value, index) => index)
+    : [];
 };
 
 const readSkinData = (mesh: Mesh) => ({
@@ -580,6 +584,108 @@ const readSkinData = (mesh: Mesh) => ({
   sdefRW0: mesh.getVerticesData(MmdBufferKind.MatricesSdefRW0Kind) as Float32Array | null,
   sdefRW1: mesh.getVerticesData(MmdBufferKind.MatricesSdefRW1Kind) as Float32Array | null,
 });
+
+const isFiniteVector = (value: Vector3) => (
+  Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z)
+);
+
+const isFiniteMatrix = (matrix: Matrix) => matrix.m.every((value) => Number.isFinite(value));
+
+const readFiniteInteger = (value: unknown) => {
+  const number = Number(value);
+  return Number.isFinite(number) && Number.isSafeInteger(number) && number >= 0 ? number : null;
+};
+
+const readSafeMatrix = (matrices: Float32Array, boneIndex: unknown) => {
+  const index = readFiniteInteger(boneIndex);
+  const offset = index === null ? -1 : index * 16;
+  if (offset < 0 || offset + 16 > matrices.length) return null;
+  for (let componentIndex = 0; componentIndex < 16; componentIndex += 1) {
+    if (!Number.isFinite(matrices[offset + componentIndex])) return null;
+  }
+  return Matrix.FromArray(matrices, offset);
+};
+
+const readFiniteVector3 = (data: ArrayLike<number> | null, offset: number) => {
+  if (!data || offset < 0 || offset + 3 > data.length) return null;
+  const x = Number(data[offset]);
+  const y = Number(data[offset + 1]);
+  const z = Number(data[offset + 2]);
+  return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)
+    ? new Vector3(x, y, z)
+    : null;
+};
+
+const readBabylonVertexPosition = (sourcePositions: ArrayLike<number>, vertexIndex: number) => (
+  Number.isSafeInteger(vertexIndex) && vertexIndex >= 0
+    ? readFiniteVector3(sourcePositions, vertexIndex * 3)
+    : null
+);
+
+const validBabylonVertexIndex = (value: unknown, vertexCount: number) => {
+  const index = readFiniteInteger(value);
+  return index !== null && index < vertexCount ? index : null;
+};
+
+interface BabylonVisibleGroup {
+  start: number;
+  end: number;
+  material: number;
+}
+
+type BabylonVisibleTriangleVisitor = (a: number, b: number, c: number, material: number) => void;
+
+const collectBabylonVisibleGroups = (
+  mesh: Mesh,
+  sourceIndices: readonly number[],
+  materials: readonly Material[],
+  visibility: BabylonMaterialVisibilityController,
+): BabylonVisibleGroup[] => {
+  if (!mesh.isVisible || !Number.isFinite(mesh.visibility) || mesh.visibility <= 0) return [];
+  const rawGroups = mesh.subMeshes?.length
+    ? mesh.subMeshes.map((subMesh) => ({
+        start: subMesh.indexStart,
+        count: subMesh.indexCount,
+        material: materialIndexForSubMesh(mesh, subMesh.materialIndex, materials),
+      }))
+    : [{
+        start: 0,
+        count: sourceIndices.length,
+        material: materialIndexForSubMesh(mesh, 0, materials),
+      }];
+  return rawGroups.flatMap((group) => {
+    const material = group.material;
+    if (material === null) return [];
+    const candidate = materials[material] as (Material & { isDisposed?: () => boolean }) | undefined;
+    if (!candidate || candidate.isDisposed?.() || !visibility.isRuntimeVisible(material)) return [];
+    if (!Number.isSafeInteger(group.start) || group.start < 0
+      || !Number.isSafeInteger(group.count) || group.count < 0
+      || group.start > sourceIndices.length) return [];
+    const end = group.count > sourceIndices.length - group.start
+      ? sourceIndices.length
+      : group.start + group.count;
+    return end - group.start >= 3 ? [{ start: group.start, end, material }] : [];
+  });
+};
+
+const visitBabylonVisibleTriangles = (
+  mesh: Mesh,
+  sourceIndices: readonly number[],
+  vertexCount: number,
+  materials: readonly Material[],
+  visibility: BabylonMaterialVisibilityController,
+  visitor: BabylonVisibleTriangleVisitor,
+) => {
+  collectBabylonVisibleGroups(mesh, sourceIndices, materials, visibility).forEach((group) => {
+    for (let cursor = group.start; cursor + 2 < group.end; cursor += 3) {
+      const a = validBabylonVertexIndex(sourceIndices[cursor], vertexCount);
+      const b = validBabylonVertexIndex(sourceIndices[cursor + 1], vertexCount);
+      const c = validBabylonVertexIndex(sourceIndices[cursor + 2], vertexCount);
+      if (a === null || b === null || c === null) continue;
+      visitor(a, b, c, group.material);
+    }
+  });
+};
 
 /**
  * Babylon's public position helper can apply MorphTargetManager position
@@ -617,68 +723,137 @@ const skinPosition = (
   data: ReturnType<typeof readSkinData>,
   target: Vector3,
 ) => {
+  if (!isFiniteVector(position) || !Number.isSafeInteger(vertexIndex) || vertexIndex < 0) return false;
   const weights = data.weights;
   const indices = data.indices;
-  if (!weights || !indices) return target.copyFrom(position);
+  if (!weights && !indices) {
+    target.copyFrom(position);
+    return true;
+  }
+  if (!weights || !indices) return false;
   const base = vertexIndex * 4;
+  if (base + 4 > weights.length || base + 4 > indices.length) return false;
   const sdefC = data.sdefC;
   const sdefRW0 = data.sdefRW0;
   const sdefRW1 = data.sdefRW1;
   // SDEF vectors are xyz tuples, while bone indices/weights remain vec4s.
   const sdefBase = vertexIndex * 3;
-  // babylon-mmd uses RW0.x as the per-vertex linear-skinning sentinel.
-  const sdef = sdefC && sdefRW0 && sdefRW1 && Math.abs(sdefRW0[sdefBase] ?? 0) > 1e-8;
+  const matrixFor = (source: ArrayLike<number>, offset: number) => {
+    const matrix = readSafeMatrix(matrices, source[offset]);
+    return matrix && isFiniteMatrix(matrix) ? matrix : null;
+  };
+  const weightsFor = (source: ArrayLike<number>, offset: number) => Number(source[offset]);
+  const baseWeights = Array.from({ length: 4 }, (_value, slot) => weightsFor(weights, base + slot));
+  if (baseWeights.some((weight) => !Number.isFinite(weight) || weight < 0)) return false;
+  const hasSdefData = Boolean(
+    sdefC && sdefRW0 && sdefRW1
+    && sdefBase + 3 <= sdefC.length
+    && sdefBase + 3 <= sdefRW0.length
+    && sdefBase + 3 <= sdefRW1.length,
+  );
+  if ((sdefC || sdefRW0 || sdefRW1) && !hasSdefData) return false;
+  const sdefSentinel = hasSdefData ? Number(sdefRW0?.[sdefBase]) : 0;
+  if (hasSdefData) {
+    const c = readFiniteVector3(sdefC, sdefBase);
+    const rw0 = readFiniteVector3(sdefRW0, sdefBase);
+    const rw1 = readFiniteVector3(sdefRW1, sdefBase);
+    if (!c || !rw0 || !rw1 || !Number.isFinite(sdefSentinel)) return false;
+  }
+  // Match babylon-mmd's shader branch exactly: only an exact zero RW0.x
+  // selects linear skinning; any non-zero value selects the SDEF influence.
+  const sdef = hasSdefData && sdefSentinel !== 0;
   if (sdef) {
-    const i0 = Math.round(Number(indices[base] ?? 0));
-    const i1 = Math.round(Number(indices[base + 1] ?? 0));
-    const w0 = Number(weights[base] ?? 0);
-    const w1 = Number(weights[base + 1] ?? 0);
-    const m0 = Matrix.FromArray(matrices, i0 * 16);
-    const m1 = Matrix.FromArray(matrices, i1 * 16);
-    const q0 = Quaternion.FromRotationMatrix(m0);
-    const q1 = Quaternion.FromRotationMatrix(m1);
+    if (!sdefC || !sdefRW0 || !sdefRW1) return false;
+    const w0 = baseWeights[0];
+    const w1 = baseWeights[1];
+    if (w0 + w1 <= 1e-8) return false;
+    const m0 = w0 > 0 ? matrixFor(indices, base) : Matrix.Identity();
+    const m1 = w1 > 0 ? matrixFor(indices, base + 1) : Matrix.Identity();
+    if ((w0 > 0 && !m0) || (w1 > 0 && !m1)) return false;
+    const q0 = Quaternion.FromRotationMatrix(m0!);
+    const q1 = Quaternion.FromRotationMatrix(m1!);
     const rotation = Quaternion.Slerp(q0, q1, w1);
     const rotationMatrix = Matrix.FromQuaternionToRef(rotation, Matrix.Identity());
-    const c = new Vector3(sdefC[sdefBase] ?? 0, sdefC[sdefBase + 1] ?? 0, sdefC[sdefBase + 2] ?? 0);
-    const rw0 = new Vector3(sdefRW0[sdefBase] ?? 0, sdefRW0[sdefBase + 1] ?? 0, sdefRW0[sdefBase + 2] ?? 0);
-    const rw1 = new Vector3(sdefRW1[sdefBase] ?? 0, sdefRW1[sdefBase + 1] ?? 0, sdefRW1[sdefBase + 2] ?? 0);
+    const c = readFiniteVector3(sdefC, sdefBase);
+    const rw0 = readFiniteVector3(sdefRW0, sdefBase);
+    const rw1 = readFiniteVector3(sdefRW1, sdefBase);
+    if (!c || !rw0 || !rw1 || !isFiniteMatrix(rotationMatrix)) return false;
     target.copyFrom(Vector3.TransformCoordinates(position.subtract(c), rotationMatrix));
-    const p0 = Vector3.TransformCoordinates(rw0, m0);
-    const p1 = Vector3.TransformCoordinates(rw1, m1);
-    target.scaleInPlace(1);
+    const p0 = Vector3.TransformCoordinates(rw0, m0!);
+    const p1 = Vector3.TransformCoordinates(rw1, m1!);
+    if (!isFiniteVector(p0) || !isFiniteVector(p1)) return false;
     target.addInPlace(p0.scale(w0)).addInPlace(p1.scale(w1));
-    return target;
+    return isFiniteVector(target);
   }
+
+  const baseMatrices: Matrix[] = [];
+  let totalWeight = 0;
+  for (let slot = 0; slot < 4; slot += 1) {
+    const offset = base + slot;
+    const weight = baseWeights[slot];
+    const matrix = weight > 0 ? matrixFor(indices, offset) : null;
+    if (weight > 0 && !matrix) return false;
+    baseMatrices.push(matrix ?? Matrix.Identity());
+    totalWeight += weight;
+  }
+  const extraMatrices: Matrix[] = [];
+  const extraWeights: number[] = [];
+  if (mesh.numBoneInfluencers > 4) {
+    if (!data.extraIndices || !data.extraWeights) return false;
+    const extraBase = vertexIndex * 4;
+    if (extraBase + 4 > data.extraIndices.length || extraBase + 4 > data.extraWeights.length) return false;
+    for (let slot = 0; slot < 4; slot += 1) {
+      const offset = extraBase + slot;
+      const weight = Number(data.extraWeights[offset]);
+      if (!Number.isFinite(weight) || weight < 0) return false;
+      const matrix = weight > 0 ? matrixFor(data.extraIndices, offset) : null;
+      if (weight > 0 && !matrix) return false;
+      extraMatrices.push(matrix ?? Matrix.Identity());
+      extraWeights.push(weight);
+      totalWeight += weight;
+    }
+  }
+  if (!Number.isFinite(totalWeight) || totalWeight <= 1e-8) return false;
   target.set(0, 0, 0);
-  const add = (slot: number, extra = false) => {
-    const sourceIndex = extra ? data.extraIndices : indices;
-    const sourceWeight = extra ? data.extraWeights : weights;
-    if (!sourceIndex || !sourceWeight) return;
-    const offset = extra ? vertexIndex * 4 : base;
-    const weight = Number(sourceWeight[offset + slot] ?? 0);
+  let valid = true;
+  const add = (matrix: Matrix, weight: number) => {
     if (weight <= 0) return;
-    const boneIndex = Math.max(0, Math.round(Number(sourceIndex[offset + slot] ?? 0)));
-    const matrix = Matrix.FromArray(matrices, boneIndex * 16);
     const transformed = Vector3.TransformCoordinates(position, matrix);
+    if (!isFiniteVector(transformed)) {
+      valid = false;
+      return;
+    }
     target.addInPlace(transformed.scale(weight));
   };
-  for (let slot = 0; slot < 4; slot += 1) add(slot);
-  if (mesh.numBoneInfluencers > 4) for (let slot = 0; slot < 4; slot += 1) add(slot, true);
-  return target;
+  baseMatrices.forEach((matrix, slot) => add(matrix, baseWeights[slot]));
+  extraMatrices.forEach((matrix, slot) => add(matrix, extraWeights[slot] ?? 0));
+  return valid && isFiniteVector(target);
 };
 
 const createBabylonSkinMatrices = (
   worldTransformMatrices: Float32Array,
   bones: readonly Bone[],
 ) => {
-  // babylon-mmd exposes MMD world matrices, while Babylon's shader skin
-  // buffer is inverse-bind * world. Keep the CPU snapshot on that same path.
-  const matrices = new Float32Array(worldTransformMatrices.length);
+  // Keep the CPU snapshot on babylon-mmd's official inverse-bind call order.
+  // Babylon's multiplyToRef semantics produce the same matrix consumed by
+  // the renderer from `inverseBind.multiplyToRef(world, skin)`.
+  const availableMatrixCount = Math.floor(worldTransformMatrices.length / 16);
+  if (availableMatrixCount < bones.length) {
+    throw appError("error.mesh.invalidVertices");
+  }
+  const matrices = new Float32Array(bones.length * 16);
   const world = Matrix.Identity();
   const skin = Matrix.Identity();
   bones.forEach((bone, index) => {
-    Matrix.FromArrayToRef(worldTransformMatrices, index * 16, world);
-    bone.getAbsoluteInverseBindMatrix().multiplyToRef(world, skin);
+    const worldMatrix = readSafeMatrix(worldTransformMatrices, index);
+    if (!worldMatrix) {
+      throw appError("error.mesh.nonFiniteVertex");
+    }
+    world.copyFrom(worldMatrix);
+    const inverseBind = bone.getAbsoluteInverseBindMatrix();
+    if (!isFiniteMatrix(inverseBind)) throw appError("error.mesh.invalidVertices");
+    inverseBind.multiplyToRef(world, skin);
+    if (!isFiniteMatrix(skin)) throw appError("error.mesh.nonFiniteVertex");
     skin.copyToArray(matrices, index * 16);
   });
   return matrices;
@@ -705,50 +880,35 @@ const createBabylonSnapshot = async (
       error.name = "AbortError";
       throw error;
     }
-    if (!mesh.isVisible || mesh.visibility <= 0) continue;
     const sourcePositions = mesh.getPositionData(false, true);
     if (!sourcePositions) continue;
+    const vertexCount = Math.floor(sourcePositions.length / 3);
+    if (!Number.isSafeInteger(vertexCount) || vertexCount <= 0) continue;
     const sourceUvs = mesh.getVerticesData(VertexBuffer.UVKind) as Float32Array | null;
     const morphedUvs = readMorphedUvs(mesh, sourceUvs);
     const skin = readSkinData(mesh);
     const matrices = skinMatrices;
-    // Babylon's Matrix.multiply applies the left operand after the right
-    // operand (A.multiply(B) yields B * A). Build root^-1 * meshWorld so the
-    // CPU snapshot remains in the same root-relative space as the renderer.
+    // Babylon's multiply helper composes matrices in reverse operand order.
     const meshToRoot = mesh.computeWorldMatrix(true).multiply(rootWorldInverse);
     const sourceIndices = readIndices(mesh);
-    const groups = mesh.subMeshes?.length
-      ? mesh.subMeshes.map((subMesh) => ({
-          start: subMesh.indexStart,
-          count: subMesh.indexCount,
-          material: materialIndexForSubMesh(mesh, subMesh.materialIndex, materials),
-        }))
-      : [{
-          start: 0,
-          count: sourceIndices.length,
-          material: materialIndexForSubMesh(mesh, 0, materials),
-        }];
     // Filter materials before emitting vertices. Keeping a vertex-only list
     // for hidden triangles would still expand the worker's bounds and change
     // the final normalization even though those triangles are not exported.
-    const visibleGroups = groups.filter((group) => {
-      const material = group.material;
-      if (material === null) return false;
-      const candidate = materials[material] as (Material & { isDisposed?: () => boolean }) | undefined;
-      return !candidate?.isDisposed?.() && visibility.isRuntimeVisible(material);
-    });
     const vertexMap = new Map<number, number>();
-    const emitVertex = (sourceIndex: number) => {
+    const emitVertex = (sourceIndex: number): number | null => {
+      const validIndex = validBabylonVertexIndex(sourceIndex, vertexCount);
+      if (validIndex === null) return null;
+      sourceIndex = validIndex;
       const existing = vertexMap.get(sourceIndex);
       if (existing !== undefined) return existing;
-      const position = new Vector3(
-        sourcePositions[sourceIndex * 3] ?? 0,
-        sourcePositions[sourceIndex * 3 + 1] ?? 0,
-        sourcePositions[sourceIndex * 3 + 2] ?? 0,
-      );
-      skinPosition(position, sourceIndex, mesh, matrices, skin, temp);
+      const position = readBabylonVertexPosition(sourcePositions, sourceIndex);
+      if (!position) return null;
+      if (!skinPosition(position, sourceIndex, mesh, matrices, skin, temp)) return null;
+      if (!isFiniteMatrix(meshToRoot)) return null;
       const rootRelative = Vector3.TransformCoordinates(temp, meshToRoot);
+      if (!isFiniteVector(rootRelative)) return null;
       const mapped = toMelyPosition(rootRelative.x, rootRelative.y, rootRelative.z);
+      if (!mapped.every(Number.isFinite)) return null;
       const outputIndex = positions.length / 3;
       positions.push(mapped[0], mapped[1], mapped[2]);
       if (morphedUvs) {
@@ -760,18 +920,13 @@ const createBabylonSnapshot = async (
       vertexMap.set(sourceIndex, outputIndex);
       return outputIndex;
     };
-    visibleGroups.forEach((group) => {
-      const material = group.material;
-      if (material === null) return;
-      const end = Math.min(sourceIndices.length, group.start + group.count);
-      for (let cursor = group.start; cursor + 2 < end; cursor += 3) {
-        indices.push(
-          emitVertex(sourceIndices[cursor] ?? 0),
-          emitVertex(sourceIndices[cursor + 1] ?? 0),
-          emitVertex(sourceIndices[cursor + 2] ?? 0),
-        );
-        triangleMaterials.push(material);
-      }
+    visitBabylonVisibleTriangles(mesh, sourceIndices, vertexCount, materials, visibility, (a, b, c, material) => {
+      const outputA = emitVertex(a);
+      const outputB = emitVertex(b);
+      const outputC = emitVertex(c);
+      if (outputA === null || outputB === null || outputC === null) return;
+      indices.push(outputA, outputB, outputC);
+      triangleMaterials.push(material);
     });
   }
   if (!indices.length) throw appError("error.snapshot.noVisibleTriangles");
@@ -802,37 +957,22 @@ const computeBabylonVisibleBounds = (
   const rootWorldInverse = rootMesh.computeWorldMatrix(true).clone().invert();
   const temp = new Vector3();
   sourceMeshes.forEach((mesh) => {
-    if (!mesh.isVisible || mesh.visibility <= 0) return;
     const sourcePositions = mesh.getPositionData(false, true);
     if (!sourcePositions) return;
     const skin = readSkinData(mesh);
     const meshToRoot = mesh.computeWorldMatrix(true).multiply(rootWorldInverse);
     const sourceIndices = readIndices(mesh);
-    const groups = mesh.subMeshes?.length
-      ? mesh.subMeshes.map((subMesh) => ({
-          start: subMesh.indexStart,
-          count: subMesh.indexCount,
-          material: materialIndexForSubMesh(mesh, subMesh.materialIndex, materials),
-        }))
-      : [{
-          start: 0,
-          count: sourceIndices.length,
-          material: materialIndexForSubMesh(mesh, 0, materials),
-        }];
-    groups.forEach((group) => {
-      if (group.material === null) return;
-      if (!materials[group.material] || !visibility.isRuntimeVisible(group.material)) return;
-      const end = Math.min(sourceIndices.length, group.start + group.count);
-      for (let cursor = group.start; cursor < end; cursor += 1) {
-        const sourceIndex = sourceIndices[cursor] ?? 0;
-        const position = new Vector3(
-          sourcePositions[sourceIndex * 3] ?? 0,
-          sourcePositions[sourceIndex * 3 + 1] ?? 0,
-          sourcePositions[sourceIndex * 3 + 2] ?? 0,
-        );
-        skinPosition(position, sourceIndex, mesh, skinMatrices, skin, temp);
+    if (!isFiniteMatrix(meshToRoot)) return;
+    const vertexCount = Math.floor(sourcePositions.length / 3);
+    if (!Number.isSafeInteger(vertexCount) || vertexCount <= 0) return;
+    visitBabylonVisibleTriangles(mesh, sourceIndices, vertexCount, materials, visibility, (a, b, c) => {
+      for (const sourceIndex of [a, b, c]) {
+        const position = readBabylonVertexPosition(sourcePositions, sourceIndex);
+        if (!position || !skinPosition(position, sourceIndex, mesh, skinMatrices, skin, temp)) continue;
         const rootRelative = Vector3.TransformCoordinates(temp, meshToRoot);
+        if (!isFiniteVector(rootRelative)) continue;
         const mapped = toMelyPosition(rootRelative.x, rootRelative.y, rootRelative.z);
+        if (!mapped.every(Number.isFinite)) continue;
         target.expandByPoint(new ThreeVector3(mapped[0], mapped[1], mapped[2]));
       }
     });
@@ -980,8 +1120,13 @@ export const loadBabylonMmdModel = async (
     const textureNameMap = (rootMesh.metadata as {
       textureNameMap?: Map<BaseTexture, string>;
     } | null)?.textureNameMap;
+    const textureWarningKeys = new Set(textureWarnings);
     textureNameMap?.forEach((path, texture) => {
-      if (texture.loadingError) textureWarnings.push(path || texture.name);
+      if (!texture.loadingError) return;
+      const warning = path || texture.name;
+      if (textureWarningKeys.has(warning)) return;
+      textureWarningKeys.add(warning);
+      textureWarnings.push(warning);
     });
     const materialInfo: MmdMaterialInfo[] = materials.map((material, index) => {
       const color = materialColor(material);
@@ -1017,6 +1162,15 @@ export const loadBabylonMmdModel = async (
     // Keep the user-level switch independent from VMD's per-frame physics
     // toggles, which are stored in the same rigidBodyStates buffer.
     let physicsEnabledState = false;
+    // Integrated Babylon physics queues reset requests in the WASM runtime and
+    // consumes them during beforePhysics. Keep the request pending across a
+    // kinematic preview evaluation so the first live step initializes bodies
+    // after their dynamic state has been committed.
+    let physicsInitializationPending = false;
+    // A later preview/edit evaluation can make bodies kinematic after a live
+    // physics step. Remember that transition so the next live step does not
+    // reuse the old dynamic transforms and velocities.
+    let physicsStepActive = false;
   let dance = emptyMotion();
   let expression = emptyMotion();
     const motionTimes: MmdMotionTimes = { dance: 0, expression: 0 };
@@ -1107,7 +1261,18 @@ export const loadBabylonMmdModel = async (
       physicsDeltaSeconds = 0,
     ) => {
       if (!active || !mmdModel || !mmdRuntime) return;
-      const effectivePhysics = Boolean(physics && physicsEnabledState && physicsAvailable);
+      const physicsDelta = Number.isFinite(physicsDeltaSeconds)
+        ? Math.max(0, physicsDeltaSeconds)
+        : 0;
+      const effectivePhysics = Boolean(
+        physics
+        && physicsEnabledState
+        && physicsAvailable
+        && physicsDelta > 0,
+      );
+      if (!effectivePhysics && physicsEnabledState && physicsAvailable && physicsStepActive) {
+        physicsInitializationPending = true;
+      }
       motionTimes.dance = Math.max(0, Math.min(dance.info?.durationSeconds ?? 0, times.dance));
       motionTimes.expression = Math.max(0, Math.min(expression.info?.durationSeconds ?? 0, times.expression));
       resetAnimationBase();
@@ -1135,18 +1300,43 @@ export const loadBabylonMmdModel = async (
       // `physics` is an operation-level choice (preview vs. physical pose),
       // while `physicsEnabledState` is the user-level capability switch.
       // Both must be true before any rigid body is allowed to become dynamic.
-      const physicsDelta = Number.isFinite(physicsDeltaSeconds)
-        ? Math.max(0, physicsDeltaSeconds)
-        : 0;
       physicsClock.deltaSeconds = physicsDelta;
+      if (effectivePhysics && physicsInitializationPending) {
+        mmdRuntime.initializeMmdModelPhysics(mmdModel);
+      }
       mmdRuntime.beforePhysics(physicsDelta * 1000);
       mmdRuntime.afterPhysics();
+      if (effectivePhysics && physicsInitializationPending) {
+        physicsInitializationPending = false;
+      }
+      if (effectivePhysics) physicsStepActive = true;
       materialVisibility.applyAll();
       // A VMD property track can rewrite rigidBodyStates during animation.
       // The operation-level switch remains authoritative for preview and
       // snapshot generation, so force the disabled state back after evaluation.
       if (!effectivePhysics) mmdModel.rigidBodyStates.fill(0);
       skeleton?._markAsDirty();
+    };
+
+    const settlePhysics = () => {
+      if (!mmdModel || !mmdRuntime) return;
+      // The target pose is evaluated once with kinematic bodies before the
+      // deterministic settle. Resetting after that evaluation prevents the
+      // zero-delta evaluation from becoming an extra physics step.
+      mmdModel.rigidBodyStates.fill(1);
+      mmdRuntime.initializeMmdModelPhysics(mmdModel);
+      physicsInitializationPending = false;
+      const previousPhysicsDelta = physicsClock.deltaSeconds;
+      physicsClock.deltaSeconds = BABYLON_PHYSICS_FIXED_STEP;
+      try {
+        for (let step = 0; step < BABYLON_PHYSICS_SETTLE_STEPS; step += 1) {
+          mmdRuntime.beforePhysics(BABYLON_PHYSICS_FIXED_STEP * 1000);
+          mmdRuntime.afterPhysics();
+        }
+      } finally {
+        physicsClock.deltaSeconds = previousPhysicsDelta;
+      }
+      physicsStepActive = true;
     };
 
     const loadMotion = async (file: File, kind: MmdMotionTrackKind): Promise<MmdMotionTrackInfo> => {
@@ -1352,33 +1542,42 @@ export const loadBabylonMmdModel = async (
       setPhysicsEnabled: async (enabled) => {
         if (!mmdModel || !physicsAvailable) return;
         physicsEnabledState = enabled;
-        mmdModel.rigidBodyStates.fill(enabled ? 1 : 0);
         if (enabled) {
+          // Do not queue the reset before the kinematic preview pass: the
+          // runtime would consume it with disabled bodies. The request is
+          // consumed by the first live step or by settlePhysics instead.
+          physicsInitializationPending = true;
+        } else {
+          // Process a reset while bodies are kinematic so disabling physics
+          // cannot leave stale velocities, forces or dynamic transforms to be
+          // reused when physics is enabled again.
           mmdRuntime?.initializeMmdModelPhysics(mmdModel);
-          mmdModel.initializePhysics();
+          physicsInitializationPending = false;
+          physicsStepActive = false;
         }
-        evaluate(motionTimes, physicsEnabledState);
+        // A zero-delta evaluation keeps every rigid body kinematic.
+        evaluate(motionTimes, false);
       },
       setMaterialVisible: (index, visible) => {
         materialVisibility.setVisible(index, visible);
       },
       visibleBounds,
       visibleTriangleCount: () => sourceMeshes.reduce((sum, mesh) => {
-        if (!mesh.isVisible || mesh.visibility <= 0) return sum;
-        if (!mesh.subMeshes?.length) {
-          return sum + (materialArray(mesh).some((material) => {
-            const index = materials.indexOf(material);
-            return index >= 0 && materialVisibility.isRuntimeVisible(index);
-          })
-            ? Math.floor(mesh.getTotalIndices() / 3)
-            : 0);
-        }
-        return sum + mesh.subMeshes.reduce((meshSum, subMesh) => {
-          const materialIndex = materialIndexForSubMesh(mesh, subMesh.materialIndex, materials);
-          return materialIndex !== null && materialVisibility.isRuntimeVisible(materialIndex)
-            ? meshSum + Math.floor(subMesh.indexCount / 3)
-            : meshSum;
-        }, 0);
+        const sourcePositions = mesh.getPositionData(false, true);
+        if (!sourcePositions) return sum;
+        const sourceIndices = readIndices(mesh);
+        const vertexCount = Math.floor(sourcePositions.length / 3);
+        if (!Number.isSafeInteger(vertexCount) || vertexCount <= 0) return sum;
+        let count = 0;
+        visitBabylonVisibleTriangles(
+          mesh,
+          sourceIndices,
+          vertexCount,
+          materials,
+          materialVisibility,
+          () => { count += 1; },
+        );
+        return sum + count;
       }, 0),
       textureByteEstimate: () => {
         const seenTextures = new Set<BaseTexture>();
@@ -1398,20 +1597,11 @@ export const loadBabylonMmdModel = async (
         return { ...motionTimes };
       },
       updatePose: (times) => {
-        evaluate(times, physicsEnabledState);
+        // Static seeks first evaluate with kinematic bodies. Physics is
+        // advanced only by the explicit deterministic settle below.
+        evaluate(times, false);
         if (physicsEnabledState && physicsAvailable) {
-          mmdRuntime?.initializeMmdModelPhysics(mmdModel!);
-          mmdModel?.initializePhysics();
-          const previousPhysicsDelta = physicsClock.deltaSeconds;
-          physicsClock.deltaSeconds = BABYLON_PHYSICS_FIXED_STEP;
-          try {
-            for (let step = 0; step < 120; step += 1) {
-              mmdRuntime?.beforePhysics(BABYLON_PHYSICS_FIXED_STEP * 1000);
-              mmdRuntime?.afterPhysics();
-            }
-          } finally {
-            physicsClock.deltaSeconds = previousPhysicsDelta;
-          }
+          settlePhysics();
         }
         return { ...motionTimes };
       },

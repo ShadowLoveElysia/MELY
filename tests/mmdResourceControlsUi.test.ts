@@ -38,6 +38,12 @@ test("resource clearing is only exposed through the viewport trash dialog", () =
   assert.doesNotMatch(app, /expandedAssetsRef\.current = expandedAssetsRef\.current\.filter[\s\S]{0,180}endsWith\("\.vmd"\)/);
 });
 
+test("Vanilla renderer uses the parser-backed Three runtime", () => {
+  const factory = readFileSync("src/core/mmdRendererFactory.ts", "utf8");
+  assert.match(factory, /if \(mode === "vanilla"\) \{[\s\S]*import\("\.\/mmdModel"\)[\s\S]*loadMmdModel\(files, modelFile\)/);
+  assert.doesNotMatch(factory, /mode === "vanilla"[\s\S]*import\("\.\/threeVanillaMmdDriver"\)/);
+});
+
 test("physics is explicit, lazy, and settled before generation snapshots", () => {
   const app = readFileSync("src/App.tsx", "utf8");
   const viewport = readFileSync("src/components/Viewport3D.tsx", "utf8");
@@ -70,7 +76,7 @@ test("physics is explicit, lazy, and settled before generation snapshots", () =>
   assert.doesNotMatch(viewport, /sourceContent\.scale\.setScalar\(scale\)|targetSpan/);
   assert.match(viewport, /new THREE\.Color\(\)\.setRGB\([\s\S]{0,180}THREE\.SRGBColorSpace/);
   assert.match(babylonRuntime, /updateLivePose: \(times, deltaSeconds\) => \{\s*evaluate\(times, physicsEnabledState, deltaSeconds\)/);
-  assert.match(babylonRuntime, /updatePose: \(times\) => \{\s*evaluate\(times, physicsEnabledState\)/);
+  assert.match(babylonRuntime, /updatePose: \(times\) => \{[\s\S]*evaluate\(times, false\)[\s\S]*settlePhysics\(\)/);
   const babylonSnapshot = babylonRuntime.match(/createSnapshot: async \(options = \{\}\) => \{[\s\S]*?\n\s*\},\n\s*clearMotion:/)?.[0] ?? "";
   assert.doesNotMatch(babylonSnapshot, /initializeMmdModelPhysics|beforePhysics\(/);
 });

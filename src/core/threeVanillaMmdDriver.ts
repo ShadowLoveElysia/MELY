@@ -273,8 +273,14 @@ export const loadThreeVanillaMmdModel = async (
   modelFile: File,
 ): Promise<LoadedThreeMmdModel> => {
   const resources = createMmdResourceUrlBundle(files, modelFile);
-  const textureWarnings: string[] = [];
-  resources.manager.onError = (url) => textureWarnings.push(url);
+  const textureWarnings = [...resources.warnings];
+  const textureWarningKeys = new Set(textureWarnings);
+  const addTextureWarning = (value: string) => {
+    if (textureWarningKeys.has(value)) return;
+    textureWarningKeys.add(value);
+    textureWarnings.push(value);
+  };
+  resources.manager.onError = (url) => addTextureWarning(url);
   let parsed: MmdModel | null = null;
   let mesh: SkinnedMesh | null = null;
   let textureCapture: VanillaMmdLoaderTextureCapture | null = null;
@@ -284,6 +290,12 @@ export const loadThreeVanillaMmdModel = async (
     textureCapture = captureVanillaMmdLoaderTextures(loader);
     try {
       mesh = await loader.loadAsync(resources.modelUrl);
+      // three-stdlib resolves its model promise as soon as the mesh is built;
+      // material textures continue through the shared LoadingManager. Keep the
+      // resource bundle alive until that batch has actually finished.
+      await resources.waitForLoadCompletion();
+      resources.warnings.forEach(addTextureWarning);
+      resources.missingPaths.forEach((path) => addTextureWarning(`missing: ${path}`));
     } finally {
       textureCapture.restore();
     }

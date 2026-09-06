@@ -8,6 +8,7 @@ import {
   type ThreeMmdSnapshotSource,
 } from "../src/core/mmdSnapshot";
 import { computeVisibleMmdBounds } from "../src/core/mmdModel";
+import { AppError } from "../src/core/appError";
 
 const vectorFromTuple = (tuple: readonly [number, number, number]) =>
   new THREE.Vector3(tuple[0], tuple[1], tuple[2]);
@@ -202,6 +203,163 @@ test("CPU snapshots preserve the current sparse morph-split expression", async (
   releaseMmdMeshSnapshot(snapshot);
   assert.equal(snapshot.positions.byteLength, 0);
   assert.equal(snapshot.indices.byteLength, 0);
+});
+
+test("CPU snapshots keep shared source vertices separate across split material bodies", async () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute([
+    0, 0, 0,
+    1, 0, 0,
+    0, 1, 0,
+    2, 1, 0,
+  ], 3));
+  geometry.setIndex([0, 1, 2, 0, 3, 1]);
+  geometry.addGroup(0, 3, 0);
+  geometry.addGroup(3, 3, 1);
+  const materials = [new THREE.MeshBasicMaterial(), new THREE.MeshBasicMaterial()];
+  const mesh = new THREE.SkinnedMesh(geometry, materials);
+  const bone = new THREE.Bone();
+  mesh.add(bone);
+  mesh.bind(new THREE.Skeleton([bone]));
+
+  const makeSplitBody = (
+    materialIndex: number,
+    positions: number[],
+    morphOffset: number[],
+  ) => {
+    const splitGeometry = new THREE.BufferGeometry();
+    splitGeometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    splitGeometry.morphTargetsRelative = true;
+    splitGeometry.morphAttributes.position = [
+      new THREE.Float32BufferAttribute(morphOffset, 3),
+    ];
+    const body = new THREE.SkinnedMesh(splitGeometry, materials);
+    body.bind(mesh.skeleton, mesh.bindMatrix);
+    body.morphTargetInfluences = [1];
+    body.userData.mmdMorphSplitBody = { materialIndex, morphTargetIndices: Uint16Array.of(0) };
+    return body;
+  };
+  const firstBody = makeSplitBody(
+    0,
+    [0, 0, 0, 1, 0, 0, 0, 1, 0],
+    [10, 0, 0, 0, 0, 0, 0, 0, 0],
+  );
+  const secondBody = makeSplitBody(
+    1,
+    [0, 0, 0, 2, 1, 0, 1, 0, 0],
+    [20, 0, 0, 0, 0, 0, 0, 0, 0],
+  );
+  mesh.userData.mmdMorphSplitBodyMeshes = [firstBody, secondBody];
+
+  const root = new THREE.Group();
+  root.add(mesh, firstBody, secondBody);
+  const snapshot = await createMmdMeshSnapshot(
+    { root, mesh } satisfies ThreeMmdSnapshotSource,
+    { includeTextures: false },
+  );
+
+  assert.equal(snapshot.positions.length, 18);
+  assertPosition(snapshot.positions, 0, new THREE.Vector3(10, 0, 0));
+  assertPosition(snapshot.positions, 3, new THREE.Vector3(20, 0, 0));
+  assert.deepEqual([...snapshot.indices], [0, 1, 2, 3, 4, 5]);
+  const bounds = computeVisibleMmdBounds(root, mesh);
+  assert.deepEqual(bounds.min.toArray(), [0, 0, 0]);
+  assert.deepEqual(bounds.max.toArray(), [20, 1, 0]);
+});
+
+test("CPU snapshots discard triangles with out-of-range source indices", async () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute([
+    0, 0, 0,
+    1, 0, 0,
+    0, 1, 0,
+    2, 0, 0,
+    3, 0, 0,
+    2, 1, 0,
+  ], 3));
+  geometry.setAttribute("skinIndex", new THREE.Uint16BufferAttribute([
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+  ], 4));
+  geometry.setAttribute("skinWeight", new THREE.Float32BufferAttribute([
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+  ], 4));
+  geometry.setIndex([0, 1, 2, 3, 4, 99]);
+  const mesh = new THREE.SkinnedMesh(geometry, new THREE.MeshBasicMaterial());
+  const bone = new THREE.Bone();
+  mesh.add(bone);
+  mesh.bind(new THREE.Skeleton([bone]));
+  const root = new THREE.Group();
+  root.add(mesh);
+
+  const snapshot = await createMmdMeshSnapshot(
+    { root, mesh } satisfies ThreeMmdSnapshotSource,
+    { includeTextures: false },
+  );
+  assert.deepEqual([...snapshot.indices], [0, 1, 2]);
+  assert.deepEqual([...snapshot.triangleMaterials], [0]);
+  assert.equal(snapshot.positions.length, 9);
+});
+
+test("CPU snapshots reject out-of-range bone indices instead of clamping them", async () => {
+  const { mesh, model } = createDeformRig({
+    positions: [0, 0, 0, 1, 0, 0, 0, 1, 0],
+    skinIndices: [0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0],
+    skinWeights: [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+  });
+  await assert.rejects(
+    createMmdMeshSnapshot(model, { includeTextures: false }),
+    (error: unknown) => error instanceof AppError && error.code === "error.mesh.invalidVertices",
+  );
+  mesh.geometry.dispose();
+});
+
+test("visible bounds ignore invalid or non-finite posed vertices", () => {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute([
+    0, 0, 0,
+    1, 0, 0,
+    0, 0, 0,
+    Number.NaN, 1, 0,
+    2, 0, 0,
+    3, 0, 0,
+  ], 3));
+  geometry.setAttribute("skinIndex", new THREE.Uint16BufferAttribute([
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+    0, 0, 0, 0,
+  ], 4));
+  geometry.setAttribute("skinWeight", new THREE.Float32BufferAttribute([
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+    1, 0, 0, 0,
+  ], 4));
+  geometry.setIndex([0, 1, 3, 0, 1, 99]);
+  const mesh = new THREE.SkinnedMesh(geometry, new THREE.MeshBasicMaterial());
+  const bone = new THREE.Bone();
+  mesh.add(bone);
+  mesh.bind(new THREE.Skeleton([bone]));
+  const root = new THREE.Group();
+  root.add(mesh);
+
+  const bounds = computeVisibleMmdBounds(root, mesh);
+  assert.deepEqual(bounds.min.toArray(), [0, 0, 0]);
+  assert.deepEqual(bounds.max.toArray(), [1, 0, 0]);
 });
 
 test("CPU snapshots evaluate BDEF1, BDEF2, and BDEF4 weights at the current pose", async () => {

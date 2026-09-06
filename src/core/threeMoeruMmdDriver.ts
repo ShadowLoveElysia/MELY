@@ -76,11 +76,23 @@ export const loadThreeMoeruMmdModel = async (
   modelFile: File,
 ): Promise<LoadedThreeMmdModel> => {
   const resources = createMmdResourceUrlBundle(files, modelFile);
-  const textureWarnings: string[] = [];
-  resources.manager.onError = (url) => textureWarnings.push(url);
+  const textureWarnings = [...resources.warnings];
+  const textureWarningKeys = new Set(textureWarnings);
+  const addTextureWarning = (value: string) => {
+    if (textureWarningKeys.has(value)) return;
+    textureWarningKeys.add(value);
+    textureWarnings.push(value);
+  };
+  resources.manager.onError = (url) => addTextureWarning(url);
   let mmd: MMD | null = null;
   try {
     mmd = await new MMDLoader(resources.manager).loadAsync(resources.modelUrl);
+    // Moeru's loader resolves after assembling the MMD object, while its
+    // material textures finish through the shared LoadingManager. Keep the
+    // package alive and collect load errors until that batch has ended.
+    await resources.waitForLoadCompletion();
+    resources.warnings.forEach(addTextureWarning);
+    resources.missingPaths.forEach((path) => addTextureWarning(`missing: ${path}`));
     const root = new Group();
     root.name = modelFile.name.replace(/\.[^.]+$/, "") || "MMD Model";
     adaptMoeruMmdOutlineParameters(mmd.mesh);

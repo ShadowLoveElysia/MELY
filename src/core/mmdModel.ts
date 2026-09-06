@@ -39,6 +39,20 @@ import {
   type PreviewRuntimeDiagnostics,
 } from "./mmdPreviewRuntime";
 import { createSwitchableMmdPhysicsBackend } from "./mmdPhysics";
+import { createMmdResourceUrlBundle } from "./mmdResourceUrls";
+import {
+  collectVisibleMmdTriangles,
+  countVisibleMmdTriangles as countCollectedVisibleMmdTriangles,
+  createMmdMorphSplitBindings,
+  mmdMaterialCanRender,
+  mmdMaterialIsVisible,
+  resolveMmdMorphSplitVertex,
+} from "./threeMmdVisibleGeometry";
+import {
+  computeThreeMmdPosedVertex,
+  createThreeMmdSkinningContext,
+} from "./threeMmdSkinning";
+import { syncMmdUvMorphAttributes } from "./mmdUvMorphs";
 
 export type { LoadedMmdModel, MmdRendererMode, MmdSnapshotOptions } from "./mmdRuntime";
 
@@ -51,7 +65,7 @@ export interface LoadedThreeMmdModel extends LoadedMmdModel {
 
 type DisposeMmdModel = (
   model: ThreeMmdModel,
-  options: { textures: "owned" },
+  options: { textures: "all" | "owned" | "none" },
 ) => void;
 
 interface LoaderWithRetainedResources {
@@ -191,7 +205,11 @@ export const disposeMmdModelResources = (
     collectMaterialTextures(material).forEach((texture) => textures.add(texture));
   });
 
-  disposeMmdModel(model, { textures: "owned" });
+  // The upstream disposer also accepts `owned`, but calling it with that
+  // option and then releasing decoded sources below would dispose every
+  // loader-owned texture twice. Keep ownership handling here so textures that
+  // are only reachable through shader uniforms are released as well.
+  disposeMmdModel(model, { textures: "none" });
   releaseOwnedMmdTextureSources(textures);
 
   materials.forEach((material) => {
@@ -234,12 +252,27 @@ const materialCount = (mesh: SkinnedMesh) =>
 const materialList = (mesh: SkinnedMesh) =>
   (Array.isArray(mesh.material) ? mesh.material : [mesh.material]) as Material[];
 
-const materialIsVisible = (material: Material | undefined) =>
-  Boolean(material?.visible && material.opacity > 0.01);
+const materialIsVisible = mmdMaterialIsVisible;
 
 const runtimeMaterialIsVisible = (material: Material) => {
   const flags = material.userData.mmdMaterial?.flags;
   return material.opacity > 0 || mmdMaterialSuppressesColorAtAlpha(material.opacity, flags);
+};
+
+const expandVisibleVertex = (
+  candidate: SkinnedMesh,
+  index: number,
+  transform: Matrix4,
+  point: Vector3,
+  target: Box3,
+  skinningContext: ReturnType<typeof createThreeMmdSkinningContext>,
+) => {
+  const posed = computeThreeMmdPosedVertex(candidate, index, point, skinningContext);
+  if (!posed) return false;
+  posed.applyMatrix4(transform);
+  if (!Number.isFinite(posed.x) || !Number.isFinite(posed.y) || !Number.isFinite(posed.z)) return false;
+  target.expandByPoint(point);
+  return true;
 };
 
 export const computeVisibleMmdBounds = (
@@ -249,64 +282,55 @@ export const computeVisibleMmdBounds = (
 ) => {
   const geometry = mesh.geometry;
   const position = geometry.getAttribute("position");
-  const sourceIndex = geometry.getIndex();
-  const materials = materialList(mesh);
-  const ranges = geometry.groups.length
-    ? geometry.groups
-    : [{ start: 0, count: sourceIndex?.count ?? position.count, materialIndex: 0 }];
-  const splitBodyByMaterial = new Map<number, SkinnedMesh>();
-  const splitBodies = mesh.userData.mmdMorphSplitBodyMeshes;
-  if (Array.isArray(splitBodies)) {
-    splitBodies.forEach((candidate) => {
-      if (!isSkinnedMesh(candidate)) return;
-      const materialIndex = candidate.userData.mmdMorphSplitBody?.materialIndex;
-      if (Number.isInteger(materialIndex)) splitBodyByMaterial.set(materialIndex, candidate);
-    });
+  if (!position || !Number.isInteger(position.count) || position.count <= 0) {
+    target.makeEmpty();
+    return target;
   }
-
   target.makeEmpty();
   root.updateMatrixWorld(true);
+  // Morph-split body influences are normally copied by the loader's render
+  // hook. Bounds can be requested before a render, so synchronize them here
+  // before evaluating the same posed vertices used by snapshots.
+  syncMmdUvMorphAttributes(root);
   mesh.skeleton.update();
   const rootWorldInverse = new Matrix4().copy(root.matrixWorld).invert();
   const meshToRoot = new Matrix4().multiplyMatrices(rootWorldInverse, mesh.matrixWorld);
   const point = new Vector3();
-  for (const range of ranges) {
-    const materialIndex = range.materialIndex ?? 0;
-    if (!materialIsVisible(materials[materialIndex] ?? materials[0])) continue;
-    const splitBody = splitBodyByMaterial.get(materialIndex);
-    if (splitBody) {
-      const splitToRoot = new Matrix4().multiplyMatrices(rootWorldInverse, splitBody.matrixWorld);
-      const splitPosition = splitBody.geometry.getAttribute("position");
-      for (let index = 0; index < splitPosition.count; index += 1) {
-        splitBody.getVertexPosition(index, point).applyMatrix4(splitToRoot);
-        target.expandByPoint(point);
-      }
-      continue;
-    }
-    const end = Math.min(range.start + range.count, sourceIndex?.count ?? position.count);
-    for (let offset = range.start; offset < end; offset += 1) {
-      const vertexIndex = sourceIndex ? sourceIndex.getX(offset) : offset;
-      mesh.getVertexPosition(vertexIndex, point).applyMatrix4(meshToRoot);
-      target.expandByPoint(point);
+  const triangles = collectVisibleMmdTriangles(mesh);
+  const splitBindings = createMmdMorphSplitBindings(mesh);
+  const skinningContexts = new Map<SkinnedMesh, ReturnType<typeof createThreeMmdSkinningContext>>();
+  const contextFor = (candidate: SkinnedMesh) => {
+    if (skinningContexts.has(candidate)) return skinningContexts.get(candidate);
+    const context = createThreeMmdSkinningContext(candidate);
+    skinningContexts.set(candidate, context);
+    return context;
+  };
+  for (let triangleIndex = 0; triangleIndex < triangles.triangleMaterials.length; triangleIndex += 1) {
+    const materialIndex = triangles.triangleMaterials[triangleIndex];
+    for (let corner = 0; corner < 3; corner += 1) {
+      const compactIndex = triangles.indices[triangleIndex * 3 + corner];
+      const sourceVertex = triangles.sourceVertexIndices[compactIndex];
+      const elementOffset = triangles.sourceElementOffsets[compactIndex] ?? sourceVertex;
+      const split = resolveMmdMorphSplitVertex(
+        splitBindings,
+        sourceVertex,
+        elementOffset,
+        materialIndex,
+      );
+      const transform = split
+        ? new Matrix4().multiplyMatrices(rootWorldInverse, split.mesh.matrixWorld)
+        : meshToRoot;
+      expandVisibleVertex(
+        split?.mesh ?? mesh,
+        split?.vertexIndex ?? sourceVertex,
+        transform,
+        point,
+        target,
+        contextFor(split?.mesh ?? mesh),
+      );
     }
   }
   return target;
-};
-
-const countVisibleMmdTriangles = (mesh: SkinnedMesh) => {
-  const geometry = mesh.geometry;
-  const position = geometry.getAttribute("position");
-  const sourceIndex = geometry.getIndex();
-  const materials = materialList(mesh);
-  const ranges = geometry.groups.length
-    ? geometry.groups
-    : [{ start: 0, count: sourceIndex?.count ?? position.count, materialIndex: 0 }];
-  return ranges.reduce((count, range) => {
-    const materialIndex = range.materialIndex ?? 0;
-    if (!materialIsVisible(materials[materialIndex] ?? materials[0])) return count;
-    const end = Math.min(range.start + range.count, sourceIndex?.count ?? position.count);
-    return count + Math.max(0, Math.floor((end - range.start) / 3));
-  }, 0);
 };
 
 interface ExpressionTrackState {
@@ -665,12 +689,14 @@ export const loadMmdModel = async (
 ): Promise<LoadedThreeMmdModel> => {
   const {
     ThreeMmdLoader,
-    createMmdTextureMapFromFiles,
     disposeMmdModel,
   } = await import("@yohawing/three-mmd-loader");
 
+  const resources = createMmdResourceUrlBundle(files, modelFile);
   const loader = new ThreeMmdLoader({
-    textureMap: createMmdTextureMapFromFiles(files, modelFile),
+    textureResolver: {
+      resolve: async (path, modelUrl) => resources.resolveFile(path, modelUrl),
+    },
     geometryAwareAlpha: true,
     runtime: {
       physics: "external",
@@ -680,11 +706,27 @@ export const loadMmdModel = async (
   let model: ThreeMmdModel;
   try {
     model = await loader.loadModel(modelFile, MMD_MODEL_LOAD_OPTIONS);
+    await resources.waitForLoadCompletion();
+  } catch (error) {
+    resources.dispose();
+    throw error;
   } finally {
     releaseMmdLoaderReferences(loader);
   }
-  evaluateMmdPreviewFrame(model, 0);
-  syncMmdSkeletonForCpuRead(model);
+  let modelResourcesDisposed = false;
+  let physicsDisposed = false;
+  const disposeLoadedModelResources = () => {
+    if (modelResourcesDisposed) return;
+    modelResourcesDisposed = true;
+    try {
+      disposeMmdModelResources(model, disposeMmdModel);
+    } finally {
+      resources.dispose();
+    }
+  };
+  try {
+    evaluateMmdPreviewFrame(model, 0);
+    syncMmdSkeletonForCpuRead(model);
 
   const position = model.mesh.geometry.getAttribute("position");
   const index = model.mesh.geometry.getIndex();
@@ -709,6 +751,12 @@ export const loadMmdModel = async (
   const textureWarnings = model.diagnostics.textures.map((diagnostic) =>
     `${diagnostic.textureKind}: ${diagnostic.path}`,
   );
+  const textureWarningKeys = new Set(textureWarnings);
+  [...resources.warnings, ...resources.missingPaths.map((path) => `missing: ${path}`)].forEach((warning) => {
+    if (textureWarningKeys.has(warning)) return;
+    textureWarningKeys.add(warning);
+    textureWarnings.push(warning);
+  });
   let activeModel: ThreeMmdModel | null = model;
   let pose: MmdPoseController | null = createMmdPoseController(model.mesh);
   const bones = pose.bones;
@@ -788,7 +836,7 @@ export const loadMmdModel = async (
       if (visible) {
         if (!hiddenMaterialIndices.has(index)) return;
         hiddenMaterialIndices.delete(index);
-        material.visible = runtimeMaterialIsVisible(material);
+        material.visible = mmdMaterialCanRender(material);
       } else {
         if (hiddenMaterialIndices.has(index)) return;
         hiddenMaterialIndices.add(index);
@@ -801,7 +849,7 @@ export const loadMmdModel = async (
     },
     visibleTriangleCount: () => {
       currentModel();
-      return countVisibleMmdTriangles(model.mesh);
+      return countCollectedVisibleMmdTriangles(model.mesh);
     },
     textureByteEstimate: () => {
       currentModel();
@@ -1017,9 +1065,26 @@ export const loadMmdModel = async (
       expressionTrack = null;
       importedPoseAnimation = null;
       pose = null;
-      physics?.dispose?.();
-      disposeMmdModelResources(disposedModel, disposeMmdModel);
+      try {
+        if (!physicsDisposed) {
+          physicsDisposed = true;
+          physics?.dispose?.();
+        }
+      } finally {
+        disposeLoadedModelResources();
+      }
     },
   };
-  return loadedModel;
+    return loadedModel;
+  } catch (error) {
+    // Loading has already returned a model at this point, so failures while
+    // evaluating its first frame or assembling the application wrapper must
+    // release the same runtime, textures and decoded image sources as dispose.
+    try {
+      disposeLoadedModelResources();
+    } catch {
+      // Preserve the original load/assembly error.
+    }
+    throw error;
+  }
 };

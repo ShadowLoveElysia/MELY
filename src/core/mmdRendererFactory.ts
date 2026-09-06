@@ -10,8 +10,12 @@ export const loadMmdModelForRenderer = async (
   modelFile: File,
 ): Promise<LoadedMmdModel> => {
   if (mode === "vanilla") {
-    const { loadThreeVanillaMmdModel } = await import("./threeVanillaMmdDriver");
-    return loadThreeVanillaMmdModel(files, modelFile);
+    // Keep Vanilla on the parser/geometry/runtime path that owns the same
+    // Yohawing model representation end to end. The legacy stock
+    // three-stdlib adapter used a separate metadata parser and could silently
+    // lose PMX skinning and morph semantics between those stages.
+    const { loadMmdModel } = await import("./mmdModel");
+    return loadMmdModel(files, modelFile);
   }
   if (mode === "moeru") {
     const { loadThreeMoeruMmdModel } = await import("./threeMoeruMmdDriver");

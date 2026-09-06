@@ -8,9 +8,18 @@ import type {
   MmdMeshSnapshot,
 } from "../types";
 import { appError } from "./appError";
-
-type FourNumbers = [number, number, number, number];
-type FourMatrices = [THREE.Matrix4, THREE.Matrix4, THREE.Matrix4, THREE.Matrix4];
+import { syncMmdUvMorphAttributes } from "./mmdUvMorphs";
+import {
+  collectVisibleMmdTriangles,
+  createMmdMorphSplitBindings,
+  mmdMaterialIsVisible,
+  resolveMmdMorphSplitVertex,
+  type MmdMorphSplitBindings,
+} from "./threeMmdVisibleGeometry";
+import {
+  computeThreeMmdPosedVertex,
+  createThreeMmdSkinningContext,
+} from "./threeMmdSkinning";
 
 export interface ThreeMmdSnapshotSource {
   root: THREE.Group;
@@ -176,105 +185,18 @@ export const createMmdFaceFrameSnapshot = (
   };
 };
 
-const readFourNumbers = (
-  attribute: THREE.BufferAttribute | THREE.InterleavedBufferAttribute,
+const finiteVector = (value: THREE.Vector3) => (
+  Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z)
+);
+
+const validAttributeIndex = (
+  attribute: THREE.BufferAttribute | THREE.InterleavedBufferAttribute | undefined,
   index: number,
-): FourNumbers => [
-  attribute.getX(index),
-  attribute.getY(index),
-  attribute.getZ(index),
-  attribute.getW(index),
-];
+) => Boolean(attribute && Number.isInteger(index) && index >= 0 && index < attribute.count);
 
-const readVector3 = (
-  attribute: THREE.BufferAttribute | THREE.InterleavedBufferAttribute,
-  index: number,
-  target: THREE.Vector3,
-) => target.set(attribute.getX(index), attribute.getY(index), attribute.getZ(index));
+const finiteMatrix = (matrix: THREE.Matrix4) => matrix.elements.every(Number.isFinite);
 
-const getMorphedPosition = (
-  mesh: THREE.SkinnedMesh,
-  vertexIndex: number,
-  target: THREE.Vector3,
-  base: THREE.Vector3,
-  offset: THREE.Vector3,
-  morphed: THREE.Vector3,
-) => {
-  const geometry = mesh.geometry;
-  const position = geometry.getAttribute("position");
-  target.fromBufferAttribute(position, vertexIndex);
-
-  const morphPositions = geometry.morphAttributes.position;
-  const influences = mesh.morphTargetInfluences;
-  if (!morphPositions?.length || !influences) return target;
-
-  base.copy(target);
-  offset.set(0, 0, 0);
-  for (let morphIndex = 0; morphIndex < morphPositions.length; morphIndex += 1) {
-    const influence = influences[morphIndex] ?? 0;
-    if (influence === 0) continue;
-    morphed.fromBufferAttribute(morphPositions[morphIndex], vertexIndex);
-    if (!geometry.morphTargetsRelative) morphed.sub(base);
-    offset.addScaledVector(morphed, influence);
-  }
-  return target.add(offset);
-};
-
-const materialIsVisible = (material: THREE.Material | undefined) =>
-  Boolean(material?.visible && material.opacity > 0.01);
-
-const collectVisibleTriangles = (mesh: THREE.SkinnedMesh) => {
-  const geometry = mesh.geometry;
-  const vertexCount = geometry.getAttribute("position").count;
-  const sourceIndex = geometry.getIndex();
-  const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-  const ranges = geometry.groups.length
-    ? geometry.groups.map((group) => ({
-        start: group.start,
-        count: group.count,
-        materialIndex: group.materialIndex ?? 0,
-      }))
-    : [{ start: 0, count: sourceIndex?.count ?? vertexCount, materialIndex: 0 }];
-  const visibleRanges = ranges.flatMap((range) => {
-    if (!materialIsVisible(materials[range.materialIndex] ?? materials[0])) return [];
-    const end = Math.min(range.start + range.count, sourceIndex?.count ?? vertexCount);
-    const triangleCount = Math.max(0, Math.floor((end - range.start) / 3));
-    return triangleCount > 0 ? [{ ...range, triangleCount }] : [];
-  });
-  const triangleCount = visibleRanges.reduce((sum, range) => sum + range.triangleCount, 0);
-  if (triangleCount === 0) throw appError("error.snapshot.noVisibleTriangles");
-  const indices = new Uint32Array(triangleCount * 3);
-  const triangleMaterials = new Uint16Array(triangleCount);
-  let indexOffset = 0;
-  let triangleOffset = 0;
-  for (const range of visibleRanges) {
-    for (let triangle = 0; triangle < range.triangleCount; triangle += 1) {
-      const sourceOffset = range.start + triangle * 3;
-      indices[indexOffset++] = sourceIndex ? sourceIndex.getX(sourceOffset) : sourceOffset;
-      indices[indexOffset++] = sourceIndex ? sourceIndex.getX(sourceOffset + 1) : sourceOffset + 1;
-      indices[indexOffset++] = sourceIndex ? sourceIndex.getX(sourceOffset + 2) : sourceOffset + 2;
-      triangleMaterials[triangleOffset++] = range.materialIndex;
-    }
-  }
-  const sourceToVisible = new Int32Array(vertexCount);
-  sourceToVisible.fill(-1);
-  const sourceVertexIndices: number[] = [];
-  for (let offset = 0; offset < indices.length; offset += 1) {
-    const sourceVertexIndex = indices[offset];
-    let visibleVertexIndex = sourceToVisible[sourceVertexIndex];
-    if (visibleVertexIndex < 0) {
-      visibleVertexIndex = sourceVertexIndices.length;
-      sourceToVisible[sourceVertexIndex] = visibleVertexIndex;
-      sourceVertexIndices.push(sourceVertexIndex);
-    }
-    indices[offset] = visibleVertexIndex;
-  }
-  return {
-    indices,
-    triangleMaterials,
-    sourceVertexIndices: Uint32Array.from(sourceVertexIndices),
-  };
-};
+const materialIsVisible = mmdMaterialIsVisible;
 
 const textureImageSize = (image: unknown) => {
   if (!image || typeof image !== "object") return null;
@@ -497,83 +419,35 @@ const captureMaterials = (
   return { materials, textures };
 };
 
-interface SplitMorphBindings {
-  meshes: THREE.SkinnedMesh[];
-  meshIndices: Int16Array;
-  localIndices: Uint32Array;
-}
-
-const splitMorphBindings = (mesh: THREE.SkinnedMesh): SplitMorphBindings | undefined => {
-  const candidates = mesh.userData.mmdMorphSplitBodyMeshes;
-  if (!Array.isArray(candidates)) return undefined;
-  const meshes = candidates.filter((candidate): candidate is THREE.SkinnedMesh =>
-    Boolean(candidate && typeof candidate === "object" && candidate.isSkinnedMesh));
-  if (!meshes.length || meshes.length >= 0x7fff) return undefined;
-  const sourceIndex = mesh.geometry.getIndex();
-  if (!sourceIndex) return undefined;
-  const vertexCount = mesh.geometry.getAttribute("position").count;
-  const meshIndices = new Int16Array(vertexCount);
-  meshIndices.fill(-1);
-  const localIndices = new Uint32Array(vertexCount);
-  const seenAt = new Uint32Array(vertexCount);
-
-  meshes.forEach((body, bodyIndex) => {
-    const materialIndex = body.userData.mmdMorphSplitBody?.materialIndex;
-    if (!Number.isInteger(materialIndex)) return;
-    const group = mesh.geometry.groups.find((candidate) => candidate.materialIndex === materialIndex);
-    if (!group) return;
-    let localIndex = 0;
-    const stamp = bodyIndex + 1;
-    const end = Math.min(group.start + group.count, sourceIndex.count);
-    for (let offset = group.start; offset < end; offset += 1) {
-      const sourceVertex = sourceIndex.getX(offset);
-      if (seenAt[sourceVertex] === stamp) continue;
-      seenAt[sourceVertex] = stamp;
-      if (meshIndices[sourceVertex] < 0) {
-        meshIndices[sourceVertex] = bodyIndex;
-        localIndices[sourceVertex] = localIndex;
-      }
-      localIndex += 1;
-    }
-  });
-  return { meshes, meshIndices, localIndices };
-};
-
 const morphMeshForVertex = (
   mesh: THREE.SkinnedMesh,
   vertexIndex: number,
-  bindings: SplitMorphBindings | undefined,
-) => {
-  if (!bindings) return { mesh, vertexIndex };
-  const bodyIndex = bindings.meshIndices[vertexIndex];
-  const body = bodyIndex >= 0 ? bindings.meshes[bodyIndex] : undefined;
-  return body
-    ? { mesh: body, vertexIndex: bindings.localIndices[vertexIndex] }
-    : { mesh, vertexIndex };
-};
+  sourceElementOffset: number,
+  materialIndex: number,
+  bindings: MmdMorphSplitBindings | undefined,
+) => resolveMmdMorphSplitVertex(
+  bindings,
+  vertexIndex,
+  sourceElementOffset,
+  materialIndex,
+) ?? { mesh, vertexIndex };
 
 export const createMmdMeshSnapshot = async (
   model: ThreeMmdSnapshotSource,
   options: MmdSnapshotOptions = {},
 ): Promise<MmdMeshSnapshot> => {
-  const { computeMmdSdefSkinnedPosition, computeQdefSkinnedPosition } = await import(
-    "@yohawing/three-mmd-loader"
-  );
   const mesh = model.mesh;
+  // Snapshot UVs are read from live geometry attributes. Keep them in sync
+  // here as well as after runtime updates so callers that changed morph
+  // influences directly still capture the current UV expression.
+  syncMmdUvMorphAttributes(model.root);
   const geometry = mesh.geometry;
   const position = geometry.getAttribute("position");
-  const skinIndex = geometry.getAttribute("skinIndex");
-  const skinWeight = geometry.getAttribute("skinWeight");
-  const sdefEnabled = geometry.getAttribute("matricesSdefEnabled")
-    ?? geometry.getAttribute("mmdSdefMask");
-  const sdefC = geometry.getAttribute("matricesSdefC")
-    ?? geometry.getAttribute("mmdSdefC");
-  const sdefRW0 = geometry.getAttribute("matricesSdefRW0")
-    ?? geometry.getAttribute("mmdSdefRW0");
-  const sdefRW1 = geometry.getAttribute("matricesSdefRW1")
-    ?? geometry.getAttribute("mmdSdefRW1");
-  const qdefEnabled = geometry.getAttribute("matricesQdefEnabled");
-  const triangles = collectVisibleTriangles(mesh);
+  if (!position || !Number.isInteger(position.count) || position.count <= 0) {
+    throw appError("error.mesh.invalidVertices");
+  }
+  const triangles = collectVisibleMmdTriangles(mesh);
+  if (triangles.indices.length === 0) throw appError("error.snapshot.noVisibleTriangles");
   const sourceVertexIndices = triangles.sourceVertexIndices;
 
   model.root.updateMatrixWorld(true);
@@ -584,21 +458,31 @@ export const createMmdMeshSnapshot = async (
     .copy(model.root.matrixWorld)
     .invert()
     .multiply(mesh.matrixWorld);
+  const meshToRootByMesh = new Map<THREE.SkinnedMesh, THREE.Matrix4>([[mesh, meshToRoot]]);
+  const transformForMesh = (candidate: THREE.SkinnedMesh) => {
+    const cached = meshToRootByMesh.get(candidate);
+    if (cached) return cached;
+    const transform = new THREE.Matrix4()
+      .copy(model.root.matrixWorld)
+      .invert()
+      .multiply(candidate.matrixWorld);
+    meshToRootByMesh.set(candidate, transform);
+    return transform;
+  };
 
-  const boneMatrices = mesh.skeleton.bones.map((bone, index) =>
-    new THREE.Matrix4().multiplyMatrices(bone.matrixWorld, mesh.skeleton.boneInverses[index]),
-  );
-  const identityMatrix = new THREE.Matrix4();
-  const splitBindings = splitMorphBindings(mesh);
+  if (!finiteMatrix(meshToRoot)) {
+    throw appError("error.mesh.nonFiniteVertex");
+  }
+  const splitBindings = createMmdMorphSplitBindings(mesh);
+  const skinningContexts = new Map<THREE.SkinnedMesh, ReturnType<typeof createThreeMmdSkinningContext>>();
+  const contextFor = (candidate: THREE.SkinnedMesh) => {
+    if (skinningContexts.has(candidate)) return skinningContexts.get(candidate);
+    const context = createThreeMmdSkinningContext(candidate);
+    skinningContexts.set(candidate, context);
+    return context;
+  };
   const positions = new Float32Array(sourceVertexIndices.length * 3);
-  const morphedPosition = new THREE.Vector3();
-  const morphBase = new THREE.Vector3();
-  const morphOffset = new THREE.Vector3();
-  const morphTarget = new THREE.Vector3();
-  const linearSkinned = new THREE.Vector3();
-  const sdefCenter = new THREE.Vector3();
-  const sdefWeighted0 = new THREE.Vector3();
-  const sdefWeighted1 = new THREE.Vector3();
+  const posedPosition = new THREE.Vector3();
 
   for (let visibleVertexIndex = 0; visibleVertexIndex < sourceVertexIndices.length; visibleVertexIndex += 1) {
     if (visibleVertexIndex > 0 && visibleVertexIndex % SNAPSHOT_CHUNK_SIZE === 0) {
@@ -608,56 +492,29 @@ export const createMmdMeshSnapshot = async (
     }
     const vertexIndex = sourceVertexIndices[visibleVertexIndex];
 
-    const morphSource = morphMeshForVertex(mesh, vertexIndex, splitBindings);
-    getMorphedPosition(
+    const sourceElementOffset = triangles.sourceElementOffsets[visibleVertexIndex] ?? vertexIndex;
+    const materialIndex = triangles.sourceMaterialIndices[visibleVertexIndex] ?? 0;
+    const morphSource = morphMeshForVertex(
+      mesh,
+      vertexIndex,
+      sourceElementOffset,
+      materialIndex,
+      splitBindings,
+    );
+    const posed = computeThreeMmdPosedVertex(
       morphSource.mesh,
       morphSource.vertexIndex,
-      morphedPosition,
-      morphBase,
-      morphOffset,
-      morphTarget,
+      posedPosition,
+      contextFor(morphSource.mesh),
     );
-    let skinned: THREE.Vector3;
-
-    if (skinIndex && skinWeight) {
-      const boneIndices = readFourNumbers(skinIndex, vertexIndex);
-      const weights = readFourNumbers(skinWeight, vertexIndex);
-      const matrices = boneIndices.map((boneIndex) =>
-        boneMatrices[Math.max(0, Math.min(boneMatrices.length - 1, Math.round(boneIndex)))]
-          ?? identityMatrix,
-      ) as FourMatrices;
-
-      if ((qdefEnabled?.getX(vertexIndex) ?? 0) >= 0.5) {
-        skinned = computeQdefSkinnedPosition({
-          position: morphedPosition,
-          skinWeights: weights,
-          boneMatrices: matrices,
-          bindMatrix: mesh.bindMatrix,
-          bindMatrixInverse: mesh.bindMatrixInverse,
-        });
-      } else if ((sdefEnabled?.getX(vertexIndex) ?? 0) >= 0.5 && sdefC && sdefRW0 && sdefRW1) {
-        skinned = computeMmdSdefSkinnedPosition({
-          position: morphedPosition,
-          skinWeights: weights,
-          boneMatrices: matrices,
-          sdefEnabled: 1,
-          sdefC: readVector3(sdefC, vertexIndex, sdefCenter),
-          sdefRW0: readVector3(sdefRW0, vertexIndex, sdefWeighted0),
-          sdefRW1: readVector3(sdefRW1, vertexIndex, sdefWeighted1),
-          bindMatrix: mesh.bindMatrix,
-          bindMatrixInverse: mesh.bindMatrixInverse,
-        });
-      } else {
-        skinned = mesh.applyBoneTransform(vertexIndex, linearSkinned.copy(morphedPosition)) as THREE.Vector3;
-      }
-    } else {
-      skinned = linearSkinned.copy(morphedPosition);
-    }
-
-    skinned.applyMatrix4(meshToRoot);
-    positions[visibleVertexIndex * 3] = skinned.x;
-    positions[visibleVertexIndex * 3 + 1] = skinned.y;
-    positions[visibleVertexIndex * 3 + 2] = skinned.z;
+    if (!posed) throw appError("error.mesh.invalidVertices");
+    const meshToRootTransform = transformForMesh(morphSource.mesh);
+    if (!finiteMatrix(meshToRootTransform)) throw appError("error.mesh.nonFiniteVertex");
+    posed.applyMatrix4(meshToRootTransform);
+    if (!finiteVector(posed)) throw appError("error.mesh.nonFiniteVertex");
+    positions[visibleVertexIndex * 3] = posed.x;
+    positions[visibleVertexIndex * 3 + 1] = posed.y;
+    positions[visibleVertexIndex * 3 + 2] = posed.z;
   }
 
   throwIfCancelled(options);
@@ -667,14 +524,29 @@ export const createMmdMeshSnapshot = async (
     triangleMaterials: triangles.triangleMaterials,
   };
   if (options.includeTextures === false) return { positions, ...visibleTriangles, faceFrame };
-  const uvAttribute = geometry.getAttribute("uv");
-  const uvs = uvAttribute
-    ? Float32Array.from({ length: sourceVertexIndices.length * 2 }, (_, offset) => {
-        const sourceVertexIndex = sourceVertexIndices[Math.floor(offset / 2)];
-        return offset % 2 === 0
-          ? uvAttribute.getX(sourceVertexIndex)
-          : uvAttribute.getY(sourceVertexIndex);
-      })
+  const readUv = (visibleVertexIndex: number, sourceVertexIndex: number) => {
+    const sourceElementOffset = triangles.sourceElementOffsets[visibleVertexIndex] ?? sourceVertexIndex;
+    const materialIndex = triangles.sourceMaterialIndices[visibleVertexIndex] ?? 0;
+    const source = morphMeshForVertex(
+      mesh,
+      sourceVertexIndex,
+      sourceElementOffset,
+      materialIndex,
+      splitBindings,
+    );
+    const attribute = source.mesh.geometry.getAttribute("uv");
+    if (!validAttributeIndex(attribute, source.vertexIndex)) return undefined;
+    return [attribute.getX(source.vertexIndex), attribute.getY(source.vertexIndex)] as const;
+  };
+  const uvValues: Array<readonly [number, number] | undefined> = [];
+  for (let index = 0; index < sourceVertexIndices.length; index += 1) {
+    uvValues.push(readUv(index, sourceVertexIndices[index] ?? -1));
+  }
+  const uvs = uvValues.every((value): value is readonly [number, number] => Boolean(value))
+    ? Float32Array.from(uvValues.reduce<number[]>((values, value) => {
+        if (value) values.push(value[0], value[1]);
+        return values;
+      }, []))
     : undefined;
   const materialData = captureMaterials(
     mesh,

@@ -38,6 +38,11 @@ import {
 } from "./mmdModel";
 import { createMmdPoseController, type MmdPoseController } from "./mmdPose";
 import { normalizeMelyBoneName } from "./melyPose";
+import {
+  countVisibleMmdTriangles,
+  mmdMaterialCanRender,
+  mmdMaterialIsVisible,
+} from "./threeMmdVisibleGeometry";
 import type {
   LoadedMmdModel,
   MmdRendererMode,
@@ -93,8 +98,7 @@ const materialList = (mesh: SkinnedMesh) => (
   Array.isArray(mesh.material) ? mesh.material : [mesh.material]
 ) as Material[];
 
-const materialIsVisible = (material: Material | undefined) =>
-  Boolean(material?.visible && material.opacity > 0.01);
+const materialIsVisible = mmdMaterialIsVisible;
 
 const materialColor = (material: Material) => {
   const color = (
@@ -201,21 +205,6 @@ const collectMorphNames = (
   ...Object.keys(mesh.morphTargetDictionary ?? {}),
   ...(metadata.morphEnglishNames ?? []),
 ])).filter(Boolean);
-
-const countVisibleTriangles = (mesh: SkinnedMesh) => {
-  const geometry = mesh.geometry;
-  const position = geometry.getAttribute("position");
-  const sourceIndex = geometry.getIndex();
-  const materials = materialList(mesh);
-  const groups = geometry.groups.length
-    ? geometry.groups
-    : [{ start: 0, count: sourceIndex?.count ?? position.count, materialIndex: 0 }];
-  return groups.reduce((count, group) => {
-    if (!materialIsVisible(materials[group.materialIndex ?? 0] ?? materials[0])) return count;
-    const end = Math.min(group.start + group.count, sourceIndex?.count ?? position.count);
-    return count + Math.max(0, Math.floor((end - group.start) / 3));
-  }, 0);
-};
 
 const estimateTextureBytes = (materials: readonly Material[]) => {
   const seen = new Set<string>();
@@ -504,7 +493,7 @@ export const createThreeMmdModel = ({ driver }: ThreeRuntimeOptions): LoadedThre
       if (!material) throw new RangeError(`MMD material index is out of range: ${materialIndex}`);
       if (visible) {
         hiddenMaterialIndices.delete(materialIndex);
-        material.visible = material.opacity > 0.01;
+        material.visible = mmdMaterialCanRender(material);
       } else {
         hiddenMaterialIndices.add(materialIndex);
         material.visible = false;
@@ -516,7 +505,7 @@ export const createThreeMmdModel = ({ driver }: ThreeRuntimeOptions): LoadedThre
     },
     visibleTriangleCount: () => {
       assertActive();
-      return countVisibleTriangles(mesh);
+      return countVisibleMmdTriangles(mesh);
     },
     textureByteEstimate: () => {
       assertActive();
