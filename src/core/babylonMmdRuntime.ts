@@ -77,6 +77,7 @@ import {
   threeToBabylonPosition,
 } from "./mmdCoordinates";
 import { createBabylonMmdReferenceFiles } from "./babylonMmdResources";
+import { builtinToonFile } from "./mmdBuiltinToon";
 import { applyBabylonCameraPanningProfile } from "./babylonCameraControls";
 import { isSuggestedEmissiveMaterial, isSuggestedSkinMaterial } from "./mmdModel";
 import { MMD_PREVIEW_VERTICAL_FOV_RADIANS } from "./perspectiveFraming";
@@ -192,11 +193,24 @@ class DiagnosticMmdMaterialBuilder extends MmdStandardMaterialBuilder {
   public override async loadToonTexture(
     ...args: Parameters<MmdStandardMaterialBuilder["loadToonTexture"]>
   ) {
-    await super.loadToonTexture(...args);
-    const [, material, materialInfo, imagePathTable, textureInfo] = args;
+    const [, , materialInfo, imagePathTable, textureInfo, , , , referenceFileResolver] = args;
     const path = imagePathTable[textureInfo?.imagePathIndex ?? -1];
+    const resolved = path === undefined
+      ? undefined
+      : referenceFileResolver.resolve(referenceFileResolver.createFullPath(path));
+    const effectiveArgs = resolved || path === undefined || materialInfo.isSharedToonTexture
+      ? args
+      : [
+        args[0], args[1], args[2],
+        Object.assign([...imagePathTable], {
+          [textureInfo?.imagePathIndex ?? -1]: `toon/${builtinToonFile(path).name}`,
+        }),
+        args[4], args[5], args[6], args[7], args[8], args[9], args[10],
+      ] as Parameters<MmdStandardMaterialBuilder["loadToonTexture"]>;
+    await super.loadToonTexture(...effectiveArgs);
+    const [, material, effectiveMaterialInfo] = effectiveArgs;
     if (
-      !materialInfo.isSharedToonTexture
+      !effectiveMaterialInfo.isSharedToonTexture
       && path !== undefined
       && (!material.toonTexture || material.toonTexture.loadingError)
     ) this.warn("toon", path);
@@ -1020,7 +1034,9 @@ export const loadBabylonMmdModel = async (
     light.intensity = 1.8;
     const hemi = new HemisphericLight("mely-babylon-hemi", new Vector3(0, 1, 0), scene);
     hemi.intensity = 0.65;
-    const referenceBundle = createBabylonMmdReferenceFiles(files, modelFile);
+    const referenceBundle = createBabylonMmdReferenceFiles(files, modelFile, {
+      includeBuiltinToon: true,
+    });
     const textureWarnings = [...referenceBundle.warnings];
     const materialBuilder = new DiagnosticMmdMaterialBuilder(textureWarnings);
 

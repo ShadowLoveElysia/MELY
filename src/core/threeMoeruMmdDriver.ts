@@ -93,6 +93,7 @@ export const loadThreeMoeruMmdModel = async (
     await resources.waitForLoadCompletion();
     resources.warnings.forEach(addTextureWarning);
     resources.missingPaths.forEach((path) => addTextureWarning(`missing: ${path}`));
+    resources.fallbackPaths.forEach((path) => addTextureWarning(`fallback-builtin-toon: ${path}`));
     const root = new Group();
     root.name = modelFile.name.replace(/\.[^.]+$/, "") || "MMD Model";
     adaptMoeruMmdOutlineParameters(mmd.mesh);

@@ -1,3 +1,5 @@
+import { builtinToonFile } from "./mmdBuiltinToon";
+
 const MMD_TEXTURE_FILE_PATTERN = /\.(?:bmp|dds|gif|jpe?g|png|spa|sph|tga|webp)$/i;
 
 const normalizeReferencePath = (path: string) => path
@@ -46,6 +48,10 @@ export interface BabylonMmdReferenceFiles {
   warnings: string[];
 }
 
+export interface BabylonMmdReferenceOptions {
+  readonly includeBuiltinToon?: boolean;
+}
+
 /**
  * babylon-mmd resolves File references exclusively through webkitRelativePath.
  * SceneLoader supplies an empty rootUrl for an in-memory model File, so paths
@@ -54,6 +60,7 @@ export interface BabylonMmdReferenceFiles {
 export const createBabylonMmdReferenceFiles = (
   files: readonly File[],
   modelFile: File,
+  options: BabylonMmdReferenceOptions = {},
 ): BabylonMmdReferenceFiles => {
   const modelDirectory = directorySegments(assetPath(modelFile));
   const referenceFiles: File[] = [];
@@ -73,6 +80,17 @@ export const createBabylonMmdReferenceFiles = (
     seen.add(key);
     referenceFiles.push(withRelativePath(file, rebased));
   });
+
+  if (options.includeBuiltinToon) for (let index = 1; index <= 10; index += 1) {
+    const name = `toon${String(index).padStart(2, "0")}.bmp`;
+    const builtin = builtinToonFile(name);
+    for (const rebased of [`toon/${name}`, name]) {
+      const key = rebased.toUpperCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      referenceFiles.push(withRelativePath(builtin, rebased));
+    }
+  }
 
   return { referenceFiles, warnings };
 };

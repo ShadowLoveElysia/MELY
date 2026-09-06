@@ -1,5 +1,6 @@
 import { LoadingManager } from "three";
 import { normalizeAssetPath } from "./mmdAssets";
+import { builtinToonFile, isToonReference } from "./mmdBuiltinToon";
 
 const decodeResourcePath = (value: string) => {
   let decoded = value;
@@ -24,6 +25,9 @@ const pathKey = (value: string) => canonicalPath(value).toLowerCase();
 const isExternalOrAbsolutePath = (value: string) => (
   /^(?:[a-z][a-z\d+.-]*:|[\\/]|[a-z]:[\\/])/i.test(value)
 );
+
+const isNetworkOrFileUrl = (value: string) => /^(?:[a-z][a-z\d+.-]*:\/\/)/i.test(value);
+const isBasenameSearchableAbsolute = (value: string) => /^[a-z]:[\\/]/i.test(value);
 
 const addCandidate = (
   index: Map<string, Set<File>>,
@@ -113,6 +117,7 @@ export interface MmdResourceUrlBundle {
   /** Resource issues are reported without turning a missing texture into a model-load failure. */
   readonly warnings: readonly string[];
   readonly missingPaths: readonly string[];
+  readonly fallbackPaths: readonly string[];
   dispose: () => void;
 }
 
@@ -131,6 +136,7 @@ export const createMmdResourceUrlBundle = (
   const basenameToFiles = new Map<string, Set<File>>();
   const warnings: string[] = [];
   const missingPaths: string[] = [];
+  const fallbackPaths: string[] = [];
   const warningKeys = new Set<string>();
   const missingKeys = new Set<string>();
   const virtualRoot = `mely-mmd/${crypto.randomUUID()}/`;
@@ -179,12 +185,23 @@ export const createMmdResourceUrlBundle = (
     const clean = pathAfterVirtualRoot(
       requestedPath,
       modelUrl && isVirtualModelUrl(modelUrl, virtualRoot) ? virtualRoot : undefined,
-    );
-    if (isExternalOrAbsolutePath(clean)) return undefined;
-    const normalized = canonicalPath(clean);
+);
+
+const candidatesUnderModelDirectory = (
+  candidates: ReadonlySet<File> | undefined,
+  modelDirectory: string,
+) => [...(candidates ?? [])].filter((file) => {
+  const path = safeAssetPath(file.webkitRelativePath || file.name);
+  const directory = modelDirectory.replace(/\/$/, "");
+  return Boolean(path && (path === directory || path.startsWith(`${directory}/`)));
+});
+    if (isNetworkOrFileUrl(clean)) return undefined;
+    const absolute = isExternalOrAbsolutePath(clean);
+    if (absolute && !isBasenameSearchableAbsolute(clean)) return undefined;
+    const normalized = canonicalPath(absolute ? (clean.split(/[\\/]/).pop() ?? clean) : clean);
     if (!normalized) return undefined;
-    const relativeToModel = joinPath(baseDirectory, normalized);
-    if (relativeToModel === null) {
+    const relativeToModel = absolute ? null : joinPath(baseDirectory, normalized);
+    if (relativeToModel === null && !absolute) {
       const warning = `invalid: ${normalized}`;
       if (!warningKeys.has(warning)) {
         warningKeys.add(warning);
@@ -192,12 +209,12 @@ export const createMmdResourceUrlBundle = (
       }
       return undefined;
     }
-    const relativeKey = pathKey(relativeToModel);
-    if (ambiguousCandidate(pathToFiles, relativeKey)) {
+    const relativeKey = relativeToModel ? pathKey(relativeToModel) : "";
+    if (relativeKey && ambiguousCandidate(pathToFiles, relativeKey)) {
       reportAmbiguous("path", relativeKey);
       return undefined;
     }
-    let file = uniqueCandidate(pathToFiles, relativeKey);
+    let file = relativeKey ? uniqueCandidate(pathToFiles, relativeKey) : undefined;
     if (!file) {
       const normalizedKey = pathKey(normalized);
       if (ambiguousCandidate(pathToFiles, normalizedKey)) {
@@ -209,13 +226,27 @@ export const createMmdResourceUrlBundle = (
     if (!file) {
       const basename = normalized.split("/").pop() ?? normalized;
       const basenameKey = pathKey(basename);
-      if (ambiguousCandidate(basenameToFiles, basenameKey)) {
+      const localCandidates = candidatesUnderModelDirectory(
+        basenameToFiles.get(basenameKey),
+        baseDirectory,
+      );
+      if (localCandidates.length === 1) file = localCandidates[0];
+      else if (localCandidates.length > 1) {
         reportAmbiguous("basename", basenameKey);
         return undefined;
+      } else {
+        if (ambiguousCandidate(basenameToFiles, basenameKey)) {
+          reportAmbiguous("basename", basenameKey);
+          return undefined;
+        }
+        file = uniqueCandidate(basenameToFiles, basenameKey);
       }
-      file = uniqueCandidate(basenameToFiles, basenameKey);
     }
-    if (!file) recordMissingPath(missingPaths, missingKeys, normalized);
+    if (!file && isToonReference(normalized)) {
+      file = builtinToonFile(normalized);
+      fallbackPaths.push(normalized);
+    }
+    if (!file && !absolute) recordMissingPath(missingPaths, missingKeys, normalized);
     return file;
   };
   const modelUrl = createVirtualFileUrl(modelFile);
@@ -257,6 +288,7 @@ export const createMmdResourceUrlBundle = (
     },
     warnings,
     missingPaths,
+    fallbackPaths,
     dispose: () => {
       if (disposed) return;
       disposed = true;

@@ -31,6 +31,31 @@ test("Three resource URLs resolve model-relative and URL-encoded local paths", a
   }
 });
 
+test("absolute model references use basename fallback for local files", async () => {
+  const model = fileAt("pack/model.pmx", "model-bytes");
+  const texture = fileAt("pack/textures/02.png", "texture-bytes");
+  const bundle = createMmdResourceUrlBundle([model, texture], model);
+  try {
+    const url = bundle.manager.resolveURL("H:\\\\Downloads\\\\AAA\\\\02.png");
+    assert.equal(await fetch(url).then((response) => response.text()), "texture-bytes");
+  } finally {
+    bundle.dispose();
+  }
+});
+
+test("missing toon references use the built-in fallback", async () => {
+  const model = fileAt("pack/model.pmx", "model-bytes");
+  const bundle = createMmdResourceUrlBundle([model], model);
+  try {
+    const url = bundle.manager.resolveURL("toon/toon01.bmp");
+    assert.match(url, /^blob:/);
+    assert.ok(bundle.fallbackPaths.includes("toon/toon01.bmp"));
+    assert.equal((await fetch(url)).ok, true);
+  } finally {
+    bundle.dispose();
+  }
+});
+
 test("Three resource URLs resolve a sibling package path before basename fallback", async () => {
   const model = fileAt("pack/models/character/model.pmx", "model-bytes");
   const sibling = fileAt("pack/shared/toon.bmp", "sibling-bytes");

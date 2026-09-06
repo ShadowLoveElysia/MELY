@@ -23,6 +23,12 @@ test("Babylon reference files fall back to names for ordinary File inputs", () =
   assert.equal(result.referenceFiles[0]?.type, "image/png");
 });
 
+test("Babylon can opt into built-in toon references for runtime loading", () => {
+  const model = new File(["model"], "model.pmx");
+  const result = createBabylonMmdReferenceFiles([model], model, { includeBuiltinToon: true });
+  assert.ok(result.referenceFiles.some((file) => file.webkitRelativePath === "toon/toon01.bmp"));
+});
+
 test("Babylon reference files are rebased to a nested model directory", () => {
   const model = fileAt("package/角色/model.pmx");
   const local = fileAt("package/角色/纹理/脸.png");

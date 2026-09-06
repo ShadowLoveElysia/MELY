@@ -757,6 +757,12 @@ export const loadMmdModel = async (
     textureWarningKeys.add(warning);
     textureWarnings.push(warning);
   });
+  resources.fallbackPaths.forEach((path) => {
+    const warning = `fallback-builtin-toon: ${path}`;
+    if (textureWarningKeys.has(warning)) return;
+    textureWarningKeys.add(warning);
+    textureWarnings.push(warning);
+  });
   let activeModel: ThreeMmdModel | null = model;
   let pose: MmdPoseController | null = createMmdPoseController(model.mesh);
   const bones = pose.bones;

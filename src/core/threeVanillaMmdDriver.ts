@@ -296,6 +296,7 @@ export const loadThreeVanillaMmdModel = async (
       await resources.waitForLoadCompletion();
       resources.warnings.forEach(addTextureWarning);
       resources.missingPaths.forEach((path) => addTextureWarning(`missing: ${path}`));
+      resources.fallbackPaths.forEach((path) => addTextureWarning(`fallback-builtin-toon: ${path}`));
     } finally {
       textureCapture.restore();
     }
