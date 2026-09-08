@@ -91,6 +91,12 @@ const canFallbackBeforeNativeCreate = (error: unknown): error is TauriSolidVoxel
   )
 );
 
+export const nativeFallbackReasonCode = (error: TauriSolidVoxelClientError) => {
+  if (error.kind === "runtime-unavailable") return "runtime-unavailable";
+  if (error.kind === "native") return error.nativeError?.code ?? "native-error";
+  return error.kind;
+};
+
 const createAbortError = (message: string, signal?: AbortSignal) => {
   const reason = signal?.reason;
   if (reason instanceof Error && reason.name === "AbortError") return reason;

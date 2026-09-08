@@ -146,6 +146,7 @@ import {
 } from "./platform/solidVoxelBackend";
 import {
   runNativeSolidVoxelJob,
+  nativeFallbackReasonCode,
   type NativeSolidVoxelCompletedOwnership,
 } from "./platform/nativeSolidVoxelRunOrchestrator";
 import {
@@ -776,6 +777,7 @@ export default function App() {
   const exportWorkerOwnershipReturnedRef = useRef(false);
   const currentJobRef = useRef<string>("");
   const nativeRunAbortControllerRef = useRef<AbortController | null>(null);
+  const solidVoxelBackendProbePromiseRef = useRef<Promise<SolidVoxelBackendProbeResult> | null>(null);
   const nativeResultOwnershipRef = useRef<NativeSolidVoxelCompletedOwnership | null>(null);
   const nativeOwnershipCleanupPromiseRef = useRef<Promise<void>>(Promise.resolve());
   const modelLoadRequestRef = useRef<string>("");
@@ -1005,13 +1007,18 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    void probeSolidVoxelBackend().then((probe) => {
+    const probePromise = probeSolidVoxelBackend();
+    solidVoxelBackendProbePromiseRef.current = probePromise;
+    void probePromise.then((probe) => {
       if (cancelled) return;
       setSolidVoxelBackendProbe(probe);
       setPerformanceCapabilities(probe.capabilities);
     });
     return () => {
       cancelled = true;
+      if (solidVoxelBackendProbePromiseRef.current === probePromise) {
+        solidVoxelBackendProbePromiseRef.current = null;
+      }
     };
   }, []);
 
@@ -1471,21 +1478,40 @@ export default function App() {
       setToast(t("toast.modelRequired"));
       return;
     }
+    // Three vanilla can become interactive before the asynchronous Tauri
+    // capability probe resolves. Await that same probe so renderer load speed
+    // cannot silently select the Web fallback for an otherwise native job.
+    let backendProbe = solidVoxelBackendProbe;
+    if (!backendProbe) {
+      const pendingProbe = solidVoxelBackendProbePromiseRef.current;
+      if (pendingProbe) {
+        try {
+          backendProbe = await pendingProbe;
+        } catch {
+          backendProbe = null;
+        }
+      }
+    }
+    if (!backendProbe) {
+      setToast(t("toast.generationFailed", { reason: t("error.native.unavailable") }));
+      return;
+    }
+    const nativeJobAvailableForGeneration = Boolean(backendProbe?.nativeJobAvailable);
     const nativeThreadRisk = assessNativeThreadRisk({
       resolvedThreads: resolvedWorkerThreads,
       capabilities: performanceCapabilities,
-      nativeJobAvailable: nativeSolidVoxelJobAvailable
+      nativeJobAvailable: nativeJobAvailableForGeneration
         && mode === "solid"
-        && canRunNativeSolidOptions(solidVoxelBackendProbe?.nativeJobApi, nextSolidOptions),
+        && canRunNativeSolidOptions(backendProbe?.nativeJobApi, nextSolidOptions),
     });
     let nativeThreadExecutionSnapshot = acceptedNativeThreadExecution
       ?? nativeThreadRisk.executionSnapshot;
     if (
       acceptedNativeThreadExecution
       && (
-        !nativeSolidVoxelJobAvailable
+        !nativeJobAvailableForGeneration
         || mode !== "solid"
-        || !canRunNativeSolidOptions(solidVoxelBackendProbe?.nativeJobApi, nextSolidOptions)
+        || !canRunNativeSolidOptions(backendProbe?.nativeJobApi, nextSolidOptions)
       )
     ) {
       setPendingThreadResourceRisk(null);
@@ -1509,9 +1535,9 @@ export default function App() {
       return;
     }
     if (
-      !nativeSolidVoxelJobAvailable
+      !nativeJobAvailableForGeneration
       || mode !== "solid"
-      || !canRunNativeSolidOptions(solidVoxelBackendProbe?.nativeJobApi, nextSolidOptions)
+      || !canRunNativeSolidOptions(backendProbe?.nativeJobApi, nextSolidOptions)
     ) nativeThreadExecutionSnapshot = null;
     const targetHeight = mode === "solid" ? nextSolidOptions.targetHeight : nextHologramOptions.targetHeight;
     const dimensions = estimateModelDimensions(model, targetHeight);
@@ -1669,6 +1695,9 @@ export default function App() {
             }
           }
           if (nativeRun.kind === "fallback-allowed") {
+            setToast(t("toast.generationFailed", {
+              reason: `${t("error.native.unavailable")} (${nativeFallbackReasonCode(nativeRun.reason)})`,
+            }));
             useWebWorker = true;
             setActiveWorkerThreads(null);
             workerLifecycle.start(jobId);
