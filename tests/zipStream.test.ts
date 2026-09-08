@@ -66,6 +66,16 @@ test("streamed ZIP preserves a multi-chunk entry without detaching its source bu
   assert.equal(writer.diagnostics.pendingOutputChunks, 0);
 });
 
+test("streamed ZIP fails the writer when entry finalization violates ZIP32 limits", async () => {
+  const writer = createZipStreamWriter(() => undefined, {
+    zip32TestState: { entryCompressedSize: MAX_ZIP32_VALUE + 1 },
+  });
+  const entry = await writer.start("invalid.bin", false);
+  await entry.write(new Uint8Array([1]));
+  await assert.rejects(entry.end(), /compressed entry size 4294967296 exceeds maximum 4294967295/);
+  await assert.rejects(writer.close(), /compressed entry size 4294967296 exceeds maximum 4294967295/);
+});
+
 test("slow ZIP sinks keep input and output queues bounded", async () => {
   const source = deterministicBytes(2 * 1024 * 1024 + 17);
   const output: Uint8Array[] = [];

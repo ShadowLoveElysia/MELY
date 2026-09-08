@@ -39,6 +39,11 @@ export interface ZipStreamDiagnostics {
   peakPendingOutputBytes: number;
 }
 
+export interface ZipStreamEntry {
+  write(chunk: Uint8Array): Promise<void>;
+  end(): Promise<void>;
+}
+
 export const MAX_ZIP32_VALUE = 0xffff_ffff;
 export const MAX_ZIP32_ENTRIES = 0xffff;
 export const MAX_ZIP32_NAME_BYTES = 0xffff;
@@ -197,6 +202,8 @@ export const createZipStreamWriter = (
   let peakPendingOutputChunks = 0;
   let peakPendingOutputBytes = 0;
   let state: "open" | "closing" | "closed" | "failed" = "open";
+  let activeEntryToken: object | null = null;
+  const addEntryToken = {};
   let outputQueue = Promise.resolve();
   let failReject: ((reason: unknown) => void) | undefined;
   const failed = new Promise<never>((_resolve, reject) => {
@@ -266,7 +273,7 @@ export const createZipStreamWriter = (
     throwIfAborted(options.signal);
   };
 
-  const add = async (path: string, bytes: Uint8Array, compress = true) => {
+  const addEntry = async (path: string, bytes: Uint8Array, compress = true) => {
     throwIfFailed();
     if (state !== "open") throw new Error(`ZIP writer is ${state}`);
     throwIfAborted(options.signal);
@@ -340,18 +347,144 @@ export const createZipStreamWriter = (
     fileCount += 1;
   };
 
+  const add = async (path: string, bytes: Uint8Array, compress = true) => {
+    if (activeEntryToken) throw new Error("ZIP writer allows only one active entry");
+    activeEntryToken = addEntryToken;
+    try {
+      await addEntry(path, bytes, compress);
+    } finally {
+      if (activeEntryToken === addEntryToken) activeEntryToken = null;
+    }
+  };
+
+  /** Start a streamed entry; callers may feed bounded chunks and finish it. */
+  const start = async (path: string, compress = true): Promise<ZipStreamEntry> => {
+    if (activeEntryToken) throw new Error("ZIP writer allows only one active entry");
+    const entryToken = {};
+    activeEntryToken = entryToken;
+    try {
+      throwIfFailed();
+      if (state !== "open") throw new Error(`ZIP writer is ${state}`);
+      throwIfAborted(options.signal);
+      await waitForOutput();
+      const nameBytes = utf8Encoder.encode(path).byteLength;
+      if (nameBytes > MAX_ZIP32_NAME_BYTES) {
+        throw zip32Error("UTF-8 filename length", nameBytes, MAX_ZIP32_NAME_BYTES);
+      }
+      assertZip32Entry(zip32State, { nameBytes, uncompressedSize: 0, compressedSize: 0 });
+      currentEntryCompressedSize = 0;
+      let uncompressedSize = 0;
+      const input = compress ? new ZipDeflate(path, { level: 6 }) : new ZipPassThrough(path);
+      archive.add(input);
+      const completed = new Promise<void>((resolve, reject) => {
+        const forward = input.ondata;
+        if (!forward) {
+          reject(new Error("ZIP input stream was not attached"));
+          return;
+        }
+        input.ondata = (error, data, final) => {
+          try {
+            forward(error, data, final);
+            if (error) reject(error);
+            else if (final) resolve();
+          } catch (streamError) {
+            reject(streamError);
+          }
+        };
+      });
+      let entryState: "writing" | "ending" | "ended" | "failed" = "writing";
+      let operationInFlight = false;
+      let endPromise: Promise<void> | undefined;
+
+      const beginOperation = () => {
+        throwIfFailed();
+        throwIfAborted(options.signal);
+        if (entryState !== "writing") {
+          throw new Error(`ZIP entry is already ${entryState}`);
+        }
+        if (operationInFlight) throw new Error("ZIP entry operation is already in progress");
+        operationInFlight = true;
+      };
+
+      const write = async (chunk: Uint8Array) => {
+        if (!(chunk instanceof Uint8Array)) {
+          throw new TypeError("ZIP entry chunks must be Uint8Array");
+        }
+        beginOperation();
+        try {
+          const nextSize = uncompressedSize + chunk.byteLength;
+          if (!Number.isSafeInteger(nextSize) || nextSize > MAX_ZIP32_VALUE) {
+            throw zip32Error("uncompressed entry size", nextSize, MAX_ZIP32_VALUE);
+          }
+          uncompressedSize = nextSize;
+          inputChunksPushed += 1;
+          pendingInputBytes = chunk.byteLength;
+          peakInputBytesInFlight = Math.max(peakInputBytesInFlight, pendingInputBytes);
+          input.push(chunk.slice(), false);
+          pendingInputBytes = 0;
+          await waitForOutput();
+        } catch (error) {
+          entryState = "failed";
+          setFailure(error);
+          throw error;
+        } finally {
+          pendingInputBytes = 0;
+          operationInFlight = false;
+        }
+      };
+
+      const end = () => {
+        if (endPromise) return endPromise;
+        beginOperation();
+        entryState = "ending";
+        endPromise = (async () => {
+          try {
+            input.push(new Uint8Array(0), true);
+            await Promise.race([completed, failed]);
+            await waitForOutput();
+            const emittedLocalRecordBytes = currentEntryCompressedSize;
+            currentEntryCompressedSize = 0;
+            const compressedSize = options.zip32TestState?.entryCompressedSize
+              ?? emittedLocalRecordBytes
+                - ZIP_LOCAL_HEADER_FIXED_BYTES
+                - nameBytes
+                - ZIP_DATA_DESCRIPTOR_BYTES;
+            zip32State = assertZip32Entry(zip32State, { nameBytes, uncompressedSize, compressedSize });
+            fileCount += 1;
+            entryState = "ended";
+          } catch (error) {
+            entryState = "failed";
+            setFailure(error);
+            throw error;
+          } finally {
+            operationInFlight = false;
+            if (activeEntryToken === entryToken) activeEntryToken = null;
+          }
+        })();
+        return endPromise;
+      };
+      return { write, end };
+    } catch (error) {
+      if (activeEntryToken === entryToken) activeEntryToken = null;
+      throw error;
+    }
+  };
+
   return {
     add,
+    start,
     abort: () => {
       if (state === "closed" || state === "failed") return;
       const reason = options.signal?.aborted
         ? abortReason(options.signal)
         : new DOMException("ZIP generation was cancelled", "AbortError");
       setFailure(reason);
+      activeEntryToken = null;
     },
     close: async (): Promise<ZipStreamSummary> => {
       throwIfFailed();
       if (state !== "open") throw new Error(`ZIP writer is ${state}`);
+      if (activeEntryToken) throw new Error("ZIP writer has an unfinished entry");
       throwIfAborted(options.signal);
       checkedZip32Sum(
         "central directory offset",

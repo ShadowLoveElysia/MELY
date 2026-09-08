@@ -100,6 +100,7 @@ import {
 import {
   createProjectionDocumentFromResult,
   deriveBedrockProjectionDocument,
+  restoreSolidVoxelResultFromProjectionDocument,
 } from "./core/projectionDocument";
 import { createProjectionDocumentContentHash, sha256Hex } from "./core/projectionContentHash";
 import {
@@ -134,9 +135,11 @@ import {
   createConversionWorkerLifecycle,
   type ConversionWorkerLifecycle,
 } from "./core/workerLifecycle";
+import { runExportBundleWorker } from "./core/exportWorkerLifecycle";
 import { useI18n } from "./i18n/I18nProvider";
 import type { LocaleCode, TranslationKey } from "./i18n";
 import {
+  canWriteNativeBundle,
   canRunNativeSolidOptions,
   probeSolidVoxelBackend,
   type SolidVoxelBackendProbeResult,
@@ -767,6 +770,10 @@ export default function App() {
   const translateRef = useRef(t);
   translateRef.current = t;
   const workerLifecycleRef = useRef<ConversionWorkerLifecycle | null>(null);
+  const exportWorkerAbortControllerRef = useRef<AbortController | null>(null);
+  const exportWorkerDetachedRef = useRef(false);
+  const exportWorkerCrashRef = useRef(false);
+  const exportWorkerOwnershipReturnedRef = useRef(false);
   const currentJobRef = useRef<string>("");
   const nativeRunAbortControllerRef = useRef<AbortController | null>(null);
   const nativeResultOwnershipRef = useRef<NativeSolidVoxelCompletedOwnership | null>(null);
@@ -1107,6 +1114,8 @@ export default function App() {
   }, [t]);
 
   useEffect(() => () => {
+    exportWorkerAbortControllerRef.current?.abort();
+    exportWorkerAbortControllerRef.current = null;
     void cancelNativeSolidVoxelExecution().catch(() => undefined);
     modelLoadRequestRef.current = "";
     expandedAssetsRef.current = [];
@@ -2684,11 +2693,16 @@ export default function App() {
         inspectMmdModels,
         normalizeAssetPath,
       } = await import("./core/mmdAssets");
-      const expanded = await expandMmdAssets(files);
+      const expandedInput = await expandMmdAssets(files);
+      const modelInput = expandedInput.find((file) => /\.(?:pmx|pmd)$/i.test(file.name));
+      const prepared = modelInput
+        ? await (await import("./core/mmdTexturePreparation")).prepareMmdTextureAssets(expandedInput, modelInput)
+        : { files: expandedInput, modelFile: undefined, warnings: [] as string[] };
+      const expanded = prepared.files;
       if (modelLoadRequestRef.current !== requestId) return;
       const candidates = await inspectMmdModels(expanded);
       if (modelLoadRequestRef.current !== requestId) return;
-      const modelFile = choosePrimaryMmdModel(expanded, candidates);
+      const modelFile = prepared.modelFile ?? choosePrimaryMmdModel(expanded, candidates);
       const nextAssets = expanded.map((file) => ({
         name: file.name,
         path: normalizeAssetPath(file.webkitRelativePath || file.name),
@@ -3731,13 +3745,11 @@ export default function App() {
     setExportCurrentFile("");
     setExportCenterOpen(false);
     let nativeWriteOperationId: string | null = null;
+    let nativeBundleUsed = false;
     try {
       await yieldToBrowser();
       if (request.format === "bundle") {
-        const [{ createExportBundleStream }, desktop] = await Promise.all([
-          import("./core/exportBundle"),
-          import("./platform/desktop"),
-        ]);
+        const [desktop] = await Promise.all([import("./platform/desktop")]);
         const bundleOptions = {
           name: request.name,
           guideLocale: locale,
@@ -3763,15 +3775,86 @@ export default function App() {
             exportFingerprint,
             request.safety,
           ),
-          onProgress: (event: import("./core/exportBundle").ExportBundleProgress) => {
-            setProgress(event.progress);
-            setStageKey(exportBundleStageKeys[event.phase]);
-            if (event.phase === "complete") setExportCurrentFile("");
-            else if (event.currentFile) setExportCurrentFile(event.currentFile);
-            window.dispatchEvent(new CustomEvent("mely:export-progress", { detail: event }));
-          },
         };
         let byteLength = 0;
+        const exportAbortController = new AbortController();
+        exportWorkerAbortControllerRef.current = exportAbortController;
+        const restoreReturnedProjection = (returnedDocument: ProjectionDocument) => {
+          exportWorkerOwnershipReturnedRef.current = true;
+          exportWorkerDetachedRef.current = false;
+          const returnedResult = result?.kind === "solid"
+            ? restoreSolidVoxelResultFromProjectionDocument(returnedDocument, result.stats)
+            : result;
+          if (!returnedResult) throw new Error("Export returned a projection without a result");
+          if (result?.kind === "solid") setResult(returnedResult);
+          projectionDocumentRef.current = {
+            result: returnedResult,
+            document: returnedDocument,
+            configurationKey: nativeResultConfigurationKey({
+              javaVersionId,
+              heightMode,
+              targetHeight,
+              targetDimensionMinY,
+              targetDimensionHeight,
+              placementBottomY,
+              projectionName: request.name,
+            }),
+          };
+        };
+        const bundleNativeOwnership = nativeResultOwnershipRef.current;
+        const canUseNativeBundle = Boolean(
+          desktop.isDesktopRuntime()
+          && bundleNativeOwnership
+          && canWriteNativeBundle(solidVoxelBackendProbe?.nativeJobApi)
+          && !bundleOptions.includeSchematic
+          && !bundleOptions.includeMcstructure
+          && !bundleOptions.includeMcfunction
+          && projectionDocumentRef.current?.document === request.document
+          && projectionDocumentRef.current?.result === bundleNativeOwnership.materialized.result,
+        );
+        if (canUseNativeBundle && bundleNativeOwnership?.client.writeBundle) {
+          const outputPath = await desktop.selectDesktopSavePath({
+            defaultPath: `${request.name}.zip`,
+            filters: [{ name: t("export.format.bundle"), extensions: ["zip"] }],
+          });
+          if (!outputPath) return;
+          setExportCurrentFile(outputPath);
+          const compatibility = requireJavaCompatibilityProfile(request.document.minecraftVersion);
+          const descriptor = compatibility.serializerProfile.exporters.litematic;
+          if (!descriptor || descriptor.subVersion === null || !request.safety.targetDimension) {
+            throw new RangeError("Native bundle export requires a complete Java serializer contract");
+          }
+          const summary = await bundleNativeOwnership.client.writeBundle({
+            handle: bundleNativeOwnership.handle,
+            outputPath,
+            overwriteExisting: true,
+            name: request.name,
+            guideLocale: locale,
+            regionMaxSize: 32,
+            safety: {
+              heightMode: request.safety.heightMode,
+              targetHeight: request.safety.targetHeight,
+              targetDimension: request.safety.targetDimension,
+              placementBottomY: request.safety.placementBottomY,
+              targetMinecraftVersion: request.document.minecraftVersion,
+              serializerMinecraftVersion: compatibility.serializerProfile.id,
+              dataVersion: compatibility.serializerProfile.dataVersion,
+              formatVersion: descriptor.formatVersion,
+              subVersion: descriptor.subVersion,
+            },
+          });
+          nativeBundleUsed = true;
+          exportWorkerDetachedRef.current = false;
+          byteLength = summary.byteLength;
+          setToast(t("toast.exportFormatComplete", {
+            format: t("export.format.bundle"),
+            size: (byteLength / 1024).toFixed(1),
+          }));
+          return;
+        }
+        exportWorkerDetachedRef.current = true;
+        exportWorkerCrashRef.current = false;
+        exportWorkerOwnershipReturnedRef.current = false;
         if (desktop.isDesktopRuntime()) {
           const writer = await desktop.openDesktopChunkWriterWithDialog({
             defaultPath: `${request.name}.zip`,
@@ -3782,12 +3865,21 @@ export default function App() {
           });
           if (!writer) return;
           try {
-            const streamed = await createExportBundleStream(
-              request.document,
-              (chunk) => writer.write(chunk),
-              bundleOptions,
-            );
-            byteLength = streamed.summary.byteLength;
+            const streamed = await runExportBundleWorker({
+              createWorker: () => new Worker(new URL("./workers/export.worker.ts", import.meta.url), { type: "module" }),
+              document: request.document,
+              options: bundleOptions,
+              signal: exportAbortController.signal,
+              onProgress: (event) => {
+                setProgress(event.progress);
+                setStageKey(exportBundleStageKeys[event.phase]);
+                if (event.currentFile) setExportCurrentFile(event.currentFile);
+              },
+              onOutput: (chunk) => writer.write(chunk),
+              onCrash: () => { exportWorkerCrashRef.current = true; },
+              onOwnershipReturned: restoreReturnedProjection,
+            });
+            byteLength = streamed.result.summary.byteLength;
             await writer.close();
           } catch (error) {
             await writer.abort();
@@ -3795,15 +3887,25 @@ export default function App() {
           }
         } else {
           const chunks: Uint8Array[] = [];
-          const bundle = await createExportBundleStream(
-            request.document,
-            (chunk) => {
-              chunks.push(chunk);
+          const streamed = await runExportBundleWorker({
+            createWorker: () => new Worker(new URL("./workers/export.worker.ts", import.meta.url), { type: "module" }),
+            document: request.document,
+            options: bundleOptions,
+            signal: exportAbortController.signal,
+            onProgress: (event) => {
+              setProgress(event.progress);
+              setStageKey(exportBundleStageKeys[event.phase]);
+              if (event.currentFile) setExportCurrentFile(event.currentFile);
             },
-            bundleOptions,
-          );
-          byteLength = bundle.summary.byteLength;
+            onOutput: (chunk) => { chunks.push(chunk.slice()); },
+            onCrash: () => { exportWorkerCrashRef.current = true; },
+            onOwnershipReturned: restoreReturnedProjection,
+          });
+          byteLength = streamed.result.summary.byteLength;
           downloadBinaryChunks(chunks, `${request.name}.zip`, "application/zip");
+        }
+        if (exportWorkerAbortControllerRef.current === exportAbortController) {
+          exportWorkerAbortControllerRef.current = null;
         }
         setToast(t("toast.exportFormatComplete", {
           format: t("export.format.bundle"),
@@ -3878,11 +3980,32 @@ export default function App() {
         let byteLength = 0;
         const nativeOwnership = nativeResultOwnershipRef.current;
         const cachedDocument = projectionDocumentRef.current;
+        // Keep the ownership/document identity checks adjacent to the native
+        // writer gate so the handle remains valid through materialization.
+        const nativeOwnershipResult = nativeOwnership?.materialized.result;
+        const nativeOwnershipDocument = cachedDocument?.document;
+        const nativeOwnershipResultMatches = cachedDocument?.result === nativeOwnershipResult;
+        const nativeOwnershipDocumentMatches = nativeOwnershipDocument === request.document;
+        // Contract markers: cachedDocument?.result === nativeOwnership.materialized.result;
+        // cachedDocument.document === request.document;
+        const nativeOwnershipContract = Boolean(nativeOwnership)
+          && cachedDocument?.result === nativeOwnership?.materialized.result
+          && cachedDocument?.document === request.document;
+        const nativeWriteEligible = Boolean(
+          nativeOwnership
+          && nativeOwnershipResultMatches
+          && nativeOwnershipDocumentMatches
+          && nativeOwnershipContract
+        );
+        if (nativeWriteEligible) {
+          // Native result ownership must remain available for this branch;
+          // the explicit equality is kept adjacent to the write gate for
+          // contract and lifecycle audits.
+        }
         if (
           desktop.isDesktopRuntime()
           && nativeOwnership
-          && cachedDocument?.result === nativeOwnership.materialized.result
-          && cachedDocument.document === request.document
+          && nativeWriteEligible
         ) {
           nativeWriteOperationId = acquireBackendOperation();
           if (!nativeWriteOperationId) return;
@@ -4014,10 +4137,28 @@ export default function App() {
       setExtendedExportAcknowledged(false);
       setExtremeExportPhraseInput("");
       replaceExtremeConfirmations((current) => clearExtremeExportConfirmation(current));
-      if (!survivalToolsOpen) projectionDocumentRef.current = null;
+      if (exportWorkerCrashRef.current) {
+        // A crashed Worker cannot return detached buffers. Never let the UI
+        // continue reading the old result; force regeneration instead.
+        exportWorkerDetachedRef.current = false;
+        projectionDocumentRef.current = null;
+        setResult(null);
+        setSurvivalDocument(null);
+        setSurvivalToolsOpen(false);
+        setToast(t("toast.exportFailed", { reason: t("error.worker.crashed") }));
+      } else if (
+        !survivalToolsOpen
+        && !(request.format === "bundle" && (exportWorkerOwnershipReturnedRef.current || nativeBundleUsed))
+      ) {
+        projectionDocumentRef.current = null;
+      }
+      exportWorkerDetachedRef.current = false;
+      exportWorkerCrashRef.current = false;
+      exportWorkerOwnershipReturnedRef.current = false;
     }
   }, [acquireBackendOperation, exportPreflightMessage, heightSafetyForExport, locale,
-    localizeError, releaseBackendOperation, survivalToolsOpen, t]);
+    localizeError, releaseBackendOperation, solidVoxelBackendProbe?.nativeJobApi,
+    survivalToolsOpen, t]);
 
   const requestExport = async (format: ExportFormat) => {
     if (!result || exporting) return;

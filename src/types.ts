@@ -380,3 +380,6 @@ export type WorkerEvent =
       params?: Record<string, string | number>;
       telemetry?: PerformanceTelemetryReport;
     };
+
+export type ExportWorkerCommand = import("./core/exportWorkerProtocol").ExportWorkerCommand;
+export type ExportWorkerEvent = import("./core/exportWorkerProtocol").ExportWorkerEvent;

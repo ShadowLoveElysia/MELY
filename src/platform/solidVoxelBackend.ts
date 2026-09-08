@@ -17,6 +17,11 @@ export type NativeSolidVoxelJobFeature =
   | "chunkBatchPull"
   | "litematicWrite";
 
+export interface NativeSolidVoxelBundleCapabilities {
+  /** Native ZIP bundle writing is optional; generation does not depend on it. */
+  bundleWrite: boolean;
+}
+
 export interface NativeSolidVoxelNumericRange {
   minimum: number;
   maximum: number;
@@ -38,6 +43,7 @@ export interface NativeSolidVoxelJobApi {
   nativeResultHandles: true;
   features: readonly NativeSolidVoxelJobFeature[];
   supportedSolidOptions: NativeSupportedSolidOptions;
+  bundleWrite?: boolean;
 }
 
 /**
@@ -198,12 +204,16 @@ const parseNativeJobApi = (value: unknown): NativeSolidVoxelJobApi | null => {
     ))
     || new Set(features).size !== features.length
   ) return null;
+  if (candidate.bundleWrite !== undefined && typeof candidate.bundleWrite !== "boolean") {
+    return null;
+  }
   return Object.freeze({
     version: 1,
     rawSnapshotVersion: 1,
     nativeResultHandles: true,
     features: Object.freeze([...features]) as readonly NativeSolidVoxelJobFeature[],
     supportedSolidOptions,
+    ...(candidate.bundleWrite === undefined ? {} : { bundleWrite: candidate.bundleWrite }),
   });
 };
 
@@ -216,6 +226,10 @@ const hasRequiredNativeJobFeatures = (jobApi: NativeSolidVoxelJobApi | null) => 
   && jobApi.features.includes("chunkBatchPull")
   && jobApi.features.includes("litematicWrite")
 );
+
+export const canWriteNativeBundle = (
+  jobApi: NativeSolidVoxelJobApi | null | undefined,
+) => Boolean(jobApi?.bundleWrite === true);
 
 export const canRunNativeSolidOptions = (
   jobApi: NativeSolidVoxelJobApi | null | undefined,

@@ -20,6 +20,7 @@ import {
   SOLID_VOXEL_JOB_STATUS_COMMAND,
   TauriSolidVoxelClientError,
   UPLOAD_SOLID_VOXEL_SNAPSHOT_COMMAND,
+  WRITE_SOLID_VOXEL_BUNDLE_COMMAND,
   WRITE_SOLID_VOXEL_LITEMATIC_COMMAND,
   createTauriSolidVoxelClient,
   type TauriSolidVoxelTransport,
@@ -584,8 +585,122 @@ test("native Litematic writing is capability gated and carries only handle/path/
   assert.equal(summary.outputPath, request.outputPath);
   assert.equal(summary.blockCount, 4_064);
   assert.deepEqual(call, [WRITE_SOLID_VOXEL_LITEMATIC_COMMAND, {
-    ...request,
-    handle: handleDto,
+    request: {
+      ...request,
+      handle: handleDto,
+    },
   }]);
   assert.doesNotMatch(JSON.stringify(call), /chunks|positions|blockIndices|projectionDocument/i);
+});
+
+test("native bundle writing is optional, uses the request envelope, and carries only handle/path/export data", async () => {
+  const request = {
+    handle,
+    outputPath: "C:\\exports\\mely-bundle.zip",
+    overwriteExisting: false,
+    name: "MELY 4064",
+    guideLocale: "zh-CN" as const,
+    regionMaxSize: 32 as const,
+    safety: {
+      heightMode: "experimental_4064" as const,
+      targetHeight: 4_064,
+      targetDimension: { minY: -2_032, height: 4_064 },
+      placementBottomY: -2_032,
+      targetMinecraftVersion: "1.20.1",
+      serializerMinecraftVersion: "1.20.1",
+      dataVersion: 3_465,
+      formatVersion: 6,
+      subVersion: 1,
+    },
+  };
+
+  const unavailable = createTauriSolidVoxelClient(transport(), { writeLitematic: true });
+  assert.equal(typeof unavailable.writeBundle, "function");
+  await assert.rejects(
+    unavailable.writeBundle!(request),
+    assertClientError("runtime-unavailable", WRITE_SOLID_VOXEL_BUNDLE_COMMAND),
+  );
+
+  let call: unknown[] | null = null;
+  const available = createTauriSolidVoxelClient(transport({
+    invokeJson: async (...args) => {
+      call = args;
+      return {
+        outputPath: request.outputPath,
+        byteLength: 98_765,
+        fileCount: 5,
+        partCount: 3,
+        blockCount: 4_064,
+        dataVersion: 3_465,
+      };
+    },
+  }), { writeLitematic: true, bundleWrite: true });
+  assert.equal(typeof available.writeBundle, "function");
+  const summary = await available.writeBundle!(request);
+  assert.deepEqual(summary, {
+    outputPath: request.outputPath,
+    byteLength: 98_765,
+    fileCount: 5,
+    partCount: 3,
+    blockCount: 4_064,
+    dataVersion: 3_465,
+  });
+  assert.deepEqual(call, [WRITE_SOLID_VOXEL_BUNDLE_COMMAND, {
+    request: {
+      ...request,
+      handle: handleDto,
+    },
+  }]);
+  assert.doesNotMatch(JSON.stringify(call), /chunks|positions|blockIndices|projectionDocument/i);
+});
+
+test("native bundle summaries reject path mismatches and unsafe counters", async () => {
+  const request = {
+    handle,
+    outputPath: "C:\\exports\\mely-bundle.zip",
+    overwriteExisting: true,
+    name: "MELY",
+    guideLocale: "en-US" as const,
+    regionMaxSize: 32 as const,
+    safety: {
+      heightMode: "default" as const,
+      targetHeight: 384,
+      targetDimension: { minY: -64, height: 384 },
+      placementBottomY: -64,
+      targetMinecraftVersion: "1.20.1",
+      serializerMinecraftVersion: "1.20.1",
+      dataVersion: 3_465,
+      formatVersion: 6,
+      subVersion: 1,
+    },
+  };
+  const mismatchedPath = createTauriSolidVoxelClient(transport({
+    invokeJson: async () => ({
+      outputPath: "C:\\exports\\other.zip",
+      byteLength: 1,
+      fileCount: 1,
+      partCount: 1,
+      blockCount: 1,
+      dataVersion: 3_465,
+    }),
+  }), { writeLitematic: true, bundleWrite: true });
+  await assert.rejects(
+    mismatchedPath.writeBundle!(request),
+    assertClientError("protocol", WRITE_SOLID_VOXEL_BUNDLE_COMMAND),
+  );
+
+  const unsafeCounter = createTauriSolidVoxelClient(transport({
+    invokeJson: async () => ({
+      outputPath: request.outputPath,
+      byteLength: Number.MAX_SAFE_INTEGER + 1,
+      fileCount: 1,
+      partCount: 1,
+      blockCount: 1,
+      dataVersion: 3_465,
+    }),
+  }), { writeLitematic: true, bundleWrite: true });
+  await assert.rejects(
+    unsafeCounter.writeBundle!(request),
+    assertClientError("protocol", WRITE_SOLID_VOXEL_BUNDLE_COMMAND),
+  );
 });

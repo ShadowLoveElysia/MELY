@@ -4,6 +4,8 @@ import { basename, dirname, join } from "@tauri-apps/api/path";
 import { open as openDialog, save, type DialogFilter } from "@tauri-apps/plugin-dialog";
 import {
   open as openFile,
+  remove as removeFile,
+  rename as renameFile,
   readDir,
   readFile,
   stat,
@@ -38,6 +40,10 @@ export interface DesktopChunkWriter {
 }
 
 export type DesktopFileHandleFactory = (path: string) => Promise<Pick<FileHandle, "write" | "close">>;
+export interface DesktopChunkPathOperations {
+  remove(path: string): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+}
 
 const desktopMimeType = (name: string) => {
   switch (name.split(".").pop()?.toLowerCase()) {
@@ -232,6 +238,7 @@ export const openDesktopChunkWriter = async (
   options: DesktopSaveOptions,
   selectPath: DesktopSavePathSelector,
   openHandle: DesktopFileHandleFactory,
+  pathOperations?: DesktopChunkPathOperations,
 ): Promise<DesktopChunkWriter | null> => {
   let path: string | null;
   try {
@@ -241,32 +248,123 @@ export const openDesktopChunkWriter = async (
   }
   if (!path) return null;
   let handle: Pick<FileHandle, "write" | "close">;
+  const temporaryPath = pathOperations ? `${path}.mely-${crypto.randomUUID()}.tmp` : path;
   try {
-    handle = await openHandle(path);
+    handle = await openHandle(temporaryPath);
   } catch (error) {
+    // An open operation may create the temporary file before reporting a
+    // failure. Best-effort cleanup keeps a failed export from leaving a
+    // misleading partial artifact beside the selected destination.
+    if (pathOperations) await pathOperations.remove(temporaryPath).catch(() => undefined);
     throw appError("error.desktop.openFile", undefined, error);
   }
-  let closed = false;
+  let state: "open" | "closing" | "closed" | "aborted" = "open";
+  let abortRequested = false;
+  let handleClosed = false;
+  let committed = false;
+  let temporaryRemoved = false;
   let queue = Promise.resolve();
-  const closeOnce = async () => {
-    if (closed) return;
-    closed = true;
-    await queue.catch(() => undefined);
+  let closePromise: Promise<void> | null = null;
+  let abortPromise: Promise<void> | null = null;
+
+  const closeHandle = async () => {
+    if (handleClosed) return;
     try {
       await handle.close();
+      handleClosed = true;
     } catch (error) {
+      throw error;
+    }
+  };
+
+  const removeTemporary = async () => {
+    if (!pathOperations || committed || temporaryRemoved) return;
+    temporaryRemoved = true;
+    await pathOperations.remove(temporaryPath).catch(() => undefined);
+  };
+
+  // Finalization is shared by close() and abort(). In particular, a failed
+  // queued write must still close the native handle before the temporary file
+  // is removed; Windows otherwise commonly keeps the file locked.
+  const finalize = async () => {
+    let writeFailure: unknown;
+    try {
+      await queue;
+    } catch (error) {
+      writeFailure = error;
+    }
+
+    let closeFailure: unknown;
+    try {
+      await closeHandle();
+    } catch (error) {
+      closeFailure = error;
+    }
+
+    if (abortRequested) {
+      state = "aborted";
+      await removeTemporary();
+      if (writeFailure || closeFailure) {
+        throw appError("error.desktop.closeFile", undefined, writeFailure ?? closeFailure);
+      }
+      throw appError("error.desktop.streamClosed");
+    }
+    if (writeFailure) {
+      state = "closed";
+      await removeTemporary();
+      throw appError("error.desktop.closeFile", undefined, writeFailure);
+    }
+    if (closeFailure) {
+      state = "closed";
+      await removeTemporary();
+      throw appError("error.desktop.closeFile", undefined, closeFailure);
+    }
+
+    try {
+      if (pathOperations) await pathOperations.rename(temporaryPath, path);
+      committed = true;
+      state = "closed";
+    } catch (error) {
+      state = "closed";
+      await removeTemporary();
       throw appError("error.desktop.closeFile", undefined, error);
     }
+  };
+
+  const startClose = () => {
+    if (closePromise) return closePromise;
+    closePromise = finalize();
+    return closePromise;
+  };
+
+  const closeOnce = () => {
+    if (closePromise) return closePromise;
+    if (state !== "open") return Promise.reject(appError("error.desktop.streamClosed"));
+    state = "closing";
+    return startClose();
   };
   return {
     path,
     write: async (chunk) => {
-      if (closed) throw appError("error.desktop.streamClosed");
+      if (state !== "open") throw appError("error.desktop.streamClosed");
       queue = queue.then(() => writeCompleteChunk(handle, chunk));
       return queue;
     },
     close: closeOnce,
-    abort: closeOnce,
+    abort: () => {
+      if (abortPromise) return abortPromise;
+      if (committed) return Promise.resolve();
+      abortRequested = true;
+      state = "aborted";
+      abortPromise = (async () => {
+        await startClose().catch(() => undefined);
+        // Retry a close that failed transiently. Cleanup is deliberately
+        // best-effort so it cannot mask the export error that triggered abort.
+        await closeHandle().catch(() => undefined);
+        await removeTemporary();
+      })();
+      return abortPromise;
+    },
   };
 };
 
@@ -278,7 +376,10 @@ export const openDesktopChunkWriterWithDialog = async (
     write: true,
     create: true,
     truncate: true,
-  }));
+  }), {
+    remove: async (path) => removeFile(path),
+    rename: async (from, to) => renameFile(from, to),
+  });
 };
 
 export const openDesktopPaths = async (

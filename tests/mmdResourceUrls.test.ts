@@ -56,6 +56,18 @@ test("missing toon references use the built-in fallback", async () => {
   }
 });
 
+test("legacy BMP and TGA references can resolve normalized PNG assets", async () => {
+  const model = fileAt("pack/model.pmx", "model-bytes");
+  const png = fileAt("pack/textures/face.png", "normalized-png");
+  const bundle = createMmdResourceUrlBundle([model, png], model);
+  try {
+    const url = bundle.manager.resolveURL("textures/face.bmp");
+    assert.equal(await fetch(url).then((response) => response.text()), "normalized-png");
+  } finally {
+    bundle.dispose();
+  }
+});
+
 test("Three resource URLs resolve a sibling package path before basename fallback", async () => {
   const model = fileAt("pack/models/character/model.pmx", "model-bytes");
   const sibling = fileAt("pack/shared/toon.bmp", "sibling-bytes");

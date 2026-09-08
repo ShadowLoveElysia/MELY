@@ -3,6 +3,7 @@
 //! 当前阶段包含输入合同、几何/材质参考语义、32³ chunk 并行子集，
 //! 以及原生 Litematic 流式编码基础。完整任务接线仍由 manager 负责。
 
+pub mod bundle;
 pub mod chunk;
 pub mod contract;
 pub mod geometry;

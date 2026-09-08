@@ -2,37 +2,11 @@ import { normalizeAssetPath } from "./mmdAssets";
 
 const BUILTIN_TOON_CACHE = new Map<string, File>();
 
-const writeU16 = (view: DataView, offset: number, value: number) => view.setUint16(offset, value, true);
-const writeU32 = (view: DataView, offset: number, value: number) => view.setUint32(offset, value, true);
+const BUILTIN_PNG = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAIElEQVR42mNQUFD4j4wZAgIC/iNjhgULFvxHxgz/0QAAMEwopWV0VAkAAAAASUVORK5CYII="), (value) => value.charCodeAt(0));
 
-/** Creates a tiny neutral toon ramp without depending on browser image decoders. */
 const createBuiltinToon = (name: string) => {
-  const width = 4;
-  const height = 4;
-  const rowSize = width * 3;
-  const imageSize = rowSize * height;
-  const bytes = new Uint8Array(54 + imageSize);
-  const view = new DataView(bytes.buffer);
-  bytes[0] = 0x42; bytes[1] = 0x4d;
-  writeU32(view, 2, bytes.byteLength);
-  writeU32(view, 10, 54);
-  writeU32(view, 14, 40);
-  writeU32(view, 18, width);
-  writeU32(view, 22, height);
-  writeU16(view, 26, 1);
-  writeU16(view, 28, 24);
-  writeU32(view, 34, imageSize);
-  const shades = [32, 80, 160, 255];
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const value = shades[x];
-      const offset = 54 + y * rowSize + x * 3;
-      bytes[offset] = value;
-      bytes[offset + 1] = value;
-      bytes[offset + 2] = value;
-    }
-  }
-  const file = new File([bytes], name, { type: "image/bmp" });
+  const pngName = name.replace(/\.bmp$/i, ".png");
+  const file = new File([BUILTIN_PNG], pngName, { type: "image/png" });
   Object.defineProperty(file, "webkitRelativePath", { configurable: true, value: name });
   return file;
 };
@@ -48,7 +22,7 @@ export const builtinToonFile = (reference: string) => {
   const name = /^toon\d+\./i.test(basename) ? basename : "toon01.bmp";
   const existing = BUILTIN_TOON_CACHE.get(name.toLowerCase());
   if (existing) return existing;
-  const file = createBuiltinToon(name.replace(/\.(?:png|tga|jpg|jpeg)$/i, ".bmp"));
+  const file = createBuiltinToon(name.replace(/\.(?:tga|jpg|jpeg)$/i, ".png"));
   BUILTIN_TOON_CACHE.set(name.toLowerCase(), file);
   return file;
 };

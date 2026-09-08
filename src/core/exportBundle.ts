@@ -15,8 +15,13 @@ import {
   createProjectionDocument,
   deriveBedrockProjectionDocument,
   iterateProjectionViewBlocks,
-  splitProjectionViews,
 } from "./projectionDocument";
+import {
+  assertProjectionPartitionIndex,
+  createProjectionPartitionIndex,
+  iterateProjectionPartitionBlocks,
+  type ProjectionPartitionIndex,
+} from "./projectionPartitionIndex";
 import { createSchematic, type SchematicExportOptions } from "./schematic";
 import { createMcstructure, type McstructureExportOptions } from "./mcstructure";
 import {
@@ -26,6 +31,7 @@ import {
 } from "./mcfunction";
 import {
   createLitematicFromDocument,
+  streamLitematicFromDocument,
   type ExportOptions as LitematicExportOptions,
 } from "./litematic";
 import {
@@ -49,6 +55,7 @@ import {
   createZipStreamWriter,
   MAX_ZIP32_OUTPUT_BYTES,
   type ZipChunkSink,
+  type ZipStreamEntry,
 } from "./zipStream";
 
 export { MAX_ZIP32_OUTPUT_BYTES } from "./zipStream";
@@ -71,6 +78,8 @@ export interface ExportBundleOptions {
   maxWorkingBytes?: number;
   onProgress?: (progress: ExportBundleProgress) => void;
   safety?: JavaProjectionExportSafetyInput;
+  /** Optional precomputed spatial index reused by planning and all part encoders. */
+  partitionIndex?: ProjectionPartitionIndex;
 }
 
 export type ExportBundlePhase = "preparing" | "overall" | "parts" | "behaviorPack" | "metadata" | "complete";
@@ -197,7 +206,7 @@ const NBT_GZIP_DUPLICATION_FACTOR = 4;
 const DOCUMENT_BYTES_PER_BLOCK = 56;
 const PART_METADATA_BYTES = 12 * 1024;
 
-interface ExportBundlePlan {
+export interface ExportBundlePlan {
   name: string;
   slug: string;
   anchor: Point;
@@ -225,6 +234,7 @@ interface ExportBundlePlan {
     targetDimensionMinY: number | null;
     targetDimensionMaxY: number | null;
   };
+  readonly partitionIndex?: ProjectionPartitionIndex;
 }
 
 const GUIDE_FILES = {
@@ -246,9 +256,15 @@ const fileSlug = (value: string) => value
   .replace(/[^a-z0-9_.-]+/g, "_")
   .replace(/^[_.-]+|[_.-]+$/g, "") || "mely_projection";
 
-const partDocument = (document: ProjectionDocument, view: ProjectionView) =>
+const partDocument = (
+  document: ProjectionDocument,
+  view: ProjectionView,
+  partitionIndex?: ProjectionPartitionIndex,
+) =>
   createProjectionDocument(
-    iterateProjectionViewBlocks(document, view),
+    partitionIndex
+      ? iterateProjectionPartitionBlocks(document, partitionIndex, view)
+      : iterateProjectionViewBlocks(document, view),
     document.palette,
     {
       edition: document.edition,
@@ -445,7 +461,10 @@ const createBundlePlan = (
   const includeSchematic = options.includeSchematic ?? false;
   const includeMcstructure = options.includeMcstructure ?? false;
   const includeMcfunction = options.includeMcfunction ?? false;
-  const views = splitProjectionViews(document, options.partSize ?? [32, 32, 32]);
+  const partitionIndex = options.partitionIndex
+    ? assertProjectionPartitionIndex(document, options.partitionIndex, options.partSize)
+    : createProjectionPartitionIndex(document, options.partSize ?? [32, 32, 32]);
+  const views = [...partitionIndex.views];
   const targetDimension = safety.input.targetDimension
     ?? safety.compatibility.effectiveDefaultDimension;
   const litematicAdapter = safety.serializerProfile.exporters.litematic;
@@ -462,7 +481,7 @@ const createBundlePlan = (
       occupiedBounds: view.occupiedBounds,
       blockCount: view.blockCount,
       buildOrder: index + 1,
-      contentHash: createProjectionViewContentHash(document, view),
+      contentHash: createProjectionViewContentHash(document, view, partitionIndex),
       relativeOffset: view.occupiedBounds.min.map((value, axis) =>
         value - anchor[axis]) as Point,
       files: {
@@ -472,7 +491,7 @@ const createBundlePlan = (
       },
     };
   });
-  return {
+  const plan: ExportBundlePlan = {
     name,
     slug,
     anchor,
@@ -503,6 +522,15 @@ const createBundlePlan = (
         : null,
     },
   };
+  // Keep the acceleration index internal to the worker/encoder.  It is a
+  // runtime cache and must not be structured-cloned into PLAN_READY/COMPLETE
+  // events or persisted in bundle.json.
+  Object.defineProperty(plan, "partitionIndex", {
+    value: partitionIndex,
+    enumerable: false,
+    writable: false,
+  });
+  return plan;
 };
 
 const assertBundleExportSafety = (
@@ -605,7 +633,9 @@ export const estimateExportBundleResources = (
   if (!document.bounds || document.blockCount === 0) {
     throw new RangeError("Cannot bundle an empty projection");
   }
-  const views = splitProjectionViews(document, options.partSize ?? [32, 32, 32]);
+  const views = options.partitionIndex
+    ? assertProjectionPartitionIndex(document, options.partitionIndex, options.partSize).views
+    : createProjectionPartitionIndex(document, options.partSize ?? [32, 32, 32]).views;
   const paletteSize = document.palette.length + 1;
   const bitsPerBlock = Math.max(2, Math.ceil(Math.log2(Math.max(1, paletteSize))));
   let occupiedRegionVolume = 0;
@@ -688,6 +718,20 @@ const assertBundleResources = (
   return estimate;
 };
 
+/** Build one immutable plan and share its partition index across all stages. */
+export const planExportBundle = (
+  document: ProjectionDocument,
+  options: ExportBundleOptions = {},
+) => {
+  const partitionIndex = options.partitionIndex
+    ?? createProjectionPartitionIndex(document, options.partSize ?? [32, 32, 32]);
+  const indexedOptions: ExportBundleOptions = { ...options, partitionIndex };
+  const safety = assertBundleExportSafety(document, indexedOptions);
+  const resources = assertBundleResources(document, indexedOptions);
+  const plan = createBundlePlan(document, indexedOptions, safety);
+  return { plan, resources, partitionIndex };
+};
+
 const abortReason = (signal: AbortSignal) => signal.reason instanceof Error
   ? signal.reason
   : new DOMException("Export bundle generation was cancelled", "AbortError");
@@ -712,9 +756,8 @@ export const createExportBundleStream = async (
   sink: ExportBundleChunkSink,
   options: ExportBundleOptions = {},
 ): Promise<StreamedExportBundle> => {
-  const safety = assertBundleExportSafety(document, options);
-  assertBundleResources(document, options);
-  const plan = createBundlePlan(document, options, safety);
+  const preparedPlan = planExportBundle(document, options);
+  const { plan, partitionIndex } = preparedPlan;
   const guideLocale = options.guideLocale ?? DEFAULT_LOCALE;
   let latestBytes = 0;
   let completedFiles = 0;
@@ -779,32 +822,62 @@ export const createExportBundleStream = async (
     });
   };
 
+  const addLitematicStream = async (
+    phase: ExportBundlePhase,
+    progress: number,
+    completedParts: number,
+    path: string,
+    source: ProjectionDocument,
+    name: string,
+  ) => {
+    const startedAtMs = Date.now();
+    const fileStartedAt = new Date(startedAtMs).toISOString();
+    report(phase, progress, completedParts, path, "started", { fileStartedAt });
+    try {
+      const entry: ZipStreamEntry = await writer.start(path, false);
+      await streamLitematicFromDocument(source, (chunk) => entry.write(chunk), {
+        ...options.litematic,
+        name,
+        regionMaxSize: 32,
+        safety: options.safety,
+      });
+      await entry.end();
+    } catch (error) {
+      const finishedAtMs = Date.now();
+      report(phase, progress, completedParts, path, "failed", {
+        fileStartedAt,
+        fileFinishedAt: new Date(finishedAtMs).toISOString(),
+        fileDurationMs: Math.max(0, finishedAtMs - startedAtMs),
+      });
+      if (options.signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+      if (error instanceof AppError) throw error;
+      throw new ExportBundleFileError(path, error);
+    }
+    completedFiles += 1;
+    const finishedAtMs = Date.now();
+    report(phase, progress, completedParts, path, "completed", {
+      fileStartedAt,
+      fileFinishedAt: new Date(finishedAtMs).toISOString(),
+      fileDurationMs: Math.max(0, finishedAtMs - startedAtMs),
+    });
+  };
+
   try {
     throwIfAborted(options.signal);
     report("preparing", 0.01, 0);
-    await addFile("overall", 0.08, 0, plan.overallLitematic, () =>
-      createLitematicFromDocument(document, {
-        ...options.litematic,
-        name: options.litematic?.name ?? plan.name,
-        regionMaxSize: 32,
-        safety: options.safety,
-      }).bytes, false);
+    await addLitematicStream("overall", 0.08, 0, plan.overallLitematic, document,
+      options.litematic?.name ?? plan.name);
     await yieldToEventLoop();
 
     for (let index = 0; index < plan.views.length; index += 1) {
       throwIfAborted(options.signal);
       const view = plan.views[index];
       const descriptor = plan.parts[index];
-      const part = partDocument(document, view);
+      const part = partDocument(document, view, partitionIndex);
       if (!part.bounds) continue;
       const partProgress = 0.08 + 0.7 * ((index + 1) / Math.max(1, plan.parts.length));
-      await addFile("parts", partProgress, index, descriptor.files.litematic, () =>
-        createLitematicFromDocument(part, {
-          ...options.litematic,
-          name: `${options.litematic?.name ?? plan.name} ${descriptor.id}`,
-          regionMaxSize: 32,
-          safety: options.safety,
-        }).bytes, false);
+      await addLitematicStream("parts", partProgress, index, descriptor.files.litematic, part,
+        `${options.litematic?.name ?? plan.name} ${descriptor.id}`);
       if (descriptor.files.schematic) {
         await addFile("parts", partProgress, index, descriptor.files.schematic, () =>
           createSchematic(part, {
@@ -919,15 +992,15 @@ export const createExportBundle = (
   document: ProjectionDocument,
   options: ExportBundleOptions = {},
 ): ExportBundle => {
-  const safety = assertBundleExportSafety(document, options);
-  assertBundleResources(document, {
+  const indexedOptions = {
     ...options,
     maxWorkingBytes: options.maxWorkingBytes ?? SYNC_BUNDLE_WORKING_BUDGET_BYTES,
-  });
+  };
+  const preparedPlan = planExportBundle(document, indexedOptions);
+  const { plan, partitionIndex } = preparedPlan;
   if (!document.bounds || document.blockCount === 0) {
     throw new RangeError("Cannot bundle an empty projection");
   }
-  const plan = createBundlePlan(document, options, safety);
   const guideLocale = options.guideLocale ?? DEFAULT_LOCALE;
   const archive = createZipCollector({ maxOutputBytes: options.maxOutputBytes });
   archive.add(plan.overallLitematic, createLitematicFromDocument(document, {
@@ -937,7 +1010,7 @@ export const createExportBundle = (
     safety: options.safety,
   }).bytes, false);
   plan.views.forEach((view, index) => {
-    const part = partDocument(document, view);
+    const part = partDocument(document, view, partitionIndex);
     if (!part.bounds) return;
     const descriptor = plan.parts[index];
     archive.add(descriptor.files.litematic, createLitematicFromDocument(part, {

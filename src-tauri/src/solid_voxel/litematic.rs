@@ -529,6 +529,23 @@ pub fn write_litematic<W: Write>(
     write_litematic_input(&input, output, options)
 }
 
+/// Variant used by compound writers that need cooperative cancellation while
+/// retaining the caller's document storage. The document is still encoded
+/// directly into `output`; no intermediate byte buffer is created.
+pub fn write_litematic_with_control<W, IsCancelled>(
+    document: &LitematicDocument,
+    output: &mut W,
+    options: &LitematicOptions,
+    is_cancelled: IsCancelled,
+) -> Result<LitematicSummary, LitematicError>
+where
+    W: Write,
+    IsCancelled: Fn() -> bool,
+{
+    let input = LitematicInput::from_document(document)?;
+    write_litematic_input_with_control(&input, output, options, &is_cancelled)
+}
+
 /// 从原生体素结果直接流式写出，保留结果中的 chunk/position 存储，避免把
 /// 数千万体素复制成另一份完整 `LitematicDocument`。
 pub fn write_solid_litematic<W: Write>(
@@ -787,7 +804,7 @@ impl Drop for TemporaryFileGuard {
     }
 }
 
-fn commit_temporary_file(
+pub(crate) fn commit_temporary_file(
     temporary_path: &Path,
     output_path: &Path,
     overwrite_existing: bool,

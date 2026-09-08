@@ -5,6 +5,11 @@ import type {
   ProjectionView,
 } from "../types";
 import { PROJECTION_CHUNK_SIZE } from "./projectionDocument";
+import {
+  assertProjectionPartitionIndex,
+  projectionPartitionForView,
+  type ProjectionPartitionIndex,
+} from "./projectionPartitionIndex";
 
 type Point = [number, number, number];
 
@@ -316,9 +321,17 @@ function* canonicalChunkBlocks(
   states: readonly string[],
   bounds?: Pick<ProjectionView["bounds"], "min" | "max">,
   origin: Point = [0, 0, 0],
+  candidateChunkIndices?: readonly number[],
 ): Generator<string> {
   const heap: ChunkCursor[] = [];
-  for (const chunk of document.chunks) {
+  const chunks = candidateChunkIndices
+    ? candidateChunkIndices.map((index) => {
+      const chunk = document.chunks[index];
+      if (!chunk) throw new RangeError(`Projection partition index references missing chunk ${index}`);
+      return chunk;
+    })
+    : document.chunks;
+  for (const chunk of chunks) {
     const cursor = createCursor(chunk, bounds);
     if (cursor) heapPush(heap, cursor);
   }
@@ -343,9 +356,17 @@ function* canonicalChunkBlocks(
 const countBlocksInBounds = (
   document: ProjectionDocument,
   bounds: Pick<ProjectionView["bounds"], "min" | "max">,
+  candidateChunkIndices?: readonly number[],
 ) => {
   let count = 0;
-  for (const chunk of document.chunks) {
+  const chunks = candidateChunkIndices
+    ? candidateChunkIndices.map((index) => {
+      const chunk = document.chunks[index];
+      if (!chunk) throw new RangeError(`Projection partition index references missing chunk ${index}`);
+      return chunk;
+    })
+    : document.chunks;
+  for (const chunk of chunks) {
     if (chunk.positions.length !== chunk.paletteIndices.length) {
       throw new RangeError(`Projection chunk ${chunk.chunk.join(",")} has inconsistent buffers`);
     }
@@ -365,10 +386,15 @@ const countBlocksInBounds = (
 export const createProjectionViewContentHash = (
   document: ProjectionDocument,
   view: ProjectionView,
+  partitionIndex?: ProjectionPartitionIndex,
 ) => {
+  if (partitionIndex) assertProjectionPartitionIndex(document, partitionIndex);
   const origin = view.occupiedBounds.min;
   const states = document.palette.map(canonicalViewState);
-  const blockCount = countBlocksInBounds(document, view.bounds);
+  const candidateChunkIndices = partitionIndex
+    ? partitionIndex.candidateChunkIndices[projectionPartitionForView(partitionIndex, view)]
+    : undefined;
+  const blockCount = countBlocksInBounds(document, view.bounds, candidateChunkIndices);
   function* lines() {
     yield JSON.stringify([
       "MELYProjectionPart",
@@ -377,7 +403,7 @@ export const createProjectionViewContentHash = (
       document.minecraftVersion,
       blockCount,
     ]);
-    yield* canonicalChunkBlocks(document, states, view.bounds, origin);
+    yield* canonicalChunkBlocks(document, states, view.bounds, origin, candidateChunkIndices);
   }
   return hashLines(lines());
 };

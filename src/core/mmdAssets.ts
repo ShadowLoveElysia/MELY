@@ -8,6 +8,72 @@ const MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES = 256 * 1024 * 1024;
 const MAX_COMPRESSED_ARCHIVE_BYTES = 512 * 1024 * 1024;
 
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_END_SIGNATURE = 0x06054b50;
+
+const readU16 = (bytes: Uint8Array, offset: number) => (
+  offset + 2 <= bytes.length ? bytes[offset] | (bytes[offset + 1] << 8) : undefined
+);
+
+const readU32 = (bytes: Uint8Array, offset: number) => (
+  offset + 4 <= bytes.length
+    ? (bytes[offset]
+      | (bytes[offset + 1] << 8)
+      | (bytes[offset + 2] << 16)
+      | (bytes[offset + 3] << 24)) >>> 0
+    : undefined
+);
+
+const findZipEnd = (bytes: Uint8Array) => {
+  const start = Math.max(0, bytes.length - 22 - 0xffff);
+  for (let offset = bytes.length - 22; offset >= start; offset -= 1) {
+    if (readU32(bytes, offset) === ZIP_END_SIGNATURE) return offset;
+  }
+  return -1;
+};
+
+const decodeZipName = (bytes: Uint8Array, utf8: boolean) => {
+  const decode = (encoding: string, fatal = false) => {
+    try {
+      return new TextDecoder(encoding, { fatal }).decode(bytes);
+    } catch {
+      return undefined;
+    }
+  };
+  if (utf8) return decode("utf-8") ?? decode("utf-8", false) ?? "";
+  // A large number of MMD packages are created by Windows tools that write
+  // GBK filenames without setting ZIP's UTF-8 flag. Decode those names before
+  // fflate's UTF-8 decoder turns them into replacement characters.
+  return decode("utf-8", true)
+    ?? decode("gb18030")
+    ?? decode("windows-1252")
+    ?? "";
+};
+
+const zipEntryNames = (bytes: Uint8Array) => {
+  const end = findZipEnd(bytes);
+  if (end < 0) return [] as string[];
+  const centralOffset = readU32(bytes, end + 16);
+  const entryCount = readU16(bytes, end + 10);
+  if (centralOffset === undefined || entryCount === undefined) return [] as string[];
+  const names: string[] = [];
+  let offset = centralOffset;
+  for (let index = 0; index < entryCount && offset + 46 <= bytes.length; index += 1) {
+    if (readU32(bytes, offset) !== ZIP_CENTRAL_SIGNATURE) break;
+    const flags = readU16(bytes, offset + 8) ?? 0;
+    const nameLength = readU16(bytes, offset + 28) ?? 0;
+    const extraLength = readU16(bytes, offset + 30) ?? 0;
+    const commentLength = readU16(bytes, offset + 32) ?? 0;
+    const nameStart = offset + 46;
+    const nameEnd = nameStart + nameLength;
+    if (nameEnd > bytes.length) break;
+    names.push(decodeZipName(bytes.subarray(nameStart, nameEnd), (flags & 0x800) !== 0));
+    offset = nameEnd + extraLength + commentLength;
+  }
+  return names;
+};
+
 const MIME_TYPES: Record<string, string> = {
   bmp: "image/bmp",
   dds: "image/vnd-ms.dds",

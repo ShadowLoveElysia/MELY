@@ -34,6 +34,7 @@ pub struct SolidVoxelJobApiCapabilities {
     pub native_result_handles: bool,
     pub features: [&'static str; 5],
     pub supported_solid_options: SupportedSolidOptions,
+    pub bundle_write: bool,
 }
 
 pub(crate) const COMPLETE_SOLID_VOXEL_JOB_API: SolidVoxelJobApiCapabilities =
@@ -63,6 +64,7 @@ pub(crate) const COMPLETE_SOLID_VOXEL_JOB_API: SolidVoxelJobApiCapabilities =
             skin_protection: true,
             emissive_mapping: true,
         },
+        bundle_write: true,
     };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -200,3 +200,53 @@ test("desktop chunk writer wraps native write and close failures", async () => {
     return true;
   });
 });
+
+test("desktop atomic chunk writer removes the temporary file on abort", async () => {
+  const opened: string[] = [];
+  const removed: string[] = [];
+  const renamed: string[][] = [];
+  let closed = 0;
+  const writer = await openDesktopChunkWriter(
+    { defaultPath: "atomic.zip" },
+    async () => "C:\\Exports\\atomic.zip",
+    async (path) => {
+      opened.push(path);
+      return {
+        write: async (chunk: Uint8Array) => chunk.byteLength,
+        close: async () => { closed += 1; },
+      } as never;
+    },
+    {
+      remove: async (path) => { removed.push(path); },
+      rename: async (from, to) => { renamed.push([from, to]); },
+    },
+  );
+  assert.ok(writer);
+  await writer.write(Uint8Array.of(1, 2));
+  await writer.abort();
+  assert.equal(closed, 1);
+  assert.equal(removed.length, 1);
+  assert.equal(renamed.length, 0);
+  assert.match(removed[0], /atomic\.zip\.mely-.*\.tmp$/);
+});
+
+test("desktop atomic chunk writer renames only after close succeeds", async () => {
+  const renamed: string[][] = [];
+  const writer = await openDesktopChunkWriter(
+    {},
+    async () => "C:\\Exports\\atomic.zip",
+    async () => ({
+      write: async (chunk: Uint8Array) => chunk.byteLength,
+      close: async () => undefined,
+    }) as never,
+    {
+      remove: async () => undefined,
+      rename: async (from, to) => { renamed.push([from, to]); },
+    },
+  );
+  assert.ok(writer);
+  await writer.write(Uint8Array.of(1));
+  await writer.close();
+  assert.equal(renamed.length, 1);
+  await writer.abort();
+});

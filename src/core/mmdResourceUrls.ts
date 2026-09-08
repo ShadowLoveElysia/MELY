@@ -21,6 +21,7 @@ const canonicalPath = (value: string) => normalizeAssetPath(
 ).replace(/\/+/g, "/");
 
 const pathKey = (value: string) => canonicalPath(value).toLowerCase();
+const pngAlternative = (value: string) => value.replace(/\.(?:bmp|tga)$/i, ".png");
 
 const isExternalOrAbsolutePath = (value: string) => (
   /^(?:[a-z][a-z\d+.-]*:|[\\/]|[a-z]:[\\/])/i.test(value)
@@ -214,7 +215,13 @@ const candidatesUnderModelDirectory = (
       reportAmbiguous("path", relativeKey);
       return undefined;
     }
-    let file = relativeKey ? uniqueCandidate(pathToFiles, relativeKey) : undefined;
+    let file: File | undefined;
+    if (/\.tga$/i.test(normalized)) {
+      const pngPath = pngAlternative(normalized);
+      const pngRelativeKey = pathKey(joinPath(baseDirectory, pngPath) ?? pngPath);
+      file = uniqueCandidate(pathToFiles, pngRelativeKey) ?? uniqueCandidate(pathToFiles, pathKey(pngPath));
+    }
+    if (!file) file = relativeKey ? uniqueCandidate(pathToFiles, relativeKey) : undefined;
     if (!file) {
       const normalizedKey = pathKey(normalized);
       if (ambiguousCandidate(pathToFiles, normalizedKey)) {
@@ -222,6 +229,11 @@ const candidatesUnderModelDirectory = (
         return undefined;
       }
       file = uniqueCandidate(pathToFiles, normalizedKey);
+    }
+    if (!file && /\.(?:bmp|tga)$/i.test(normalized)) {
+      const pngPath = pngAlternative(normalized);
+      const pngRelativeKey = pathKey(joinPath(baseDirectory, pngPath) ?? pngPath);
+      file = uniqueCandidate(pathToFiles, pngRelativeKey) ?? uniqueCandidate(pathToFiles, pathKey(pngPath));
     }
     if (!file) {
       const basename = normalized.split("/").pop() ?? normalized;
@@ -240,6 +252,10 @@ const candidatesUnderModelDirectory = (
           return undefined;
         }
         file = uniqueCandidate(basenameToFiles, basenameKey);
+      }
+      if (!file && /\.(?:bmp|tga)$/i.test(basename)) {
+        const pngBase = pngAlternative(basename);
+        file = uniqueCandidate(basenameToFiles, pathKey(pngBase));
       }
     }
     if (!file && isToonReference(normalized)) {

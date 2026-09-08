@@ -82,9 +82,9 @@ export const createBabylonMmdReferenceFiles = (
   });
 
   if (options.includeBuiltinToon) for (let index = 1; index <= 10; index += 1) {
-    const name = `toon${String(index).padStart(2, "0")}.bmp`;
+    const name = `toon${String(index).padStart(2, "0")}.png`;
     const builtin = builtinToonFile(name);
-    for (const rebased of [`toon/${name}`, name]) {
+    for (const rebased of [`toon/${name}`, name, `toon/${name.replace(/\.png$/i, ".bmp")}`, name.replace(/\.png$/i, ".bmp")]) {
       const key = rebased.toUpperCase();
       if (seen.has(key)) continue;
       seen.add(key);

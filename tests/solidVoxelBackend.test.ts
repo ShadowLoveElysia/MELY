@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  canWriteNativeBundle,
   canRunNativeSolidOptions,
   probeSolidVoxelBackend,
   probeSolidVoxelEnvironment,
@@ -130,7 +131,7 @@ test("environment probing and backend selection keep CPU capability separate fro
 
   assert.equal(environment.nativeCapabilityProbe.status, "available");
   assert.equal(environment.nativeJobAvailable, false);
-  assert.equal(selectSolidVoxelBackend(environment).kind, "web-worker");
+  assert.equal(selectSolidVoxelBackend(environment)?.kind, "web-worker");
 });
 
 test("native jobs require the complete versioned execution and result-consumption chain", async () => {
@@ -197,6 +198,53 @@ test("malformed or unknown native job API features fail closed", async () => {
   assert.equal(result.nativeJobApi, null);
   assert.equal(result.nativeJobAvailable, false);
   assert.equal(result.backend, WEB_WORKER_SOLID_VOXEL_BACKEND);
+});
+
+test("bundle writing is an optional native capability and does not gate generation", async () => {
+  const probe = (bundleWrite: unknown) => probeSolidVoxelBackend({
+    webWorkerAvailable: true,
+    loadTauriCore: async () => ({
+      isTauri: () => true,
+      invoke: async () => ({
+        physicalCores: 16,
+        logicalProcessors: 32,
+        availableParallelism: 32,
+        recommendedThreads: 8,
+        physicalCountReliable: true,
+        jobApi: {
+          version: 1,
+          rawSnapshotVersion: 1,
+          nativeResultHandles: true,
+          features: [
+            "rawSnapshotUpload",
+            "nativeResultHandles",
+            "limitedPreview",
+            "chunkBatchPull",
+            "litematicWrite",
+          ],
+          supportedSolidOptions,
+          ...(bundleWrite === undefined ? {} : { bundleWrite }),
+        },
+      }),
+    }),
+  });
+
+  const legacy = await probe(undefined);
+  assert.equal(legacy.nativeJobAvailable, true);
+  assert.equal(canWriteNativeBundle(legacy.nativeJobApi), false);
+
+  const enabled = await probe(true);
+  assert.equal(enabled.nativeJobAvailable, true);
+  assert.equal(canWriteNativeBundle(enabled.nativeJobApi), true);
+
+  const disabled = await probe(false);
+  assert.equal(disabled.nativeJobAvailable, true);
+  assert.equal(canWriteNativeBundle(disabled.nativeJobApi), false);
+
+  const malformed = await probe("yes");
+  assert.equal(malformed.nativeJobApi, null);
+  assert.equal(malformed.nativeJobAvailable, false);
+  assert.equal(canWriteNativeBundle(malformed.nativeJobApi), false);
 });
 
 test("native option selection accepts the shell subset independently from execution readiness", async () => {

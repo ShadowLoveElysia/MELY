@@ -21,6 +21,7 @@ pub fn run() {
             commands::solid_voxel::get_solid_voxel_preview,
             commands::solid_voxel::pull_solid_voxel_chunks,
             commands::solid_voxel::write_solid_voxel_litematic,
+            commands::solid_voxel::write_solid_voxel_bundle,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build MELY desktop application");

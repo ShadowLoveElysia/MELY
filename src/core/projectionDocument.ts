@@ -425,6 +425,72 @@ export const createProjectionDocumentFromSolid = (
   });
 };
 
+/** Rebuild a chunked solid result after a Worker has returned transferred buffers. */
+export const restoreSolidVoxelResultFromProjectionDocument = (
+  document: ProjectionDocument,
+  previousStats?: SolidVoxelResult["stats"],
+): SolidVoxelResult => {
+  if (document.edition !== "java" && document.edition !== "bedrock") {
+    throw new RangeError("Solid projection document has an invalid edition");
+  }
+  if (!document.bounds || document.blockCount <= 0) {
+    throw new RangeError("Cannot restore an empty solid projection result");
+  }
+  assertProjectionDocumentIntegrity(document, "Returned solid projection");
+  if (document.palette.length > 0x1_0000) {
+    throw new RangeError("Returned solid projection palette exceeds Uint16 capacity");
+  }
+  const chunks: SolidVoxelChunk[] = document.chunks.map((chunk) => ({
+    chunk: [...chunk.chunk] as [number, number, number],
+    positions: chunk.positions,
+    blockIndices: chunk.paletteIndices instanceof Uint16Array
+      ? chunk.paletteIndices
+      : Uint16Array.from(chunk.paletteIndices),
+  }));
+  for (const chunk of chunks) {
+    if (chunk.blockIndices.length !== chunk.positions.length) {
+      throw new RangeError("Returned solid projection chunk buffers are inconsistent");
+    }
+    for (const index of chunk.blockIndices) {
+      if (index >= document.palette.length) {
+        throw new RangeError(`Returned solid projection has unknown palette index ${index}`);
+      }
+    }
+  }
+  const palette = document.palette.map((state) => ({
+    blockId: state.blockId,
+    color: [...(state.color ?? [128, 128, 128])] as [number, number, number],
+  }));
+  const stats = previousStats ?? {
+    blockCount: document.blockCount,
+    surfaceBlockCount: document.blockCount,
+    filledBlockCount: 0,
+    skinBlockCount: 0,
+    alphaRejected: 0,
+    triangleBoxTests: 0,
+    paletteSize: palette.length,
+    dimensions: [...document.bounds.dimensions] as [number, number, number],
+  };
+  return {
+    kind: "solid",
+    storage: "chunked",
+    positions: new Float32Array(0),
+    blockIndices: new Uint16Array(0),
+    chunks,
+    palette,
+    stats: {
+      ...stats,
+      blockCount: document.blockCount,
+      paletteSize: palette.length,
+      dimensions: [...document.bounds.dimensions] as [number, number, number],
+    },
+    bounds: {
+      min: [...document.bounds.min] as [number, number, number],
+      max: [...document.bounds.max] as [number, number, number],
+    },
+  };
+};
+
 export const createProjectionDocumentFromResult = (
   result: ProjectionResult,
   options: ProjectionDocumentOptions = {},

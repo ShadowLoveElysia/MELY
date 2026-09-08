@@ -21,7 +21,13 @@ import {
   type SolidVoxelResultManifest,
   type TauriSolidVoxelClient,
   type TauriSolidVoxelTransport,
+  type WriteNativeSolidVoxelBundleRequest,
+  type NativeSolidVoxelBundleSummary,
 } from "./tauriSolidVoxelBackend";
+
+export interface NativeBundleWriter {
+  writeBundle(request: WriteNativeSolidVoxelBundleRequest): Promise<NativeSolidVoxelBundleSummary>;
+}
 
 export const DEFAULT_NATIVE_SOLID_VOXEL_POLL_INTERVAL_MS = 100;
 
@@ -132,7 +138,7 @@ const resolveClient = async (
   assertCurrent();
   const client = await (
     dependencies.createClient
-    ?? ((value) => createTauriSolidVoxelClient(value, { writeLitematic: true }))
+    ?? ((value) => createTauriSolidVoxelClient(value, { writeLitematic: true, bundleWrite: true }))
   )(transport);
   assertCurrent();
   return client;

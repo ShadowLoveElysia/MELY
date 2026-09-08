@@ -23,6 +23,7 @@ export const RELEASE_SOLID_VOXEL_JOB_COMMAND = "release_solid_voxel_job";
 export const GET_SOLID_VOXEL_PREVIEW_COMMAND = "get_solid_voxel_preview";
 export const PULL_SOLID_VOXEL_CHUNKS_COMMAND = "pull_solid_voxel_chunks";
 export const WRITE_SOLID_VOXEL_LITEMATIC_COMMAND = "write_solid_voxel_litematic";
+export const WRITE_SOLID_VOXEL_BUNDLE_COMMAND = "write_solid_voxel_bundle";
 
 export const MAX_SOLID_VOXEL_PREVIEW_POINTS = 200_000;
 export const MIN_SOLID_VOXEL_BATCH_BYTES = 8 * 1024 * 1024;
@@ -162,8 +163,28 @@ export interface NativeSolidVoxelLitematicSummary {
   dataVersion: number;
 }
 
+export interface WriteNativeSolidVoxelBundleRequest {
+  handle: SolidVoxelResultHandle;
+  outputPath: string;
+  overwriteExisting: boolean;
+  name: string;
+  guideLocale: "zh-CN" | "en-US" | "ja-JP";
+  regionMaxSize: 32;
+  safety: NativeLitematicExportSafety;
+}
+
+export interface NativeSolidVoxelBundleSummary {
+  outputPath: string;
+  byteLength: number;
+  fileCount: number;
+  partCount: number;
+  blockCount: number;
+  dataVersion: number;
+}
+
 export interface NativeSolidVoxelCapabilities {
   writeLitematic: boolean;
+  bundleWrite?: boolean;
 }
 
 export interface SolidVoxelReleaseReceipt {
@@ -188,6 +209,9 @@ export interface TauriSolidVoxelClient {
   writeLitematic(
     request: WriteNativeSolidVoxelLitematicRequest,
   ): Promise<NativeSolidVoxelLitematicSummary>;
+  writeBundle?(
+    request: WriteNativeSolidVoxelBundleRequest,
+  ): Promise<NativeSolidVoxelBundleSummary>;
 }
 
 const JOB_STATES = new Set<SolidVoxelJobState>([
@@ -748,7 +772,37 @@ export const createTauriSolidVoxelClient = (
       ...request,
       handle: handleArgs(request.handle, command),
     };
-    const response = await invokeJson(transport, command, normalizedRequest);
+    // Rust command 参数是 `request`，Tauri v2 不会把扁平对象自动绑定到
+    // 一个命名参数；保持这里与命令签名一致，避免真实 IPC 下出现缺参。
+    const response = await invokeJson(transport, command, { request: normalizedRequest });
     return parseLitematicSummary(response, request);
+  },
+
+  async writeBundle(request) {
+    const command = WRITE_SOLID_VOXEL_BUNDLE_COMMAND;
+    if (!capabilities.bundleWrite) {
+      throw new TauriSolidVoxelClientError(
+        "runtime-unavailable",
+        command,
+        "Native bundle writing is not available in this runtime",
+      );
+    }
+    const normalizedRequest = {
+      ...request,
+      handle: handleArgs(request.handle, command),
+    };
+    const response = await invokeJson(transport, command, { request: normalizedRequest });
+    if (!isRecord(response)) throw protocolError(command, "Bundle summary must be an object");
+    if (response.outputPath !== request.outputPath) {
+      throw protocolError(command, "Bundle summary output path does not match the request");
+    }
+    return {
+      outputPath: request.outputPath,
+      byteLength: assertSafeInteger(response.byteLength, command, "summary.byteLength", 0),
+      fileCount: assertSafeInteger(response.fileCount, command, "summary.fileCount", 0),
+      partCount: assertSafeInteger(response.partCount, command, "summary.partCount", 0),
+      blockCount: assertSafeInteger(response.blockCount, command, "summary.blockCount", 0),
+      dataVersion: assertSafeInteger(response.dataVersion, command, "summary.dataVersion", 0),
+    };
   },
 });

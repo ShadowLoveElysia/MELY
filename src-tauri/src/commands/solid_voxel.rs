@@ -9,6 +9,7 @@ use tauri::{
 };
 
 use crate::solid_voxel::{
+    bundle::{write_native_bundle, BundleError, NativeBundleOptions},
     contract::SolidShellOptions,
     litematic::{
         write_solid_litematic_atomic_with_control, LitematicError, LitematicFileError,
@@ -169,6 +170,30 @@ pub struct WriteSolidVoxelLitematicResponse {
     pub data_version: i32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteSolidVoxelBundleRequest {
+    pub handle: ResultHandle,
+    pub output_path: String,
+    #[serde(default)]
+    pub overwrite_existing: bool,
+    pub name: String,
+    pub guide_locale: String,
+    pub region_max_size: NativeRegionMaxSize,
+    pub safety: NativeLitematicSafety,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteSolidVoxelBundleResponse {
+    pub output_path: String,
+    pub byte_length: u64,
+    pub file_count: u32,
+    pub part_count: u32,
+    pub block_count: u64,
+    pub data_version: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseSolidVoxelJobResponse {
@@ -223,6 +248,48 @@ fn litematic_write_error(error: LitematicFileError) -> SolidVoxelCommandError {
         category,
         retryable,
         message: Some(message),
+    }
+}
+
+fn bundle_write_error(error: BundleError) -> SolidVoxelCommandError {
+    let message = error.to_string();
+    match error {
+        BundleError::Cancelled => SolidVoxelCommandError {
+            code: "SOLID_VOXEL_CANCELLED",
+            category: "cancelled",
+            retryable: true,
+            message: Some(message),
+        },
+        BundleError::Io(ref io_error) if io_error.kind() == std::io::ErrorKind::AlreadyExists => {
+            SolidVoxelCommandError {
+                code: "SOLID_VOXEL_OVERWRITE_CONFIRMATION_REQUIRED",
+                category: "validation",
+                retryable: false,
+                message: Some(message),
+            }
+        }
+        BundleError::Invalid(ref message)
+            if message.starts_with("native bundle commit failed:") =>
+        {
+            SolidVoxelCommandError {
+                code: "SOLID_VOXEL_BUNDLE_COMMIT_FAILED",
+                category: "internal",
+                retryable: true,
+                message: Some(message.clone()),
+            }
+        }
+        BundleError::Invalid(_) | BundleError::Encode(_) => SolidVoxelCommandError {
+            code: "SOLID_VOXEL_INVALID_REQUEST",
+            category: "validation",
+            retryable: false,
+            message: Some(message),
+        },
+        BundleError::Io(_) => SolidVoxelCommandError {
+            code: "SOLID_VOXEL_BUNDLE_WRITE_FAILED",
+            category: "internal",
+            retryable: true,
+            message: Some(message),
+        },
     }
 }
 
@@ -509,6 +576,82 @@ pub async fn write_solid_voxel_litematic(
         region_count: summary.region_count,
         palette_size: summary.palette_size,
         dimensions: summary.dimensions,
+        data_version: summary.data_version,
+    })
+}
+
+#[tauri::command]
+pub async fn write_solid_voxel_bundle(
+    manager: State<'_, SolidVoxelManager>,
+    request: WriteSolidVoxelBundleRequest,
+) -> Result<WriteSolidVoxelBundleResponse, SolidVoxelCommandError> {
+    validate_litematic_safety(&request.safety, &request.output_path)?;
+    if request.guide_locale != "zh-CN"
+        && request.guide_locale != "en-US"
+        && request.guide_locale != "ja-JP"
+    {
+        return Err(litematic_validation_error(
+            "guideLocale must be zh-CN, en-US or ja-JP",
+        ));
+    }
+    if request.region_max_size.into_axes() != [32, 32, 32] {
+        return Err(litematic_validation_error(
+            "native bundle writer requires a fixed 32³ partition",
+        ));
+    }
+    let (result, lease) = manager
+        .begin_litematic_write(request.handle)
+        .map_err(SolidVoxelCommandError::from)?;
+    validate_result_placement(&result, &request.safety)?;
+    let output_path = PathBuf::from(&request.output_path);
+    let target_dimension = request.safety.target_dimension.clone();
+    let options = NativeBundleOptions {
+        name: request.name,
+        guide_locale: request.guide_locale,
+        height_mode: request.safety.height_mode.clone(),
+        target_height: request.safety.target_height,
+        target_dimension_min_y: target_dimension.min_y,
+        target_dimension_height: target_dimension.height,
+        placement_bottom_y: request.safety.placement_bottom_y,
+        overwrite_existing: request.overwrite_existing,
+        litematic: LitematicOptions {
+            name: "MELY_Bundle".to_owned(),
+            author: "MELY".to_owned(),
+            description: "MELY export bundle".to_owned(),
+            software: "MELY".to_owned(),
+            target_minecraft_version: request.safety.target_minecraft_version,
+            serializer_minecraft_version: request.safety.serializer_minecraft_version,
+            compatibility_level: "exact".to_owned(),
+            compatibility_warning: String::new(),
+            timestamp_millis: 0,
+            region_max_size: [32, 32, 32],
+        },
+    };
+    let output_path_for_response = request.output_path;
+    let result_for_write = result.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        write_native_bundle(
+            &result_for_write,
+            &output_path,
+            &options,
+            lease.cancellation(),
+        )
+    })
+    .await
+    .map_err(|error| SolidVoxelCommandError {
+        code: "SOLID_VOXEL_BUNDLE_WRITE_FAILED",
+        category: "internal",
+        retryable: true,
+        message: Some(format!("native bundle writer task failed: {error}")),
+    })?
+    .map_err(bundle_write_error)?;
+
+    Ok(WriteSolidVoxelBundleResponse {
+        output_path: output_path_for_response,
+        byte_length: summary.compressed_bytes,
+        file_count: summary.file_count,
+        part_count: summary.part_count,
+        block_count: summary.block_count,
         data_version: summary.data_version,
     })
 }
