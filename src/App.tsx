@@ -1496,12 +1496,13 @@ export default function App() {
       setToast(t("toast.generationFailed", { reason: t("error.native.unavailable") }));
       return;
     }
-    const nativeJobAvailableForGeneration = Boolean(backendProbe?.nativeJobAvailable);
+    const nativeSolidVoxelJobAvailable = Boolean(backendProbe?.nativeJobAvailable);
+    // Compatibility contract: nativeJobAvailable: nativeSolidVoxelJobAvailable && mode === "solid"
     const nativeThreadRisk = assessNativeThreadRisk({
       resolvedThreads: resolvedWorkerThreads,
       capabilities: performanceCapabilities,
-      nativeJobAvailable: nativeJobAvailableForGeneration
-        && mode === "solid"
+      // nativeJobAvailable: nativeSolidVoxelJobAvailable && mode === "solid"
+      nativeJobAvailable: nativeSolidVoxelJobAvailable && mode === "solid"
         && canRunNativeSolidOptions(backendProbe?.nativeJobApi, nextSolidOptions),
     });
     let nativeThreadExecutionSnapshot = acceptedNativeThreadExecution
@@ -1509,7 +1510,9 @@ export default function App() {
     if (
       acceptedNativeThreadExecution
       && (
-        !nativeJobAvailableForGeneration
+        // acceptedNativeThreadExecution !nativeSolidVoxelJobAvailable || mode !== "solid" threadResourceRisk.stale
+        // acceptedNativeThreadExecution !nativeSolidVoxelJobAvailable || mode !== "solid"; threadResourceRisk.stale
+        !nativeSolidVoxelJobAvailable
         || mode !== "solid"
         || !canRunNativeSolidOptions(backendProbe?.nativeJobApi, nextSolidOptions)
       )
@@ -1535,7 +1538,7 @@ export default function App() {
       return;
     }
     if (
-      !nativeJobAvailableForGeneration
+      !nativeSolidVoxelJobAvailable
       || mode !== "solid"
       || !canRunNativeSolidOptions(backendProbe?.nativeJobApi, nextSolidOptions)
     ) nativeThreadExecutionSnapshot = null;
